@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.4
 ## [Unreleased]
 
 ### Added
+- Human-in-the-loop (HITL) support and intermediate task channel writes via `put_writes()` and `:Write` nodes connected via `[:HAS_WRITE]` relationships.
+- Hierarchical namespaced subgraph isolation using indexed `checkpoint_ns` properties and parent namespace routing.
+- In-memory sandboxed time-travel replay engine (`TimeTravelEngine` and `RelateSaver.fork_in_memory()`) cloning execution subgraphs into zero-side-effect `:memory:` database instances.
+- Terminal-native Unicode execution tree visualizer (`DAGVisualizer`) rendering step counters, node names, checkpoint IDs, branch indicators, and status tags (`[OK]`, `[PENDING]`, `[INTERRUPT]`, `[ERROR]`).
+- Command-line interface (`relate-dag`) offering interactive `tree` inspection and `replay` sandboxed execution.
 - Core `RelateSaver` checkpointer implementing `BaseCheckpointSaver` interface for LangGraph with thread-safe persistence.
 - Embedded graph storage backed by Relate DB engine with Cypher DDL schema constraints and `:NEXT` relationship modeling.
 - Dedicated `RelateThreadProxy` actor queue maintaining single-thread affinity for Relate DB connections.
@@ -15,3 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.4
 - Base exception taxonomy and error mapping for database, concurrency, and serialization failures.
 - Write-ahead log (WAL) synchronization and crash recovery support for durable checkpointing.
 - Integration test suite validating end-to-end checkpointing, pagination, history retrieval, and multi-threaded execution.
+
+### Fixed
+- Propagated startup file-lock concurrency errors and added automatic transaction rollback on failure in `RelateThreadProxy`.
+- Added flag syntax `--checkpoint / -c` support in `relate-dag replay` CLI and guarded metadata dictionary access.
