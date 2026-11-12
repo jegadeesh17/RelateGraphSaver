@@ -38,6 +38,7 @@ from langgraph_checkpoint_relate.schema import (
     CONSTRAINT_TOOL_CALL_UNIQUE,
     CONSTRAINT_WRITE_UNIQUE,
     INDEX_CHECKPOINT_HASH,
+    INDEX_CHECKPOINT_NS,
     INDEX_CHECKPOINT_THREAD,
     SCHEMA_CONSTRAINTS,
     SCHEMA_INDEXES,
@@ -399,8 +400,8 @@ class TestSchemaDDLAndConstraints:
     def test_schema_statements_definitions(self) -> None:
         """Verify schema constraint and index definitions match architecture specifications."""
         assert len(SCHEMA_CONSTRAINTS) == 4
-        assert len(SCHEMA_INDEXES) == 2
-        assert len(ALL_SCHEMA_STATEMENTS) == 6
+        assert len(SCHEMA_INDEXES) == 3
+        assert len(ALL_SCHEMA_STATEMENTS) == 7
 
         # Check required uniqueness constraints
         assert "thread_id_unique" in CONSTRAINT_THREAD_UNIQUE
@@ -415,6 +416,7 @@ class TestSchemaDDLAndConstraints:
         # Check required indexes
         assert "checkpoint_thread_idx" in INDEX_CHECKPOINT_THREAD
         assert "checkpoint_hash_idx" in INDEX_CHECKPOINT_HASH
+        assert "checkpoint_ns_idx" in INDEX_CHECKPOINT_NS
 
     def test_initialize_schema_invalid_connection(self) -> None:
         """Verify initialize_schema raises RelateConnectionError when connection is invalid."""
@@ -433,7 +435,7 @@ class TestSchemaDDLAndConstraints:
         # Run first time
         initialize_schema(conn)
         assert len(driver.constraints) == 4
-        assert len(driver.indexes) == 2
+        assert len(driver.indexes) == 3
         assert "thread_id_unique" in driver.constraints
         assert "checkpoint_id_unique" in driver.constraints
         assert "write_id_unique" in driver.constraints
@@ -442,7 +444,7 @@ class TestSchemaDDLAndConstraints:
         # Run second time for idempotence verification
         initialize_schema(conn)
         assert len(driver.constraints) == 4
-        assert len(driver.indexes) == 2
+        assert len(driver.indexes) == 3
 
     # AC-01: Schema constraints initialized on real in-memory Relate database
     def test_initialize_schema_real_relate_memory_idempotence(self) -> None:

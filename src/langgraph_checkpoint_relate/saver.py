@@ -169,17 +169,19 @@ class RelateSaver(BaseCheckpointSaver[str]):
 
         parent_checkpoint_id: str | None = None
         raw_parent = dict(checkpoint).get("parent_checkpoint_id")
-        if raw_parent:
-            parent_checkpoint_id = str(raw_parent)
-        elif parent_candidate:
-            parent_checkpoint_id = str(parent_candidate)
-        elif (
+
+        if (
             isinstance(metadata, dict)
             and "parents" in metadata
             and isinstance(metadata["parents"], dict)
-            and checkpoint_ns in metadata["parents"]
+            and metadata["parents"]
         ):
-            parent_checkpoint_id = str(metadata["parents"][checkpoint_ns])
+            ns_parent = metadata["parents"].get(checkpoint_ns)
+            parent_checkpoint_id = str(ns_parent) if ns_parent else None
+        elif raw_parent:
+            parent_checkpoint_id = str(raw_parent)
+        elif parent_candidate:
+            parent_checkpoint_id = str(parent_candidate)
 
         if parent_checkpoint_id == checkpoint_id:
             parent_checkpoint_id = None
@@ -219,8 +221,8 @@ class RelateSaver(BaseCheckpointSaver[str]):
             "OPTIONAL MATCH (p:Checkpoint {checkpoint_id: $parent_checkpoint_id}) "
             "OPTIONAL MATCH (p)-[existing:NEXT]->(:Checkpoint) "
             "WITH c, p, count(existing) AS next_count "
-            "FOREACH (_ IN CASE WHEN p IS NOT NULL AND (next_count > 0 OR p.thread_id <> c.thread_id) THEN [1] ELSE [] END | CREATE (p)-[:FORKED_TO]->(c)) "
-            "FOREACH (_ IN CASE WHEN p IS NOT NULL AND next_count = 0 AND p.thread_id = c.thread_id THEN [1] ELSE [] END | CREATE (p)-[:NEXT]->(c)) "
+            "FOREACH (_ IN CASE WHEN p IS NOT NULL AND (next_count > 0 OR p.thread_id <> c.thread_id OR p.checkpoint_ns <> c.checkpoint_ns) THEN [1] ELSE [] END | CREATE (p)-[:FORKED_TO]->(c)) "
+            "FOREACH (_ IN CASE WHEN p IS NOT NULL AND next_count = 0 AND p.thread_id = c.thread_id AND p.checkpoint_ns = c.checkpoint_ns THEN [1] ELSE [] END | CREATE (p)-[:NEXT]->(c)) "
             "WITH c "
             "OPTIONAL MATCH (w:Write {checkpoint_id: $checkpoint_id}) "
             "FOREACH (_ IN CASE WHEN w IS NOT NULL THEN [1] ELSE [] END | MERGE (c)-[:HAS_WRITE]->(w))"
@@ -346,7 +348,10 @@ class RelateSaver(BaseCheckpointSaver[str]):
             return None
 
         checkpoint_id = get_checkpoint_id(config)
-        checkpoint_ns = configurable.get("checkpoint_ns")
+        checkpoint_ns_raw = configurable.get("checkpoint_ns")
+        checkpoint_ns = (
+            str(checkpoint_ns_raw) if checkpoint_ns_raw is not None else None
+        )
 
         if checkpoint_id:
             query = (
@@ -491,7 +496,16 @@ class RelateSaver(BaseCheckpointSaver[str]):
 
         configurable = config.get("configurable", {}) if config else {}
         thread_id = configurable.get("thread_id")
-        checkpoint_ns = configurable.get("checkpoint_ns")
+        checkpoint_ns_raw = configurable.get("checkpoint_ns")
+        checkpoint_ns = (
+            str(checkpoint_ns_raw) if checkpoint_ns_raw is not None else None
+        )
+        if checkpoint_ns is None and filter and "checkpoint_ns" in filter:
+            filter_ns_raw = filter.get("checkpoint_ns")
+            checkpoint_ns = (
+                str(filter_ns_raw) if filter_ns_raw is not None else None
+            )
+
         checkpoint_id = get_checkpoint_id(config) if config else None
 
         query = (
@@ -576,9 +590,19 @@ class RelateSaver(BaseCheckpointSaver[str]):
             metadata_bytes = _extract_bytes(r["metadata_blob"])
             metadata = self.serde.loads(metadata_bytes)
 
-            # Filter by metadata key-values
-            if filter and not all(metadata.get(k) == v for k, v in filter.items()):
-                continue
+            # Filter by filter criteria (supports metadata properties and checkpoint_ns)
+            if filter:
+                matches_filter = True
+                for k, v in filter.items():
+                    if k == "checkpoint_ns":
+                        if str(r.get("checkpoint_ns", "")) != str(v if v is not None else ""):
+                            matches_filter = False
+                            break
+                    elif metadata.get(k) != v:
+                        matches_filter = False
+                        break
+                if not matches_filter:
+                    continue
 
             # Construct and yield tuple
             tup = self._format_checkpoint_tuple(r)

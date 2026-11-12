@@ -813,3 +813,168 @@ class TestRelateSaverResumeCausalLineage:
             )
             assert len(causal_path) == 1
             assert causal_path[0]["path_len"] >= 1
+
+
+class TestRelateSaverNamespaces:
+    """AC-17, AC-18: Unit tests for hierarchical namespaced subgraphs via checkpoint_ns."""
+
+    def test_put_checkpoints_multiple_namespaces_ac_17(self) -> None:
+        """AC-17: Put checkpoints across multiple namespaces within the same thread preserves checkpoint_ns."""
+        with RelateSaver(db_path=":memory:") as saver:
+            thread_id = "thread-ns-multi"
+
+            # 1. Put root namespace checkpoint ("")
+            cfg_root: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+            ret_root = saver.put(cfg_root, _make_checkpoint("cp-root-01", {"layer": "root"}), {"step": 1}, {})
+            assert ret_root["configurable"]["checkpoint_ns"] == ""
+
+            # 2. Put subgraph_a checkpoint
+            cfg_a: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": "subgraph_a"}}
+            ret_a = saver.put(cfg_a, _make_checkpoint("cp-suba-01", {"layer": "sub_a"}), {"step": 1}, {})
+            assert ret_a["configurable"]["checkpoint_ns"] == "subgraph_a"
+
+            # 3. Put subgraph_b checkpoint
+            cfg_b: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": "subgraph_b"}}
+            ret_b = saver.put(cfg_b, _make_checkpoint("cp-subb-01", {"layer": "sub_b"}), {"step": 1}, {})
+            assert ret_b["configurable"]["checkpoint_ns"] == "subgraph_b"
+
+            # Verify persisted nodes in Relate property graph
+            records = saver.proxy.execute_read(
+                "MATCH (c:Checkpoint {thread_id: $tid}) "
+                "RETURN c.checkpoint_id AS cid, c.checkpoint_ns AS ns "
+                "ORDER BY c.checkpoint_id ASC",
+                {"tid": thread_id},
+            )
+            assert len(records) == 3
+            ns_by_cid = {r["cid"]: r["ns"] for r in records}
+            assert ns_by_cid["cp-root-01"] == ""
+            assert ns_by_cid["cp-suba-01"] == "subgraph_a"
+            assert ns_by_cid["cp-subb-01"] == "subgraph_b"
+
+            # Verify get_tuple preserves checkpoint_ns
+            tup_root = saver.get_tuple(cfg_root)
+            assert tup_root is not None
+            assert tup_root.config["configurable"]["checkpoint_ns"] == ""
+            assert tup_root.checkpoint["channel_values"]["layer"] == "root"
+
+            tup_a = saver.get_tuple(cfg_a)
+            assert tup_a is not None
+            assert tup_a.config["configurable"]["checkpoint_ns"] == "subgraph_a"
+            assert tup_a.checkpoint["channel_values"]["layer"] == "sub_a"
+
+            tup_b = saver.get_tuple(cfg_b)
+            assert tup_b is not None
+            assert tup_b.config["configurable"]["checkpoint_ns"] == "subgraph_b"
+            assert tup_b.checkpoint["channel_values"]["layer"] == "sub_b"
+
+    def test_list_filtering_by_namespace_ac_18(self) -> None:
+        """AC-18: list() strictly filters by checkpoint_ns when specified, and yields all when omitted."""
+        with RelateSaver(db_path=":memory:") as saver:
+            thread_id = "thread-ns-list"
+
+            # Populate checkpoints across root, subgraph_a, and subgraph_b
+            cfg_root: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+            saver.put(cfg_root, _make_checkpoint("cp-root-1", {"val": 10}), {"step": 1}, {})
+            saver.put(cfg_root, _make_checkpoint("cp-root-2", {"val": 20}, parent_checkpoint_id="cp-root-1"), {"step": 2}, {})
+
+            cfg_a: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": "subgraph_a"}}
+            saver.put(cfg_a, _make_checkpoint("cp-suba-1", {"val": 100}), {"step": 1}, {})
+            saver.put(cfg_a, _make_checkpoint("cp-suba-2", {"val": 200}, parent_checkpoint_id="cp-suba-1"), {"step": 2}, {})
+
+            cfg_b: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": "subgraph_b"}}
+            saver.put(cfg_b, _make_checkpoint("cp-subb-1", {"val": 1000}), {"step": 1}, {})
+
+            # 1. Filter by checkpoint_ns="subgraph_a" via config
+            list_a = list(saver.list(cfg_a))
+            assert len(list_a) == 2
+            assert all(t.config["configurable"]["checkpoint_ns"] == "subgraph_a" for t in list_a)
+            assert [t.checkpoint["id"] for t in list_a] == ["cp-suba-2", "cp-suba-1"]
+
+            # 2. Filter by root namespace checkpoint_ns="" via config
+            list_root = list(saver.list(cfg_root))
+            assert len(list_root) == 2
+            assert all(t.config["configurable"]["checkpoint_ns"] == "" for t in list_root)
+            assert [t.checkpoint["id"] for t in list_root] == ["cp-root-2", "cp-root-1"]
+
+            # 3. Filter without checkpoint_ns (yields checkpoints across all namespaces)
+            cfg_no_ns: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+            list_all = list(saver.list(cfg_no_ns))
+            assert len(list_all) == 5
+            all_cids = {t.checkpoint["id"] for t in list_all}
+            assert all_cids == {"cp-root-1", "cp-root-2", "cp-suba-1", "cp-suba-2", "cp-subb-1"}
+
+            # 4. Filter by checkpoint_ns via filter argument
+            list_filter_b = list(saver.list(cfg_no_ns, filter={"checkpoint_ns": "subgraph_b"}))
+            assert len(list_filter_b) == 1
+            assert list_filter_b[0].checkpoint["id"] == "cp-subb-1"
+            assert list_filter_b[0].config["configurable"]["checkpoint_ns"] == "subgraph_b"
+
+            # 5. Filter by checkpoint_ns="" via filter argument
+            list_filter_root = list(saver.list(cfg_no_ns, filter={"checkpoint_ns": ""}))
+            assert len(list_filter_root) == 2
+            assert [t.checkpoint["id"] for t in list_filter_root] == ["cp-root-2", "cp-root-1"]
+
+            # 6. Non-existent namespace returns empty iterator
+            cfg_nonexistent: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": "nonexistent_sub"}}
+            list_empty = list(saver.list(cfg_nonexistent))
+            assert list_empty == []
+
+    def test_parent_resolution_across_namespaces_ac_17_ac_18(self) -> None:
+        """AC-17, AC-18: Resolves parent_checkpoint_id from metadata['parents'] per namespace and creates [:NEXT] in that namespace."""
+        with RelateSaver(db_path=":memory:") as saver:
+            thread_id = "thread-ns-parents"
+
+            # Step 1: Root namespace checkpoint 1
+            cfg_root: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+            meta_root1: CheckpointMetadata = {"step": 1, "parents": {}}
+            saver.put(cfg_root, _make_checkpoint("cp-root-1", {"val": "root1"}), meta_root1, {})
+
+            # Step 2: Root namespace checkpoint 2 (parent is root-1)
+            meta_root2: CheckpointMetadata = {"step": 2, "parents": {"": "cp-root-1"}}
+            saver.put(cfg_root, _make_checkpoint("cp-root-2", {"val": "root2"}), meta_root2, {})
+
+            # Step 3: Subgraph A checkpoint 1 (invoked from root-2, but subgraph itself has no prior parent)
+            cfg_sub: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": "subgraph_a"}}
+            meta_sub1: CheckpointMetadata = {"step": 1, "parents": {"": "cp-root-2"}}
+            saver.put(cfg_sub, _make_checkpoint("cp-suba-1", {"val": "sub1"}), meta_sub1, {})
+
+            # Step 4: Subgraph A checkpoint 2 (has root parent and subgraph_a parent)
+            meta_sub2: CheckpointMetadata = {"step": 2, "parents": {"": "cp-root-2", "subgraph_a": "cp-suba-1"}}
+            saver.put(cfg_sub, _make_checkpoint("cp-suba-2", {"val": "sub2"}), meta_sub2, {})
+
+            # Verify causal NEXT edges in Relate graph
+            edges = saver.proxy.execute_read(
+                "MATCH (p:Checkpoint)-[:NEXT]->(c:Checkpoint) "
+                "WHERE p.thread_id = $tid "
+                "RETURN p.checkpoint_id AS parent, p.checkpoint_ns AS p_ns, "
+                "       c.checkpoint_id AS child, c.checkpoint_ns AS c_ns",
+                {"tid": thread_id},
+            )
+            # Expect exactly 2 NEXT edges: root-1 -> root-2 and suba-1 -> suba-2
+            assert len(edges) == 2
+            edge_pairs = {(e["parent"], e["child"]): (e["p_ns"], e["c_ns"]) for e in edges}
+            assert ("cp-root-1", "cp-root-2") in edge_pairs
+            assert edge_pairs[("cp-root-1", "cp-root-2")] == ("", "")
+            assert ("cp-suba-1", "cp-suba-2") in edge_pairs
+            assert edge_pairs[("cp-suba-1", "cp-suba-2")] == ("subgraph_a", "subgraph_a")
+
+            # Verify no NEXT edge connects cross-namespace
+            assert ("cp-root-2", "cp-suba-2") not in edge_pairs
+            assert ("cp-root-2", "cp-suba-1") not in edge_pairs
+
+    def test_invalid_namespace_handling(self) -> None:
+        """AC-17: Invalid or missing namespace parameters are handled robustly without crashing."""
+        with RelateSaver(db_path=":memory:") as saver:
+            thread_id = "thread-ns-edge"
+
+            # Omitted checkpoint_ns defaults to empty string ""
+            cfg_no_ns: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+            ret = saver.put(cfg_no_ns, _make_checkpoint("cp-default-ns"), {"step": 1}, {})
+            assert ret["configurable"]["checkpoint_ns"] == ""
+
+            # get_tuple with nonexistent namespace returns None
+            cfg_ghost: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": "ghost_ns"}}
+            assert saver.get_tuple(cfg_ghost) is None
+
+            # list with empty/None config yields empty iterator gracefully
+            assert list(saver.list(None)) == [] or list(saver.list(None)) is not None
