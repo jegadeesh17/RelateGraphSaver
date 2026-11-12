@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.4
 ## [Unreleased]
 
 ### Added
+- Cypher forensic diagnostic engine (`RelateForensics`, `detect_loops()`, `trace_root_cause()`) detecting state oscillations, repeating node cycles, and backward causal failure root-cause analysis.
+- CLI forensic diagnostic subcommands (`relate-dag forensics loops` and `relate-dag forensics trace-error`) with rich tabular rendering.
+- End-to-end multi-agent research demo application (`examples/research_agent.py`) orchestrating Planner, Researcher, Human Review interrupt, and Critic with live terminal DAG visualization.
+- Standardized PyPI packaging specifications, Trove classifiers, license metadata, and wheel build validation with Hatchling.
 - Human-in-the-loop (HITL) support and intermediate task channel writes via `put_writes()` and `:Write` nodes connected via `[:HAS_WRITE]` relationships.
 - Hierarchical namespaced subgraph isolation using indexed `checkpoint_ns` properties and parent namespace routing.
 - In-memory sandboxed time-travel replay engine (`TimeTravelEngine` and `RelateSaver.fork_in_memory()`) cloning execution subgraphs into zero-side-effect `:memory:` database instances.
@@ -22,5 +26,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.4
 - Integration test suite validating end-to-end checkpointing, pagination, history retrieval, and multi-threaded execution.
 
 ### Fixed
+- Aligned research demo pipeline default database path to `checkpoints.rl` for zero-configuration CLI visualization.
 - Propagated startup file-lock concurrency errors and added automatic transaction rollback on failure in `RelateThreadProxy`.
 - Added flag syntax `--checkpoint / -c` support in `relate-dag replay` CLI and guarded metadata dictionary access.
