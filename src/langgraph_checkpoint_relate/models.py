@@ -293,7 +293,9 @@ class RootCauseReport:
     def __post_init__(self) -> None:
         if not isinstance(self.thread_id, str) or not self.thread_id.strip():
             raise ValueError("thread_id must be a non-empty string")
-        if not isinstance(self.error_checkpoint_id, str) or not self.error_checkpoint_id.strip():
+        if not isinstance(self.error_checkpoint_id, str):
+            raise ValueError("error_checkpoint_id must be a non-empty string")
+        if not self.error_checkpoint_id.strip() and self.error_message != "No error detected":
             raise ValueError("error_checkpoint_id must be a non-empty string")
         if not isinstance(self.error_message, str):
             raise TypeError("error_message must be a string")

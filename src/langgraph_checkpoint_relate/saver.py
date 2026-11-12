@@ -11,7 +11,10 @@ import random
 import uuid
 from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from langgraph_checkpoint_relate.models import LoopReport, RootCauseReport
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import (
@@ -644,6 +647,47 @@ class RelateSaver(BaseCheckpointSaver[str]):
             checkpoint_id=checkpoint_id,
             branch_thread_id=branch_thread_id,
         )
+
+    def detect_loops(
+        self,
+        thread_id: str,
+        threshold: int = 2,
+    ) -> list[LoopReport]:
+        """Identify state oscillation or repeating cycle paths in the Cypher DAG.
+
+        Delegates to RelateForensics.detect_loops.
+
+        Args:
+            thread_id: Identifier of the execution thread.
+            threshold: Minimum cycle occurrence threshold (default: 2).
+
+        Returns:
+            List of detected LoopReport objects detailing cycle nodes, occurrence counts,
+            and checkpoint ID intervals.
+        """
+        from langgraph_checkpoint_relate.forensics import RelateForensics
+
+        forensics = RelateForensics(self)
+        return forensics.detect_loops(thread_id, threshold=threshold)
+
+    def trace_root_cause(
+        self,
+        thread_id: str,
+    ) -> RootCauseReport:
+        """Trace causal antecedent edges from an error node to the offending write.
+
+        Delegates to RelateForensics.trace_root_cause.
+
+        Args:
+            thread_id: Identifier of the execution thread.
+
+        Returns:
+            RootCauseReport detailing failure origins.
+        """
+        from langgraph_checkpoint_relate.forensics import RelateForensics
+
+        forensics = RelateForensics(self)
+        return forensics.trace_root_cause(thread_id)
 
     def flush(self, timeout: float | None = None) -> None:
         """Explicitly flush pending changes to disk WAL.

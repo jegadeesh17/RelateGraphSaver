@@ -10,6 +10,8 @@ from langgraph_checkpoint_relate.errors import (
     RelateConnectionError,
     RelateSerializationError,
 )
+from langgraph_checkpoint_relate.forensics import RelateForensics
+from langgraph_checkpoint_relate.models import LoopReport, RootCauseReport
 from langgraph_checkpoint_relate.saver import RelateSaver
 from langgraph_checkpoint_relate.time_travel import TimeTravelEngine, fork_in_memory
 from langgraph_checkpoint_relate.visualizer import DAGVisualizer
@@ -20,12 +22,15 @@ __all__ = [
     "CheckpointNotFoundError",
     "CheckpointSerializationError",
     "DAGVisualizer",
+    "LoopReport",
     "RelateCheckpointError",
     "RelateCheckpointNotFoundError",
     "RelateConcurrencyError",
     "RelateConnectionError",
+    "RelateForensics",
     "RelateSaver",
     "RelateSerializationError",
+    "RootCauseReport",
     "TimeTravelEngine",
     "__version__",
     "cli_app",
