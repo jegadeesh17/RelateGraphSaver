@@ -143,8 +143,9 @@ class RelateThreadProxy:
             )
         if self._startup_error is not None:
             self._is_closed = True
-            if isinstance(self._startup_error, RelateConnectionError):
-                raise self._startup_error
+            wrapped = _wrap_exception(self._startup_error)
+            if isinstance(wrapped, (RelateConcurrencyError, RelateConnectionError)):
+                raise wrapped from self._startup_error
             raise RelateConnectionError(
                 f"Failed to initialize Relate database connection: {self._startup_error}"
             ) from self._startup_error
@@ -231,6 +232,11 @@ class RelateThreadProxy:
             formatted = _format_records(records)
             cmd.future.set_result(formatted)
         except Exception as exc:
+            if hasattr(self._conn, "rollback"):
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    pass
             cmd.future.set_exception(_wrap_exception(exc))
 
     def _handle_batch_command(self, cmd: BatchCommand) -> None:
