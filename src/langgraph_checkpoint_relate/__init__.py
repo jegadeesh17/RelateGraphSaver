@@ -1,5 +1,6 @@
 """Relate graph checkpointer for LangGraph workflows."""
 
+from langgraph_checkpoint_relate.cli import app as cli_app
 from langgraph_checkpoint_relate.errors import (
     CheckpointNotFoundError,
     CheckpointSerializationError,
@@ -27,5 +28,6 @@ __all__ = [
     "RelateSerializationError",
     "TimeTravelEngine",
     "__version__",
+    "cli_app",
     "fork_in_memory",
 ]
