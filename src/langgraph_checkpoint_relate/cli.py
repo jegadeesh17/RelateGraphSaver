@@ -82,9 +82,15 @@ def replay(
         ...,
         help="Target thread identifier containing the historical lineage.",
     ),
-    checkpoint_id: str = typer.Argument(
-        ...,
+    checkpoint_id: str | None = typer.Argument(
+        None,
         help="Target checkpoint identifier to replay from.",
+    ),
+    checkpoint: str | None = typer.Option(
+        None,
+        "--checkpoint",
+        "-c",
+        help="Target checkpoint identifier to replay from (flag syntax).",
     ),
     db: str = typer.Option(
         "checkpoints.rl",
@@ -105,8 +111,12 @@ def replay(
     if not thread_id.strip():
         err_console.print("[bold red]Error:[/bold red] thread_id must be a non-empty string.")
         raise typer.Exit(code=1)
-    if not checkpoint_id.strip():
-        err_console.print("[bold red]Error:[/bold red] checkpoint_id must be a non-empty string.")
+
+    effective_checkpoint_id = checkpoint or checkpoint_id
+    if not effective_checkpoint_id or not effective_checkpoint_id.strip():
+        err_console.print(
+            "[bold red]Error:[/bold red] checkpoint_id must be a non-empty string (passed as an argument or via --checkpoint/-c)."
+        )
         raise typer.Exit(code=1)
 
     if db != ":memory:" and not os.path.exists(db):
@@ -120,13 +130,13 @@ def replay(
         sandboxed_saver = TimeTravelEngine.fork_in_memory(
             source_saver=source_saver,
             thread_id=thread_id,
-            checkpoint_id=checkpoint_id,
+            checkpoint_id=effective_checkpoint_id,
             branch_thread_id=branch,
         )
 
         step_records = sandboxed_saver.proxy.execute_read(
             "MATCH (c:Checkpoint {checkpoint_id: $cid}) RETURN c.step AS step",
-            {"cid": checkpoint_id},
+            {"cid": effective_checkpoint_id},
         )
         step = step_records[0]["step"] if step_records else 0
 
@@ -134,7 +144,7 @@ def replay(
         console.print("[bold green]Sandboxed replay initialized successfully.[/bold green]")
         console.print(f"  Source Thread:    [cyan]{thread_id}[/cyan]")
         console.print(f"  Replay Thread:    [cyan]{target_thread}[/cyan]")
-        console.print(f"  Checkpoint ID:    [cyan]{checkpoint_id}[/cyan]")
+        console.print(f"  Checkpoint ID:    [cyan]{effective_checkpoint_id}[/cyan]")
         console.print(f"  Replay Step:      [bold yellow]{step}[/bold yellow]")
         console.print("  Isolation:        Isolated :memory: sandbox (source database unchanged)")
     except typer.Exit:

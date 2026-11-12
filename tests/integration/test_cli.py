@@ -260,6 +260,19 @@ class TestCliReplayCommand:
         assert result.exit_code == 1
         assert "checkpoint_id must be a non-empty string" in result.output
 
+    def test_replay_with_checkpoint_option_flag(
+        self, runner: CliRunner, seeded_db: tuple[str, str, list[str]]
+    ) -> None:
+        """Verify replay with --checkpoint option flag exits with code 0."""
+        db_file, thread_id, checkpoint_ids = seeded_db
+        target_cid = checkpoint_ids[1]
+        result = runner.invoke(
+            app, ["replay", thread_id, "--checkpoint", target_cid, "--db", db_file]
+        )
+        assert result.exit_code == 0
+        assert "Sandboxed replay initialized successfully" in result.output
+        assert target_cid in result.output
+
 
 class TestCliForensicsCommand:
     """Tests verifying forensics diagnostics initial structure."""

@@ -599,7 +599,7 @@ class RelateSaver(BaseCheckpointSaver[str]):
                         if str(r.get("checkpoint_ns", "")) != str(v if v is not None else ""):
                             matches_filter = False
                             break
-                    elif metadata.get(k) != v:
+                    elif not isinstance(metadata, dict) or metadata.get(k) != v:
                         matches_filter = False
                         break
                 if not matches_filter:
