@@ -1,233 +1,157 @@
-# RelateGraphSaver (`langgraph-checkpoint-relate`)
+# RelateGraphSaver
 
-> **Embedded graph-native checkpoint and time-travel persistence engine for LangGraph, powered by Relate by Neo4j v1.0.0.**
+Embedded graph-native checkpoint and time-travel persistence engine for LangGraph, powered by Relate by Neo4j.
 
-[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue.svg)](https://www.python.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![LangGraph](https://img.shields.io/badge/LangGraph-Compatible-orange.svg)](https://github.com/langchain-ai/langgraph)
-[![Relate by Neo4j](https://img.shields.io/badge/Relate_by_Neo4j-v1.0.0-008CC1.svg)](https://neo4j.com/)
+## Features
 
----
+- **Embedded Single-File WAL Persistence:** Persists checkpoints, intermediate channel updates, and execution metadata into a zero-configuration `.rl` database file with atomic Write-Ahead Logging.
+- **Native Cypher DAG Modeling:** Represents agent execution state as a property graph with `:Thread`, `:Checkpoint`, `:Write`, and `:ToolCall` nodes linked by causal `:NEXT`, `:FORKED_TO`, and `:HAS_WRITE` relationships.
+- **Sandboxed In-Memory Time Travel:** Clones historical execution subgraphs up to any targeted checkpoint into an isolated `:memory:` database with `fork_in_memory()`, allowing speculative replays without altering production files.
+- **Terminal Execution Trees:** Inspect multi-agent branching structures, pending writes, and error states directly in the terminal using `relate-dag tree`.
+- **Cypher Forensic Diagnostics:** Detect cyclical state oscillations (`relate-dag forensics loops`) and trace backward causal paths from failures to offending antecedent writes or tool calls (`relate-dag forensics trace-error`).
+- **Human-in-the-Loop Interruption:** Native persistence for LangGraph `interrupt()` checkpoints and pending writes, supporting seamless execution pauses and resumptions.
+- **Thread-Affinity Actor Concurrency:** Dedicated actor thread proxy (`RelateThreadProxy`) eliminates thread-affinity violations and database file lock collisions across concurrent worker threads.
 
-## Overview
+## Quick start
 
-Traditional checkpointing engines persist agent state into flat key-value pairs or relational rows (e.g., SQLite or Postgres). While functional for linear executions, modern multi-agent architectures are fundamentally **directed acyclic graphs (DAGs)**: they branch, fork, iterate in cycles, invoke external tools, and require time-travel debugging.
+### Prerequisites
+- Python 3.11, 3.12, or 3.13
+- Git
 
-**RelateGraphSaver** bridges this gap by persisting LangGraph checkpoints directly into **Relate by Neo4j**, an embedded graph database engine supporting native Cypher queries, ACID Write-Ahead Logging (WAL), and single-file `.rl` persistence.
+### Installation
 
-No Docker containers, external database servers, or network daemons are required. You get enterprise-grade graph storage, sub-millisecond local queries, and full Cypher traversal capabilities straight in your Python process.
+Install from source:
 
----
+```bash
+git clone https://github.com/jegadeesh17/RelateGraphSaver.git
+cd RelateGraphSaver
+pip install -e ".[dev]"
+```
 
-## Key Features
-
-- **Embedded Single-File WAL Persistence:** Stores all checkpoints, intermediate writes, and tool invocations in a zero-configuration `.rl` database file with atomic Write-Ahead Logging.
-- **Native Cypher DAG Traversals:** Models threads, checkpoints, channel writes, and tool executions as first-class graph entities (`:Thread`, `:Checkpoint`, `:Write`, `:ToolCall`) linked by directional relationships (`:PARENT_OF`, `:BELONGS_TO`, `:HAS_WRITE`, `:GENERATED`).
-- **Sandboxed In-Memory Time Travel:** Fork execution lineages from any historical checkpoint into an isolated `:memory:` database with `fork_in_memory()`, allowing exploratory branching without corrupting production files.
-- **Terminal Execution Trees (`relate-dag tree`):** Visualize complex branching agent histories, parent-child lineages, and node states directly in your terminal with rich Unicode formatting.
-- **Forensic Diagnostic Engine (`relate-dag forensics`):**
-  - **Loop Detection (`loops`):** Detect infinite state oscillations and cyclical node patterns using Cypher cycle matching.
-  - **Root-Cause Analysis (`trace-error`):** Pinpoint the exact antecedent tool call, channel write, or state mutation that caused an agent failure.
-- **Human-in-the-Loop & Pending Writes:** Full native support for LangGraph `interrupt()` checkpoints and pending channel writes, allowing seamless state inspection and resumption.
-- **Thread-Affinity Actor Concurrency:** Eliminates multi-threaded SQLite-style lock contention via a dedicated background actor queue (`RelateThreadProxy`), ensuring thread-safe Cypher execution.
-
----
-
-## Installation
-
-Install via `pip`:
+Or install via `pip`:
 
 ```bash
 pip install langgraph-checkpoint-relate
 ```
 
-For local development and testing:
+## Usage
 
-```bash
-git clone https://github.com/relate-langgraph/langgraph-checkpoint-relate.git
-cd langgraph-checkpoint-relate
-pip install -e ".[dev]"
-```
-
----
-
-## Quickstart
-
-Integrate `RelateSaver` into any standard LangGraph workflow with just two lines of code:
+Integrate `RelateSaver` directly into any compiled LangGraph workflow:
 
 ```python
-from typing import Annotated
-from typing_extensions import TypedDict
-
+from typing import TypedDict
 from langgraph.graph import StateGraph, START, END
 from langgraph_checkpoint_relate import RelateSaver
 
-
-# 1. Define agent state
 class AgentState(TypedDict):
     query: str
-    steps: list[str]
-    count: int
+    response: str
 
+def plan_step(state: AgentState) -> dict[str, str]:
+    return {"response": f"Processed: {state['query']}"}
 
-# 2. Define workflow nodes
-def plan_step(state: AgentState) -> dict:
-    return {
-        "steps": state.get("steps", []) + ["Plan formulated"],
-        "count": state.get("count", 0) + 1,
-    }
+# Build a standard StateGraph
+builder = StateGraph(AgentState)
+builder.add_node("planner", plan_step)
+builder.add_edge(START, "planner")
+builder.add_edge("planner", END)
 
-
-def execute_step(state: AgentState) -> dict:
-    return {
-        "steps": state.get("steps", []) + ["Execution completed"],
-        "count": state.get("count", 0) + 1,
-    }
-
-
-# 3. Construct graph
-workflow = StateGraph(AgentState)
-workflow.add_node("plan", plan_step)
-workflow.add_node("execute", execute_step)
-workflow.add_edge(START, "plan")
-workflow.add_edge("plan", "execute")
-workflow.add_edge("execute", END)
-
-# 4. Compile with RelateSaver checkpointer
+# Persist to local Relate graph database
 with RelateSaver("checkpoints.rl") as checkpointer:
-    app = workflow.compile(checkpointer=checkpointer)
-
-    # 5. Execute with a persistent thread_id
+    app = builder.compile(checkpointer=checkpointer)
     config = {"configurable": {"thread_id": "session-42"}}
-    result = app.invoke({"query": "Analyze quarterly reports", "steps": [], "count": 0}, config)
-    print("Final State:", result)
+    
+    # Execute workflow
+    result = app.invoke({"query": "Graph-native persistence"}, config=config)
+    print("Execution output:", result)
 
-    # 6. Query checkpoint history natively
+    # Retrieve checkpoint history
     history = list(checkpointer.list(config))
-    print(f"Recorded {len(history)} checkpoints in graph.")
+    print(f"Recorded {len(history)} checkpoints in thread.")
 ```
 
----
+### Command-line interface
 
-## CLI Reference (`relate-dag`)
-
-`langgraph-checkpoint-relate` bundles `relate-dag`, a command-line tool for exploring and debugging agent execution graphs.
-
-### 1. Execution Tree Visualization
-
-Visualize the execution DAG for a specific thread, showing checkpoint IDs, node names, and parent-child linkages:
+Inspect and debug execution graphs using the bundled `relate-dag` CLI:
 
 ```bash
-relate-dag tree <thread_id> --db checkpoints.rl
-```
+# Render execution DAG as an interactive Unicode terminal tree
+relate-dag tree session-42 --db checkpoints.rl
 
-Output preview:
-```text
-Thread: session-42
-└── Checkpoint: 1ef82a3c-b034-6c2e-8000-000000000001 (Node: __start__)
-    └── Checkpoint: 1ef82a3c-b034-6c2e-8000-000000000002 (Node: plan)
-        └── Checkpoint: 1ef82a3c-b034-6c2e-8000-000000000003 (Node: execute)
-```
+# Fork history from a historical checkpoint into an isolated in-memory sandbox
+relate-dag replay session-42 <checkpoint_id> --db checkpoints.rl
 
-### 2. In-Memory Time-Travel Replay
-
-Fork a thread at a historical checkpoint and spin up an isolated `:memory:` sandbox. Ideal for human-in-the-loop debugging and what-if exploration without mutating the on-disk `.rl` file:
-
-```bash
-# Fork from a historical checkpoint
-relate-dag replay session-42 1ef82a3c-b034-6c2e-8000-000000000002 --db checkpoints.rl --branch session-42-debug
-```
-
-### 3. Forensic Diagnostics
-
-#### Detect Agent Loops and State Oscillations
-
-Multi-agent reflection and critique loops can spiral into infinite repetition. Detect repeating node cycles and their occurrence intervals:
-
-```bash
+# Detect state oscillations and infinite loops
 relate-dag forensics loops session-42 --threshold 2 --db checkpoints.rl
-```
 
-#### Trace Failure Root Causes
-
-When an agent fails, trace the backward causal graph to identify the earliest antecedent tool call or channel write that triggered the exception:
-
-```bash
+# Trace root cause of an execution failure
 relate-dag forensics trace-error session-42 --db checkpoints.rl
 ```
 
----
+### Running the multi-agent demo
 
-## Architecture & Graph Schema
-
-RelateGraphSaver translates agent execution dynamics into a property graph schema enforced by native Cypher unique constraints:
-
-```mermaid
-graph TD
-    T[Thread :Thread] -->|PARENT_OF| C1[Checkpoint :Checkpoint]
-    C1 -->|PARENT_OF| C2[Checkpoint :Checkpoint]
-    C2 -->|PARENT_OF| C3[Checkpoint :Checkpoint]
-    C2 -->|BELONGS_TO| T
-    C3 -->|BELONGS_TO| T
-    C2 -->|HAS_WRITE| W[Write :Write]
-    C2 -->|GENERATED| TC[ToolCall :ToolCall]
-```
-
-### Node Schema
-
-| Label | Key Properties | Purpose |
-| :--- | :--- | :--- |
-| `:Thread` | `thread_id`, `created_at`, `updated_at` | Top-level execution context grouping related runs |
-| `:Checkpoint` | `checkpoint_id`, `thread_id`, `checkpoint_ns`, `parent_checkpoint_id`, `node_name`, `step`, `state_dump`, `created_at` | Immutable snapshot of agent state and channel values |
-| `:Write` | `write_id`, `thread_id`, `checkpoint_id`, `task_id`, `channel`, `idx`, `value_dump` | Pending or committed intermediate channel writes |
-| `:ToolCall` | `tool_call_id`, `tool_name`, `args`, `status`, `error` | Forensic tracking of external tool executions |
-
-### Relationship Schema
-
-| Relationship | Direction | Description |
-| :--- | :--- | :--- |
-| `:BELONGS_TO` | `(:Checkpoint) -> (:Thread)` | Direct association between checkpoint and thread |
-| `:PARENT_OF` | `(:Checkpoint) -> (:Checkpoint)` | Directed execution edge representing step progression |
-| `:CHILD_OF` | `(:Checkpoint) -> (:Checkpoint)` | Reverse edge for rapid backward causal traversal |
-| `:HAS_WRITE` | `(:Checkpoint) -> (:Write)` | Channel writes accumulated during a step |
-| `:GENERATED` | `(:Checkpoint) -> (:ToolCall)` | External tool calls executed during node processing |
-
----
-
-## Concurrency Model
-
-Relate by Neo4j operates with strict file locks for single-writer consistency. To support concurrent LangGraph workers and web servers (such as FastAPI or Celery):
-
-1. **Thread-Affinity Proxy:** All write and read operations are dispatched through `RelateThreadProxy`, a dedicated worker thread communicating over an internal thread-safe request/response queue.
-2. **Actor Pattern:** Prevents cross-thread driver crashes and lock collisions while presenting a non-blocking asynchronous and synchronous interface to callers.
-3. **Safe Context Management:** Use `with RelateSaver("path.rl") as saver:` to guarantee clean connection teardown and file lock release.
-
----
-
-## Running the Example Application
-
-An end-to-end multi-agent research agent with Human-in-the-Loop review is provided in `examples/research_agent.py`:
+Run the complete multi-agent research demo (Planner, Researcher, Human Review interrupt, and Critic):
 
 ```bash
-# Run the complete multi-agent workflow
-python examples/research_agent.py --topic "Autonomous Agent Architecture" --db research_checkpoints.rl
+python examples/research_agent.py --topic "Autonomous Agent Architecture"
 ```
 
----
+## Running tests
 
-## Testing
-
-Run the automated test suite:
+Run the automated test suite using `pytest`:
 
 ```bash
-# Fast test suite (formatting, typing, unit & fast integration tests)
-ruff check . && ruff format --check . && mypy src tests && python -m pytest -q -m "not slow"
-
-# Full test suite including slow simulation benchmarks
+# Run the complete test suite (unit and integration tests)
 python -m pytest -q
+
+# Run fast test suite
+python -m pytest -q -m "not slow"
+
+# Run a specific test file
+python -m pytest -q tests/unit/test_saver.py
 ```
 
----
+## Project structure
+
+```text
+RelateGraphSaver/
+├── src/
+│   └── langgraph_checkpoint_relate/
+│       ├── __init__.py         # Package entrypoint and public exports
+│       ├── cli.py              # relate-dag CLI (tree, replay, forensics)
+│       ├── errors.py           # Exception hierarchy and taxonomy
+│       ├── forensics.py        # RelateForensics (loop detection & root cause)
+│       ├── models.py           # DTO dataclasses (WriteNode, Forensic reports)
+│       ├── proxy.py            # RelateThreadProxy actor queue
+│       ├── saver.py            # RelateSaver implementing BaseCheckpointSaver
+│       ├── schema.py           # Cypher DDL schema constraints and indexes
+│       ├── serde.py            # Typed state serialization and hashing
+│       ├── time_travel.py      # TimeTravelEngine in-memory sandbox
+│       └── visualizer.py       # DAGVisualizer terminal tree renderer
+├── tests/
+│   ├── conftest.py             # Shared pytest fixtures and configurations
+│   ├── fakes/                  # In-memory mock Relate database drivers
+│   ├── integration/            # End-to-end multi-agent and CLI integration tests
+│   └── unit/                   # Component-level unit test suites
+├── examples/
+│   └── research_agent.py       # Multi-agent research pipeline demo
+├── docs/                       # Living architectural documentation
+├── pyproject.toml              # Build specifications, dependencies, and metadata
+├── CHANGELOG.md                # Release history and unreleased changes
+└── README.md                   # Project documentation and quickstart
+```
+
+## Documentation
+
+- [docs/README.md](docs/README.md): Index of living technical documentation.
+- [docs/SPEC.md](docs/SPEC.md): User journeys, behavioral requirements, and Given/When/Then acceptance criteria.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): Technical architecture, Cypher graph schema, seams, and concurrency patterns.
+- [docs/DECISIONS.md](docs/DECISIONS.md): Architecture Decision Records (ADRs) capturing rationale and trade-offs.
+- [CHANGELOG.md](CHANGELOG.md): Complete release history.
+
+## How this was built
+
+Designed and built by jegadeesh17 with [SoftwareEngineeringAgents](https://github.com/jegadeesh17/SoftwareEngineeringAgents), a multi-agent workflow for Claude Code.
 
 ## License
 
