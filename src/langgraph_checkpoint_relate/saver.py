@@ -562,6 +562,22 @@ class RelateSaver(BaseCheckpointSaver[str]):
             if limit is not None and yielded_count >= limit:
                 break
 
+    def flush(self, timeout: float | None = None) -> None:
+        """Explicitly flush pending changes to disk WAL.
+
+        Args:
+            timeout: Optional maximum duration in seconds to await flush completion.
+        """
+        if hasattr(self.proxy, "flush"):
+            self.proxy.flush(timeout=timeout)
+
+    def abort(self) -> None:
+        """Abruptly terminate checkpointer and proxy without graceful flushing."""
+        if hasattr(self.proxy, "abort"):
+            self.proxy.abort()
+        elif self._owns_proxy:
+            self.proxy.close()
+
     def close(self) -> None:
         """Close the checkpointer and terminate the actor worker thread if owned."""
         if self._owns_proxy:

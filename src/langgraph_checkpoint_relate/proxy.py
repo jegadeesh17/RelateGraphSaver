@@ -216,10 +216,10 @@ class RelateThreadProxy:
                         else self._conn.execute(cmd.cypher)
                     )
                     records = cur.fetchall() if hasattr(cur, "fetchall") else []
-                    if hasattr(self._conn, "flush"):
-                        self._conn.flush()
-                    elif hasattr(self._conn, "commit") and not getattr(self._conn, "autocommit", True):
+                    if hasattr(self._conn, "commit") and not getattr(self._conn, "autocommit", True):
                         self._conn.commit()
+                    if self.wal_enabled and hasattr(self._conn, "flush"):
+                        self._conn.flush()
             else:
                 cur = (
                     self._conn.execute(cmd.cypher, cmd.params)
@@ -254,7 +254,7 @@ class RelateThreadProxy:
 
                     if hasattr(self._conn, "commit"):
                         self._conn.commit()
-                    if hasattr(self._conn, "flush"):
+                    if self.wal_enabled and hasattr(self._conn, "flush"):
                         self._conn.flush()
                 except Exception:
                     if hasattr(self._conn, "rollback"):
@@ -282,7 +282,9 @@ class RelateThreadProxy:
                     else self._conn.execute(query)
                 )
                 raw = cur.fetchall() if hasattr(cur, "fetchall") else []
-                if hasattr(self._conn, "flush"):
+                if hasattr(self._conn, "commit") and not getattr(self._conn, "autocommit", True):
+                    self._conn.commit()
+                if self.wal_enabled and hasattr(self._conn, "flush"):
                     self._conn.flush()
 
             formatted = _format_records(raw)
@@ -501,6 +503,53 @@ class RelateThreadProxy:
             raise RelateConnectionError("RelateThreadProxy is closed")
         if self._worker_thread is None or not self._worker_thread.is_alive():
             raise RelateConnectionError("RelateThreadProxy background worker thread is not running")
+
+    def flush(self, timeout: float | None = None) -> None:
+        """Explicitly flush pending changes to disk WAL."""
+        self._check_active()
+        fut: concurrent.futures.Future[None] = concurrent.futures.Future()
+
+        def do_flush() -> None:
+            try:
+                with self._writer_lock:
+                    if self._conn is not None and hasattr(self._conn, "flush"):
+                        self._conn.flush()
+                fut.set_result(None)
+            except Exception as exc:
+                fut.set_exception(_wrap_exception(exc))
+
+        self._queue.put(do_flush)
+        effective_timeout = timeout if timeout is not None else self.default_timeout
+        try:
+            fut.result(timeout=effective_timeout)
+        except (TimeoutError, concurrent.futures.TimeoutError) as to_exc:
+            raise RelateConcurrencyError(
+                f"Flush timed out after {effective_timeout}s"
+            ) from to_exc
+
+    def abort(self, timeout: float | None = 2.0) -> None:
+        """Abruptly terminate the proxy and connection without graceful flush."""
+        if self._is_closed:
+            return
+        self._is_closed = True
+
+        def do_abort() -> None:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None
+
+        try:
+            self._queue.put(do_abort)
+        except Exception:
+            pass
+
+        if self._worker_thread is not None and self._worker_thread.is_alive():
+            self._queue.put(_ShutdownSentinel())
+            effective_timeout = timeout if timeout is not None else 2.0
+            self._worker_thread.join(timeout=effective_timeout)
 
     def stop(self, timeout: float | None = 5.0) -> None:
         """Alias for close."""
