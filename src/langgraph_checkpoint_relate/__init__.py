@@ -9,6 +9,7 @@ from langgraph_checkpoint_relate.errors import (
     RelateConnectionError,
     RelateSerializationError,
 )
+from langgraph_checkpoint_relate.saver import RelateSaver
 
 __version__ = "0.1.0"
 
@@ -19,6 +20,7 @@ __all__ = [
     "RelateCheckpointNotFoundError",
     "RelateConcurrencyError",
     "RelateConnectionError",
+    "RelateSaver",
     "RelateSerializationError",
     "__version__",
 ]
