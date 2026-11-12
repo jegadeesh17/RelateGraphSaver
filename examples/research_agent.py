@@ -28,7 +28,7 @@ from langgraph_checkpoint_relate.visualizer import DAGVisualizer
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DB_PATH = "research_checkpoints.rl"
+DEFAULT_DB_PATH = "checkpoints.rl"
 DEFAULT_TOPIC = "Graph Database Checkpointing in Multi-Agent AI Systems"
 DEFAULT_FEEDBACK = (
     "LGTM! Proceed to synthesis. Emphasize ACID Write-Ahead Logging and Cypher graph traversals."
