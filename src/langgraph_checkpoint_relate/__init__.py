@@ -10,6 +10,7 @@ from langgraph_checkpoint_relate.errors import (
     RelateSerializationError,
 )
 from langgraph_checkpoint_relate.saver import RelateSaver
+from langgraph_checkpoint_relate.time_travel import TimeTravelEngine, fork_in_memory
 
 __version__ = "0.1.0"
 
@@ -22,5 +23,7 @@ __all__ = [
     "RelateConnectionError",
     "RelateSaver",
     "RelateSerializationError",
+    "TimeTravelEngine",
     "__version__",
+    "fork_in_memory",
 ]

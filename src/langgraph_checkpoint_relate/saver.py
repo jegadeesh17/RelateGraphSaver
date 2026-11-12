@@ -85,12 +85,19 @@ class RelateSaver(BaseCheckpointSaver[str]):
             self.proxy = db_path
             self.db_path = db_path.db_path
             self._owns_proxy = False
+            self._connection_factory = connection_factory or getattr(
+                db_path, "_connection_factory", None
+            )
         elif proxy is not None:
             self.proxy = proxy
             self.db_path = proxy.db_path
             self._owns_proxy = False
+            self._connection_factory = connection_factory or getattr(
+                proxy, "_connection_factory", None
+            )
         else:
             self.db_path = str(db_path)
+            self._connection_factory = connection_factory
             self.proxy = RelateThreadProxy(
                 db_path=self.db_path,
                 wal_enabled=wal_enabled,
@@ -349,9 +356,7 @@ class RelateSaver(BaseCheckpointSaver[str]):
 
         checkpoint_id = get_checkpoint_id(config)
         checkpoint_ns_raw = configurable.get("checkpoint_ns")
-        checkpoint_ns = (
-            str(checkpoint_ns_raw) if checkpoint_ns_raw is not None else None
-        )
+        checkpoint_ns = str(checkpoint_ns_raw) if checkpoint_ns_raw is not None else None
 
         if checkpoint_id:
             query = (
@@ -497,14 +502,10 @@ class RelateSaver(BaseCheckpointSaver[str]):
         configurable = config.get("configurable", {}) if config else {}
         thread_id = configurable.get("thread_id")
         checkpoint_ns_raw = configurable.get("checkpoint_ns")
-        checkpoint_ns = (
-            str(checkpoint_ns_raw) if checkpoint_ns_raw is not None else None
-        )
+        checkpoint_ns = str(checkpoint_ns_raw) if checkpoint_ns_raw is not None else None
         if checkpoint_ns is None and filter and "checkpoint_ns" in filter:
             filter_ns_raw = filter.get("checkpoint_ns")
-            checkpoint_ns = (
-                str(filter_ns_raw) if filter_ns_raw is not None else None
-            )
+            checkpoint_ns = str(filter_ns_raw) if filter_ns_raw is not None else None
 
         checkpoint_id = get_checkpoint_id(config) if config else None
 
@@ -611,6 +612,38 @@ class RelateSaver(BaseCheckpointSaver[str]):
             yielded_count += 1
             if limit is not None and yielded_count >= limit:
                 break
+
+    def fork_in_memory(
+        self,
+        thread_id: str,
+        checkpoint_id: str,
+        *,
+        branch_thread_id: str | None = None,
+    ) -> RelateSaver:
+        """Clone history up to checkpoint_id into an isolated :memory: database.
+
+        Delegates to TimeTravelEngine.fork_in_memory.
+
+        Args:
+            thread_id: Identifier of the source execution thread.
+            checkpoint_id: Target checkpoint identifier to replay from.
+            branch_thread_id: Optional new thread identifier for the replay branch.
+
+        Returns:
+            An isolated in-memory RelateSaver instance containing the historical subgraph.
+
+        Raises:
+            CheckpointNotFoundError: If checkpoint_id does not exist for thread_id.
+            RelateCheckpointError: If database read or clone operations fail.
+        """
+        from langgraph_checkpoint_relate.time_travel import TimeTravelEngine
+
+        return TimeTravelEngine.fork_in_memory(
+            source_saver=self,
+            thread_id=thread_id,
+            checkpoint_id=checkpoint_id,
+            branch_thread_id=branch_thread_id,
+        )
 
     def flush(self, timeout: float | None = None) -> None:
         """Explicitly flush pending changes to disk WAL.
