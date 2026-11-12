@@ -15,6 +15,7 @@ from typing import Any
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import (
+    WRITES_IDX_MAP,
     BaseCheckpointSaver,
     ChannelVersions,
     Checkpoint,
@@ -216,7 +217,13 @@ class RelateSaver(BaseCheckpointSaver[str]):
             "CREATE (t)-[:HAS_CHECKPOINT]->(c) "
             "WITH c "
             "OPTIONAL MATCH (p:Checkpoint {checkpoint_id: $parent_checkpoint_id}) "
-            "FOREACH (_ IN CASE WHEN p IS NOT NULL THEN [1] ELSE [] END | CREATE (p)-[:NEXT]->(c))"
+            "OPTIONAL MATCH (p)-[existing:NEXT]->(:Checkpoint) "
+            "WITH c, p, count(existing) AS next_count "
+            "FOREACH (_ IN CASE WHEN p IS NOT NULL AND (next_count > 0 OR p.thread_id <> c.thread_id) THEN [1] ELSE [] END | CREATE (p)-[:FORKED_TO]->(c)) "
+            "FOREACH (_ IN CASE WHEN p IS NOT NULL AND next_count = 0 AND p.thread_id = c.thread_id THEN [1] ELSE [] END | CREATE (p)-[:NEXT]->(c)) "
+            "WITH c "
+            "OPTIONAL MATCH (w:Write {checkpoint_id: $checkpoint_id}) "
+            "FOREACH (_ IN CASE WHEN w IS NOT NULL THEN [1] ELSE [] END | MERGE (c)-[:HAS_WRITE]->(w))"
         )
         params = {
             "thread_id": thread_id,
@@ -249,6 +256,11 @@ class RelateSaver(BaseCheckpointSaver[str]):
     ) -> None:
         """Store pending channel writes and link them via HAS_WRITE relationships.
 
+        Implements AC-14 by persisting pending writes as :Write nodes linked to the
+        target Checkpoint node via [:HAS_WRITE] relationships. Uses WRITES_IDX_MAP for
+        special channel indexing (__error__, __scheduled__, __interrupt__, __resume__)
+        and enumeration index for standard channels.
+
         Args:
             config: Configuration dictionary specifying thread_id and checkpoint_id.
             writes: Sequence of (channel, value) write pairs.
@@ -260,26 +272,35 @@ class RelateSaver(BaseCheckpointSaver[str]):
 
         configurable = config.get("configurable", {}) if config else {}
         thread_id = configurable.get("thread_id")
-        if not thread_id or not isinstance(thread_id, str):
+        if not thread_id or not isinstance(thread_id, str) or not thread_id.strip():
             raise ValueError("thread_id must be a non-empty string in config['configurable']")
 
         checkpoint_ns = str(configurable.get("checkpoint_ns", ""))
         checkpoint_id = configurable.get("checkpoint_id")
-        if not checkpoint_id:
+        if (
+            not checkpoint_id
+            or not isinstance(checkpoint_id, str)
+            or not str(checkpoint_id).strip()
+        ):
             raise ValueError("checkpoint_id is required in config['configurable'] to store writes")
 
+        checkpoint_id_str = str(checkpoint_id)
+        task_id_str = str(task_id)
+        task_path_str = str(task_path or "")
         created_at = _utc_now_iso()
         statements: list[tuple[str, dict[str, Any]]] = []
 
         for idx, (channel, value) in enumerate(writes):
+            write_idx = WRITES_IDX_MAP.get(channel, idx)
             write_blob = self.serde.dumps(value)
-            write_id = f"{thread_id}:{checkpoint_ns}:{checkpoint_id}:{task_id}:{idx}"
+            write_id = f"{thread_id}:{checkpoint_ns}:{checkpoint_id_str}:{task_id_str}:{write_idx}"
             stmt = (
                 "MERGE (w:Write {write_id: $write_id}) "
                 "SET w.thread_id = $thread_id, "
                 "    w.checkpoint_ns = $checkpoint_ns, "
                 "    w.checkpoint_id = $checkpoint_id, "
                 "    w.task_id = $task_id, "
+                "    w.task_path = $task_path, "
                 "    w.channel = $channel, "
                 "    w.write_blob = $write_blob, "
                 "    w.idx = $idx, "
@@ -292,11 +313,12 @@ class RelateSaver(BaseCheckpointSaver[str]):
                 "write_id": write_id,
                 "thread_id": thread_id,
                 "checkpoint_ns": checkpoint_ns,
-                "checkpoint_id": str(checkpoint_id),
-                "task_id": str(task_id),
+                "checkpoint_id": checkpoint_id_str,
+                "task_id": task_id_str,
+                "task_path": task_path_str,
                 "channel": str(channel),
                 "write_blob": write_blob,
-                "idx": idx,
+                "idx": write_idx,
                 "created_at": created_at,
             }
             statements.append((stmt, params))
@@ -395,7 +417,7 @@ class RelateSaver(BaseCheckpointSaver[str]):
 
         # Retrieve any pending writes associated with this checkpoint
         writes_query = (
-            "MATCH (w:Write {thread_id: $thread_id, checkpoint_id: $checkpoint_id}) "
+            "MATCH (c:Checkpoint {thread_id: $thread_id, checkpoint_id: $checkpoint_id})-[:HAS_WRITE]->(w:Write) "
             "WHERE w.checkpoint_ns = $checkpoint_ns "
             "RETURN w.task_id AS task_id, "
             "       w.channel AS channel, "
@@ -541,7 +563,11 @@ class RelateSaver(BaseCheckpointSaver[str]):
                 if before_step is not None:
                     if step > before_step:
                         continue
-                    if step == before_step and before_created_at is not None and created_at >= before_created_at:
+                    if (
+                        step == before_step
+                        and before_created_at is not None
+                        and created_at >= before_created_at
+                    ):
                         continue
                 else:
                     if cid >= before_id:

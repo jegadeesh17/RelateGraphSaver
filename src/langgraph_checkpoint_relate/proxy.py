@@ -49,7 +49,7 @@ def _format_record(record: Any) -> dict[str, Any]:
     """Convert a database record or mapping to a standard dictionary."""
     if isinstance(record, dict):
         if hasattr(record, "data") and callable(record.data):
-            return record.data()
+            return dict(record.data())
         return dict(record)
     if hasattr(record, "items"):
         return dict(record.items())
@@ -73,6 +73,7 @@ def _wrap_exception(exc: Exception) -> RelateCheckpointError:
     msg = str(exc)
     lower_msg = msg.lower()
 
+    err: RelateCheckpointError
     if isinstance(exc, (TimeoutError, concurrent.futures.TimeoutError)) or any(
         k in lower_msg for k in ("lock", "busy", "contention", "deadlock", "collision", "timeout")
     ):
@@ -217,7 +218,9 @@ class RelateThreadProxy:
                         else self._conn.execute(cmd.cypher)
                     )
                     records = cur.fetchall() if hasattr(cur, "fetchall") else []
-                    if hasattr(self._conn, "commit") and not getattr(self._conn, "autocommit", True):
+                    if hasattr(self._conn, "commit") and not getattr(
+                        self._conn, "autocommit", True
+                    ):
                         self._conn.commit()
                     if self.wal_enabled and hasattr(self._conn, "flush"):
                         self._conn.flush()
@@ -282,11 +285,7 @@ class RelateThreadProxy:
         query, params, event, result_holder = item
         try:
             with self._writer_lock:
-                cur = (
-                    self._conn.execute(query, params)
-                    if params
-                    else self._conn.execute(query)
-                )
+                cur = self._conn.execute(query, params) if params else self._conn.execute(query)
                 raw = cur.fetchall() if hasattr(cur, "fetchall") else []
                 if hasattr(self._conn, "commit") and not getattr(self._conn, "autocommit", True):
                     self._conn.commit()
@@ -321,21 +320,21 @@ class RelateThreadProxy:
             return
 
         if msg_type == "execute":
-            cmd = DbCommand(
+            db_cmd = DbCommand(
                 cypher=msg["cypher"],
                 params=msg.get("params") or {},
                 is_write=msg.get("is_write", True),
                 future=future or concurrent.futures.Future(),
             )
-            self._handle_db_command(cmd)
+            self._handle_db_command(db_cmd)
             return
 
         if msg_type == "transaction":
-            cmd = BatchCommand(
+            batch_cmd = BatchCommand(
                 statements=msg["statements"],
                 future=future or concurrent.futures.Future(),
             )
-            self._handle_batch_command(cmd)
+            self._handle_batch_command(batch_cmd)
             return
 
         if msg_type == "close":
@@ -344,7 +343,9 @@ class RelateThreadProxy:
             return
 
         if future is not None:
-            future.set_exception(RelateCheckpointError(f"Unsupported command message type: {msg_type}"))
+            future.set_exception(
+                RelateCheckpointError(f"Unsupported command message type: {msg_type}")
+            )
 
     def _cleanup_connection(self) -> None:
         """Close connection and fail any remaining pending commands."""
@@ -361,7 +362,9 @@ class RelateThreadProxy:
         while not self._queue.empty():
             try:
                 pending = self._queue.get_nowait()
-                err = RelateConnectionError("RelateThreadProxy closed before operation could execute")
+                err = RelateConnectionError(
+                    "RelateThreadProxy closed before operation could execute"
+                )
                 if isinstance(pending, (DbCommand, BatchCommand)):
                     if not pending.future.done():
                         pending.future.set_exception(err)
@@ -481,7 +484,9 @@ class RelateThreadProxy:
                 raise RelateCheckpointError(
                     f"Statement at index {idx} parameters must be a dictionary or None"
                 )
-            validated_statements.append((stmt_query, dict(stmt_params) if stmt_params is not None else {}))
+            validated_statements.append(
+                (stmt_query, dict(stmt_params) if stmt_params is not None else {})
+            )
 
         fut: concurrent.futures.Future[list[list[dict[str, Any]]]] = concurrent.futures.Future()
         cmd = BatchCommand(statements=validated_statements, future=fut)
@@ -529,9 +534,7 @@ class RelateThreadProxy:
         try:
             fut.result(timeout=effective_timeout)
         except (TimeoutError, concurrent.futures.TimeoutError) as to_exc:
-            raise RelateConcurrencyError(
-                f"Flush timed out after {effective_timeout}s"
-            ) from to_exc
+            raise RelateConcurrencyError(f"Flush timed out after {effective_timeout}s") from to_exc
 
     def abort(self, timeout: float | None = 2.0) -> None:
         """Abruptly terminate the proxy and connection without graceful flush."""
