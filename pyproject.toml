@@ -5,9 +5,37 @@ build-backend = "hatchling.build"
 [project]
 name = "langgraph-checkpoint-relate"
 version = "0.1.0"
-description = "Embedded Neo4j-compatible Cypher graph checkpointer for LangGraph agent workflows"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "RelateGraphSaver Contributors" },
+]
+dynamic = [
+    "description",
+]
+keywords = [
+    "langgraph",
+    "relate",
+    "neo4j",
+    "checkpointer",
+    "persistence",
+    "agent",
+    "dag",
+    "cypher",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: LangGraph",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
     "langgraph-checkpoint>=2.0.0",
     "langgraph>=0.2.0",
@@ -15,6 +43,12 @@ dependencies = [
     "typer>=0.12.0",
     "rich>=13.7.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/relate-langgraph/langgraph-checkpoint-relate"
+Repository = "https://github.com/relate-langgraph/langgraph-checkpoint-relate"
+Issues = "https://github.com/relate-langgraph/langgraph-checkpoint-relate/issues"
+Documentation = "https://github.com/relate-langgraph/langgraph-checkpoint-relate#readme"
 
 [project.optional-dependencies]
 dev = [
@@ -26,6 +60,8 @@ dev = [
 
 [project.scripts]
 relate-dag = "langgraph_checkpoint_relate.cli:app"
+
+[tool.hatch.metadata.hooks.custom]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/langgraph_checkpoint_relate"]
@@ -41,7 +77,7 @@ markers = [
 ]
 
 [tool.ruff]
-target-version = "py313"
+target-version = "py311"
 line-length = 100
 src = ["src", "tests"]
 exclude = [
@@ -70,7 +106,7 @@ quote-style = "double"
 indent-style = "space"
 
 [tool.mypy]
-python_version = "3.13"
+python_version = "3.11"
 strict = true
 warn_return_any = true
 warn_unused_configs = true
