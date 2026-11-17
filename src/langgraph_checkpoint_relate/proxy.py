@@ -39,6 +39,7 @@ class BatchCommand:
 
     statements: list[tuple[str, dict[str, Any]]]
     future: concurrent.futures.Future[Any]
+    flush: bool = True
 
 
 class _ShutdownSentinel:
@@ -263,7 +264,7 @@ class RelateThreadProxy:
 
                     if hasattr(self._conn, "commit"):
                         self._conn.commit()
-                    if self.wal_enabled and hasattr(self._conn, "flush"):
+                    if cmd.flush and self.wal_enabled and hasattr(self._conn, "flush"):
                         self._conn.flush()
                 except Exception:
                     if hasattr(self._conn, "rollback"):
@@ -350,6 +351,12 @@ class RelateThreadProxy:
     def _cleanup_connection(self) -> None:
         """Close connection and fail any remaining pending commands."""
         if self._conn is not None:
+            # Batches committed without their own flush become durable here.
+            if self.wal_enabled and hasattr(self._conn, "flush"):
+                try:
+                    self._conn.flush()
+                except Exception as flush_exc:
+                    logger.warning("Error flushing Relate connection before close: %s", flush_exc)
             try:
                 if hasattr(self._conn, "close"):
                     self._conn.close()
@@ -461,8 +468,15 @@ class RelateThreadProxy:
         self,
         statements: list[tuple[str, dict[str, Any]]],
         timeout: float | None = None,
+        *,
+        flush: bool = True,
     ) -> list[list[dict[str, Any]]]:
-        """Execute a batch of statements atomically within a single transaction."""
+        """Execute a batch of statements atomically within a single transaction.
+
+        With ``flush=False`` the batch still commits before this returns, but the
+        per-write flush is skipped; the data is flushed by the next flushed write
+        or by ``close()``.
+        """
         self._check_active()
 
         if isinstance(statements, (str, bytes)) or not isinstance(statements, Sequence):
@@ -489,7 +503,7 @@ class RelateThreadProxy:
             )
 
         fut: concurrent.futures.Future[list[list[dict[str, Any]]]] = concurrent.futures.Future()
-        cmd = BatchCommand(statements=validated_statements, future=fut)
+        cmd = BatchCommand(statements=validated_statements, future=fut, flush=flush)
         self._queue.put(cmd)
 
         effective_timeout = timeout if timeout is not None else self.default_timeout

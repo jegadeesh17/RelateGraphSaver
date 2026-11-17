@@ -388,7 +388,7 @@ class RelateSaver(BaseCheckpointSaver[str]):
             )
             detached: frozenset[str] = frozenset()
             if statements:
-                detached = detached_call_ids(self.proxy.execute_batch(statements))
+                detached = detached_call_ids(self.proxy.execute_batch(statements, flush=False))
             self._applied_tool_calls.mark_applied(plan, thread_id=thread_id, detached=detached)
         except Exception as exc:
             logger.warning(

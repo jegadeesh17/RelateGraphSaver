@@ -5,12 +5,14 @@
 from __future__ import annotations
 
 import concurrent.futures
+import logging
 import sys
 import threading
 from pathlib import Path
 from typing import Any
 
 import pytest
+import relate
 
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
 if _PROJECT_ROOT not in sys.path:
@@ -294,3 +296,133 @@ class TestProxyFakeDriverCompatibility:
             )
             assert len(res) == 1
             assert res[0]["id"] == "fake-thread"
+
+
+class _SpyConnection:
+    """Wraps a real connection and records commit, flush and close calls in order."""
+
+    def __init__(self, inner: Any, events: list[str], flush_error: Exception | None = None) -> None:
+        self._inner = inner
+        self._events = events
+        self._flush_error = flush_error
+
+    @property
+    def autocommit(self) -> bool:
+        return bool(self._inner.autocommit)
+
+    @autocommit.setter
+    def autocommit(self, value: bool) -> None:
+        self._inner.autocommit = value
+
+    def commit(self) -> None:
+        self._events.append("commit")
+        self._inner.commit()
+
+    def flush(self) -> None:
+        self._events.append("flush")
+        if self._flush_error is not None:
+            raise self._flush_error
+        self._inner.flush()
+
+    def close(self) -> None:
+        self._events.append("close")
+        self._inner.close()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+def _spy_proxy(
+    events: list[str], *, wal_enabled: bool = True, flush_error: Exception | None = None
+) -> RelateThreadProxy:
+    def factory(db_path: str) -> _SpyConnection:
+        return _SpyConnection(relate.connect(database=db_path), events, flush_error)
+
+    return RelateThreadProxy(
+        db_path=":memory:", wal_enabled=wal_enabled, connection_factory=factory
+    )
+
+
+_CREATE: list[tuple[str, dict[str, Any]]] = [("CREATE (:Thread {thread_id: $t})", {"t": "spy"})]
+_COUNT = "MATCH (t:Thread {thread_id: 'spy'}) RETURN count(t) AS n"
+
+
+class TestProxyFlushControl:
+    """execute_batch(flush=False) commits without a flush; close() flushes, abort() does not."""
+
+    def test_batch_flushes_by_default_adr_0014(self) -> None:
+        """ADR-0014: the default batch commits and then flushes."""
+        events: list[str] = []
+        proxy = _spy_proxy(events)
+        try:
+            events.clear()
+            proxy.execute_batch(_CREATE)
+            assert events == ["commit", "flush"]
+        finally:
+            proxy.abort()
+
+    def test_batch_without_flush_still_commits_adr_0014(self) -> None:
+        """ADR-0014: flush=False commits before returning and skips the flush."""
+        events: list[str] = []
+        proxy = _spy_proxy(events)
+        try:
+            events.clear()
+            proxy.execute_batch(_CREATE, flush=False)
+            assert events == ["commit"]
+            assert proxy.execute_read(_COUNT)[0]["n"] == 1
+        finally:
+            proxy.abort()
+
+    def test_failed_batch_without_flush_rolls_back_adr_0014(self) -> None:
+        """ADR-0014: a failing flush=False batch rolls back as one transaction."""
+        events: list[str] = []
+        proxy = _spy_proxy(events)
+        try:
+            events.clear()
+            with pytest.raises(Exception):  # noqa: B017
+                proxy.execute_batch([*_CREATE, ("THIS IS NOT CYPHER", {})], flush=False)
+            assert "flush" not in events
+            assert proxy.execute_read(_COUNT)[0]["n"] == 0
+        finally:
+            proxy.abort()
+
+    def test_close_flushes_before_closing_adr_0014(self) -> None:
+        """ADR-0014: close() flushes explicitly, then closes the connection."""
+        events: list[str] = []
+        proxy = _spy_proxy(events)
+        proxy.execute_batch(_CREATE, flush=False)
+        events.clear()
+        proxy.close()
+        assert events == ["flush", "close"]
+
+    def test_close_does_not_flush_without_wal_adr_0014(self) -> None:
+        """ADR-0014: with wal_enabled=False nothing flushes, including close()."""
+        events: list[str] = []
+        proxy = _spy_proxy(events, wal_enabled=False)
+        proxy.execute_batch(_CREATE)
+        events.clear()
+        proxy.close()
+        assert events == ["close"]
+
+    def test_abort_does_not_flush_adr_0014(self) -> None:
+        """ADR-0014: abort() closes the connection without flushing."""
+        events: list[str] = []
+        proxy = _spy_proxy(events)
+        proxy.execute_batch(_CREATE, flush=False)
+        events.clear()
+        proxy.abort()
+        assert events == ["close"]
+
+    def test_close_flush_failure_is_logged_and_connection_closed_adr_0014(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """ADR-0014: a failing flush on close logs a WARNING and the connection still closes."""
+        events: list[str] = []
+        proxy = _spy_proxy(events, flush_error=RuntimeError("disk full"))
+        events.clear()
+        with caplog.at_level(logging.WARNING):
+            proxy.close()
+        assert events == ["flush", "close"]
+        assert any(
+            r.levelno == logging.WARNING and "disk full" in r.getMessage() for r in caplog.records
+        )

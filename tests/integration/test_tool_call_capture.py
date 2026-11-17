@@ -17,9 +17,11 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import Generator
+from pathlib import Path
 from typing import Any
 
 import pytest
+import relate
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import empty_checkpoint
@@ -226,11 +228,15 @@ def test_ac47_capture_failure_does_not_fail_put_writes(
     original = saver.proxy.execute_batch
     calls: list[int] = []
 
-    def flaky(statements: list[tuple[str, dict[str, Any]]], timeout: float | None = None) -> Any:
+    def flaky(
+        statements: list[tuple[str, dict[str, Any]]],
+        timeout: float | None = None,
+        **kwargs: Any,
+    ) -> Any:
         calls.append(len(statements))
         if len(calls) == 2:
             raise RuntimeError(f"capture exploded {secret}")
-        return original(statements, timeout)
+        return original(statements, timeout, **kwargs)
 
     monkeypatch.setattr(saver.proxy, "execute_batch", flaky)
 
@@ -257,7 +263,11 @@ def test_ac47_capture_failure_does_not_fail_put(
 ) -> None:
     """AC-47: a failing capture batch leaves put() returning normally with the checkpoint stored."""
 
-    def broken(statements: list[tuple[str, dict[str, Any]]], timeout: float | None = None) -> Any:
+    def broken(
+        statements: list[tuple[str, dict[str, Any]]],
+        timeout: float | None = None,
+        **kwargs: Any,
+    ) -> Any:
         raise RuntimeError("capture exploded")
 
     monkeypatch.setattr(saver.proxy, "execute_batch", broken)
@@ -344,9 +354,13 @@ def _count_batches(saver: RelateSaver, monkeypatch: pytest.MonkeyPatch) -> list[
     original = saver.proxy.execute_batch
     sizes: list[int] = []
 
-    def counting(statements: list[tuple[str, dict[str, Any]]], timeout: float | None = None) -> Any:
+    def counting(
+        statements: list[tuple[str, dict[str, Any]]],
+        timeout: float | None = None,
+        **kwargs: Any,
+    ) -> Any:
         sizes.append(len(statements))
-        return original(statements, timeout)
+        return original(statements, timeout, **kwargs)
 
     monkeypatch.setattr(saver.proxy, "execute_batch", counting)
     return sizes
@@ -408,11 +422,15 @@ def test_applied_failed_capture_is_retried_by_next_save(
     original = saver.proxy.execute_batch
     attempts: list[int] = []
 
-    def flaky(statements: list[tuple[str, dict[str, Any]]], timeout: float | None = None) -> Any:
+    def flaky(
+        statements: list[tuple[str, dict[str, Any]]],
+        timeout: float | None = None,
+        **kwargs: Any,
+    ) -> Any:
         attempts.append(len(statements))
         if len(attempts) == 1:
             raise RuntimeError("capture exploded")
-        return original(statements, timeout)
+        return original(statements, timeout, **kwargs)
 
     monkeypatch.setattr(saver.proxy, "execute_batch", flaky)
 
@@ -533,3 +551,125 @@ def test_ac42_call_saved_before_its_checkpoint_is_attached_by_a_resend_to_that_c
 
     assert _edges(saver) == [("chk-c1", cid)]
     assert len(saver._applied_tool_calls) == 1
+
+
+class _SpyConnection:
+    """Wraps a real connection and records commit, flush and close calls in order."""
+
+    def __init__(self, inner: Any, events: list[str]) -> None:
+        self._inner = inner
+        self._events = events
+
+    @property
+    def autocommit(self) -> bool:
+        return bool(self._inner.autocommit)
+
+    @autocommit.setter
+    def autocommit(self, value: bool) -> None:
+        self._inner.autocommit = value
+
+    def commit(self) -> None:
+        self._events.append("commit")
+        self._inner.commit()
+
+    def flush(self) -> None:
+        self._events.append("flush")
+        self._inner.flush()
+
+    def close(self) -> None:
+        self._events.append("close")
+        self._inner.close()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+def _spy_saver(events: list[str]) -> RelateSaver:
+    def factory(db_path: str) -> _SpyConnection:
+        return _SpyConnection(relate.connect(database=db_path), events)
+
+    return RelateSaver(db_path=":memory:", connection_factory=factory)
+
+
+def test_adr14_put_capture_commits_without_flush_after_checkpoint_flush() -> None:
+    """ADR-0014: put() flushes its checkpoint save; the capture batch commits without a flush."""
+    events: list[str] = []
+    spy = _spy_saver(events)
+    try:
+        events.clear()
+        _put(spy, "t14p", "chk-14p", {"messages": [_ai((_call_id(), "t", {}))]})
+        assert events == ["flush", "commit"]
+    finally:
+        spy.abort()
+
+
+def test_adr14_put_writes_capture_commits_without_flush_after_writes_flush() -> None:
+    """ADR-0014: put_writes() flushes its writes save; the capture batch commits without a flush."""
+    events: list[str] = []
+    spy = _spy_saver(events)
+    try:
+        _put(spy, "t14w", "chk-14w", {})
+        events.clear()
+        spy.put_writes(
+            _config("t14w", "chk-14w"),
+            [("messages", [_ai((_call_id(), "t", {}))])],
+            "task-14",
+        )
+        assert events == ["commit", "flush", "commit"]
+    finally:
+        spy.abort()
+
+
+def test_adr14_save_without_new_tool_calls_flushes_once() -> None:
+    """ADR-0014: a save with no capture still ends with its own flush."""
+    events: list[str] = []
+    spy = _spy_saver(events)
+    try:
+        events.clear()
+        _put(spy, "t14n", "chk-14n", {"messages": [HumanMessage("hi")]})
+        assert events == ["flush"]
+    finally:
+        spy.abort()
+
+
+def test_adr14_close_flushes_after_a_capture_without_flush() -> None:
+    """ADR-0014: close() flushes the unflushed capture commit before the connection closes."""
+    events: list[str] = []
+    spy = _spy_saver(events)
+    _put(spy, "t14c", "chk-14c", {"messages": [_ai((_call_id(), "t", {}))]})
+    events.clear()
+    spy.close()
+    assert events == ["flush", "close"]
+
+
+def test_adr14_abort_does_not_flush() -> None:
+    """ADR-0014: abort() closes the connection without flushing."""
+    events: list[str] = []
+    spy = _spy_saver(events)
+    _put(spy, "t14a", "chk-14a", {"messages": [_ai((_call_id(), "t", {}))]})
+    events.clear()
+    spy.abort()
+    assert events == ["close"]
+
+
+def test_adr14_tool_call_data_survives_close_and_reopen(tmp_path: Path) -> None:
+    """ADR-0014: nodes, outcomes and edges are in the file after close() and a reopen."""
+    db = str(tmp_path / "reopen.db")
+    first, second = _call_id(), _call_id()
+    ai1, ai2 = _ai((first, "search", {"q": "x"})), _ai((second, "lookup", {}))
+    tm1 = ToolMessage(content="found", tool_call_id=first)
+    writer = RelateSaver(db_path=db)
+    _put(writer, "t14r", "chk-r1", {"messages": [ai1]})
+    _put(writer, "t14r", "chk-r2", {"messages": [ai1, tm1]}, step=1)
+    # The last commit before close() is a capture that has not been flushed.
+    writer.put_writes(_config("t14r", "chk-r2"), [("messages", [ai2])], "task-r")
+    writer.close()
+
+    reader = RelateSaver(db_path=db)
+    try:
+        nodes = _tool_nodes(reader)
+        assert set(nodes) == {first, second}
+        assert reader.serde.loads(bytes(nodes[first]["result_blob"])) == "found"
+        assert _edges(reader) == sorted([("chk-r1", first), ("chk-r2", second)])
+    finally:
+        reader.close()
