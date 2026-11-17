@@ -99,6 +99,76 @@ Run the complete multi-agent research demo (Planner, Researcher, Human Review in
 python examples/research_agent.py --topic "Autonomous Agent Architecture"
 ```
 
+### Running the tool-calling demo
+
+`examples/tool_agent.py` needs no API key. A deterministic agent asks a `ToolNode` to run one tool, and the tool fails on purpose. RelateSaver records the call as a `:ToolCall` node, so the root cause can be traced afterwards from the database file alone (ADR-0005):
+
+```bash
+# Run the agent; it prints the thread ID and a root-cause analysis
+python examples/tool_agent.py --db tool_agent.rl --thread-id demo-1
+
+# Trace the failure again later, from the file only
+relate-dag forensics trace-error demo-1 --db tool_agent.rl
+```
+
+Pass `--no-fail` to let the tool succeed.
+
+### Async usage
+
+`RelateSaver` implements the async checkpointer methods (`aget_tuple`, `alist`, `aput`, `aput_writes`), so compiled graphs work with `ainvoke` and `astream`. The synchronous methods run on worker threads, off the event loop, and writes still go through the single writer thread (ADR-0006).
+
+## How we use Relate, and why
+
+Relate is an embedded graph database from Neo4j. We use these capabilities, and nothing beyond them:
+
+- **Embedded single-file database.** Each saver opens one `.rl` file in-process. Checkpoints need no server, container or credentials, and the whole execution history of an agent is one file you can copy, attach to a bug report or delete (ADR-0001).
+- **Write-ahead logging (WAL).** Every checkpoint is committed through the WAL and flushed, so a committed checkpoint survives a process restart and an interrupted write is rolled back on reopen. An agent that resumes a thread after a crash needs exactly that guarantee.
+- **Native Cypher queries.** Agent execution is a graph, so we query it as one. `relate-dag forensics trace-error` walks `[:NEXT*0..]` backwards from a failed checkpoint across `[:HAS_WRITE]` and `[:INVOKED]` edges to the write or tool call that caused it. This is a single path query, where a relational schema needs a recursive join (ADR-0003).
+- **Connected schema.** `:Thread`, `:Checkpoint`, `:Write` and `:ToolCall` nodes are linked by `NEXT` (the causal order), `FORKED_TO` (a branch created by replay or a fork), `HAS_WRITE` (pending and channel writes) and `INVOKED` (a tool call made at a checkpoint). Forks and tool calls are edges in the data, so the terminal tree and the forensics reports read them directly instead of reconstructing them.
+- **Uniqueness constraints and indexes.** Constraints on thread, checkpoint, write and tool-call identifiers make writes idempotent and reject duplicates; indexes on thread, namespace, step and state hash keep lookups by thread and by checkpoint from scanning the graph.
+- **`:memory:` databases.** `fork_in_memory()` copies the history up to a chosen checkpoint into a throwaway `:memory:` database, so you can replay and experiment without touching the production file and without cleanup afterwards (ADR-0004).
+
+### Limits
+
+RelateSaver is a single-process engine. Use one `RelateSaver` per process and per database file. Inside that process it is safe to share across threads and async tasks, because all writes are serialized through one writer thread (ADR-0002), but a second process opening the same file is not supported. For multi-worker or multi-pod deployments, use PostgresSaver (`langgraph-checkpoint-postgres`) instead.
+
+## Benchmark
+
+`benchmarks/bench_checkpointers.py` writes N checkpoints with RelateSaver and with LangGraph's SqliteSaver, then measures put throughput, `get_tuple` latency, on-disk size and a branch ancestry query (ADR-0008). Reproduce it from the project virtual environment:
+
+```bash
+python benchmarks/bench_checkpointers.py --checkpoints 1000
+```
+
+These are the values that command printed, unedited. They are one run on one machine; expect different numbers on yours.
+
+- Checkpoints (N): 1000
+- Payload bytes (B): 256
+- OS: Windows-11-10.0.26340-SP0
+- CPU: AMD64 Family 23 Model 24 Stepping 1, AuthenticAMD
+- Python: 3.13.2
+- relate-db: 1.0.2
+- langgraph-checkpoint: 4.3.2
+- langgraph-checkpoint-sqlite: 3.1.3
+- SQLite: 3.45.3
+
+| Metric | RelateSaver (flush per write, default) | RelateSaver (wal_enabled=False) | SqliteSaver |
+| :--- | ---: | ---: | ---: |
+| Put throughput (checkpoints/s) | 9.6 | 207.1 | 972.7 |
+| Get p50 (ms) | 2.716 | 2.545 | 0.049 |
+| Get p95 (ms) | 3.078 | 3.192 | 0.073 |
+| On-disk size (KiB) | 1648.0 | 11536.0 | 724.0 |
+| Ancestry query, median of 5 (ms) | 12.704 | 9.295 | 238.964 |
+
+What the numbers say:
+
+- SqliteSaver is much faster for writes and for point reads (`get_tuple`), and its file is smaller.
+- With the default settings RelateSaver flushes after every write, which is what makes a committed checkpoint durable. In relate-db 1.0 the cost of that flush grows with the size of the database file, so save latency grows as a run gets longer. We keep it as the default because it is the safe choice (ADR-0001).
+- `wal_enabled=False` skips the per-write flush and keeps put latency flat, but we have not verified its durability across power loss, and the file is larger. It is not recommended for data you cannot lose.
+- The ancestry query is anchored on the target checkpoint and walks its ancestors. At this N it is faster in Relate than SQLite's recursive query. That is one query on one workload and says nothing about overall speed.
+
+Choose RelateSaver for the graph model and the forensics and time-travel features, not for write throughput. If throughput or multi-process access matters more, use SqliteSaver or PostgresSaver.
+
 ## Running tests
 
 Run the automated test suite using `pytest`:
@@ -136,8 +206,11 @@ RelateGraphSaver/
 │   ├── fakes/                  # In-memory mock Relate database drivers
 │   ├── integration/            # End-to-end multi-agent and CLI integration tests
 │   └── unit/                   # Component-level unit test suites
+├── benchmarks/
+│   └── bench_checkpointers.py  # RelateSaver vs SqliteSaver benchmark
 ├── examples/
-│   └── research_agent.py       # Multi-agent research pipeline demo
+│   ├── research_agent.py       # Multi-agent research pipeline demo
+│   └── tool_agent.py           # Key-free tool-calling demo with a failing tool
 ├── docs/                       # Living architectural documentation
 ├── pyproject.toml              # Build specifications, dependencies, and metadata
 ├── CHANGELOG.md                # Release history and unreleased changes
