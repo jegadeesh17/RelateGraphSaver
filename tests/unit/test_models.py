@@ -393,6 +393,23 @@ class TestForensicReports:
         with pytest.raises(ValueError, match="error_checkpoint_id must be a non-empty string"):
             RootCauseReport(thread_id="th-1", error_checkpoint_id="", error_message="msg")
 
+    def test_root_cause_report_root_tool_name_defaults_to_none_ac_45(self) -> None:
+        """AC-45: root_tool_name is optional and last, so existing construction is unchanged."""
+        keyword = RootCauseReport(thread_id="th-1", error_checkpoint_id="cp-1", error_message="m")
+        assert keyword.root_tool_name is None
+
+        positional = RootCauseReport("th-1", "cp-1", "m", "call-1", "w-1", 2, "summary")
+        assert positional.root_tool_call_id == "call-1"
+        assert positional.root_channel_write == "w-1"
+        assert positional.causal_path_length == 2
+        assert positional.diagnostic_summary == "summary"
+        assert positional.root_tool_name is None
+
+        named = RootCauseReport(
+            thread_id="th-1", error_checkpoint_id="cp-1", error_message="m", root_tool_name="search"
+        )
+        assert named.root_tool_name == "search"
+
 
 class TestSchemaDDLAndConstraints:
     """Test suite for Cypher schema DDL statements and initialize_schema function."""

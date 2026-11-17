@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, TypedDict
 
 import pytest
+from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import empty_checkpoint
 from langgraph.graph import END, START, StateGraph
@@ -371,3 +372,30 @@ class TestRelateForensics:
             assert report.causal_path_length == 1
             assert "HTTP 429" in report.error_message or "search_api" in report.error_message
             assert "call-search-err-99" in report.diagnostic_summary
+
+    def test_trace_root_cause_names_failing_tool_from_put_writes_ac_45(
+        self, temp_disk_db: str
+    ) -> None:
+        """AC-45: a tool call recorded via put_writes() is reported by tool_name and call_id."""
+        thread_id = "thread-tool-name-001"
+        call_id = "call-weather-77"
+        with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
+            cfg: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+            cp: Any = dict(empty_checkpoint())
+            cp["id"] = "cp-name-001"
+            saved_cfg = saver.put(cfg, cp, {"step": 1, "source": "loop", "parents": {}}, {})
+            ai = AIMessage(
+                content="",
+                tool_calls=[{"id": call_id, "name": "get_weather", "args": {"city": "X"}}],
+            )
+            saver.put_writes(saved_cfg, [("messages", [ai])], task_id="task-ai")
+            tool_msg = ToolMessage(content="upstream down", tool_call_id=call_id, status="error")
+            saver.put_writes(saved_cfg, [("messages", [tool_msg])], task_id="task-tool")
+
+            report = saver.trace_root_cause(thread_id)
+
+        assert report.root_tool_call_id == call_id
+        assert report.root_tool_name == "get_weather"
+        assert f"Root tool invocation: '{call_id}'. Failing tool: 'get_weather'." in (
+            report.diagnostic_summary
+        )

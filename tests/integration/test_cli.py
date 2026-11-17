@@ -502,6 +502,15 @@ class TestCliForensicsCommand:
         assert "InvalidPayloadException" in result.output
         assert "Diagnostic Summary" in result.output
 
+    def test_forensics_trace_error_shows_root_tool_name_ac_45(
+        self, runner: CliRunner, seeded_error_db: tuple[str, str, str]
+    ) -> None:
+        """AC-45: trace-error output includes a Root Tool Name line, None when unknown."""
+        db_file, thread_id, _ = seeded_error_db
+        result = runner.invoke(app, ["forensics", "trace-error", thread_id, "--db", db_file])
+        assert result.exit_code == 0
+        assert "Root Tool Name:" in result.output
+
     def test_forensics_trace_alias(
         self, runner: CliRunner, seeded_error_db: tuple[str, str, str]
     ) -> None:

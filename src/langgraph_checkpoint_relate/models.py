@@ -297,6 +297,7 @@ class RootCauseReport:
     root_channel_write: str | None = None
     causal_path_length: int = 0
     diagnostic_summary: str = ""
+    root_tool_name: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.thread_id, str) or not self.thread_id.strip():

@@ -460,6 +460,7 @@ class RelateForensics:
         )
 
         root_tool_call_id: str | None = None
+        root_tool_name: str | None = None
         root_channel_write: str | None = None
         causal_path_length: int = 0
 
@@ -468,6 +469,7 @@ class RelateForensics:
         for r in causal_rows:
             if r.get("tool_call_id") and r.get("tool_error"):
                 root_tool_call_id = str(r["tool_call_id"])
+                root_tool_name = str(r["tool_name"]) if r.get("tool_name") else None
                 root_channel_write = str(r["write_id"]) if r.get("write_id") else None
                 causal_path_length = int(r.get("distance_to_error", 0))
                 break
@@ -492,6 +494,7 @@ class RelateForensics:
                         root_tool_call_id = (
                             str(r["tool_call_id"]) if r.get("tool_call_id") else None
                         )
+                        root_tool_name = str(r["tool_name"]) if r.get("tool_name") else None
                         causal_path_length = int(r.get("distance_to_error", 0))
                         break
 
@@ -500,6 +503,7 @@ class RelateForensics:
             for r in causal_rows:
                 if r.get("tool_call_id") and int(r.get("distance_to_error", 0)) > 0:
                     root_tool_call_id = str(r["tool_call_id"])
+                    root_tool_name = str(r["tool_name"]) if r.get("tool_name") else None
                     root_channel_write = str(r["write_id"]) if r.get("write_id") else None
                     causal_path_length = int(r.get("distance_to_error", 0))
                     break
@@ -512,6 +516,7 @@ class RelateForensics:
                 if channel and channel != "__error__" and dist > 0:
                     root_channel_write = str(r["write_id"])
                     root_tool_call_id = str(r["tool_call_id"]) if r.get("tool_call_id") else None
+                    root_tool_name = str(r["tool_name"]) if r.get("tool_name") else None
                     causal_path_length = dist
                     break
 
@@ -522,6 +527,7 @@ class RelateForensics:
                 if channel and channel != "__error__":
                     root_channel_write = str(r["write_id"])
                     root_tool_call_id = str(r["tool_call_id"]) if r.get("tool_call_id") else None
+                    root_tool_name = str(r["tool_name"]) if r.get("tool_name") else None
                     causal_path_length = int(r.get("distance_to_error", 0))
                     break
 
@@ -535,6 +541,8 @@ class RelateForensics:
         ]
         if root_tool_call_id:
             parts.append(f"Root tool invocation: '{root_tool_call_id}'.")
+            if root_tool_name:
+                parts.append(f"Failing tool: '{root_tool_name}'.")
         if root_channel_write:
             parts.append(f"Offending antecedent write: '{root_channel_write}'.")
         parts.append(f"Causal path distance: {causal_path_length} step(s).")
@@ -548,6 +556,7 @@ class RelateForensics:
             root_channel_write=root_channel_write,
             causal_path_length=causal_path_length,
             diagnostic_summary=diagnostic_summary,
+            root_tool_name=root_tool_name,
         )
 
 

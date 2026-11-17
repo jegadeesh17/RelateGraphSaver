@@ -296,6 +296,7 @@ def forensics_trace_error(
                     f"[bold cyan]Error Checkpoint ID:[/bold cyan] {report.error_checkpoint_id}\n"
                     f"[bold red]Error Message:[/bold red]       {report.error_message}\n"
                     f"[bold yellow]Root Tool Call ID:[/bold yellow]   {report.root_tool_call_id or 'None'}\n"
+                    f"[bold yellow]Root Tool Name:[/bold yellow]      {report.root_tool_name or 'None'}\n"
                     f"[bold yellow]Root Channel Write:[/bold yellow]  {report.root_channel_write or 'None'}\n"
                     f"[bold green]Causal Path Length:[/bold green]  {report.causal_path_length}\n"
                     f"[bold white]Diagnostic Summary:[/bold white]  {report.diagnostic_summary}"
