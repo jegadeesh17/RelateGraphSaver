@@ -525,7 +525,7 @@ sequenceDiagram
 ```
 
 1. **Serialized Writes:** All mutating operations (`put`, `put_writes`, tool call capture, `fork`) pass through the `RelateThreadProxy` command queue. The proxy executes strictly on a single dedicated background thread, eliminating DB-API thread-affinity violations and file-lock collisions.
-2. **Crash Resilience:** Every commit flushes through the Write-Ahead Log before acknowledging caller futures. If the host process crashes mid-step, uncommitted transactions are rolled back during WAL recovery on restart, guaranteeing zero orphaned nodes or dangling edges.
+2. **Crash Resilience:** Every commit flushes through the Write-Ahead Log before acknowledging caller futures. If the host process crashes mid-step, uncommitted transactions are rolled back during WAL recovery on restart, guaranteeing zero orphaned nodes or dangling edges. Measured cost: in relate-db 1.0 each flush takes time proportional to the database file size, so with the default `wal_enabled=True` save latency grows as a thread's history grows (about 25 ms per save early and about 110 ms after 1,000 checkpoints in our benchmark). `wal_enabled=False` skips only the per-write flush and keeps saves flat (about 3 ms); a process kill still kept committed checkpoints in our tests, but durability across power loss without the flush is not verified, and the file grows larger. We keep the flush as the default.
 3. **Deadlock Prevention:** Calling threads wait synchronously on lightweight `concurrent.futures.Future` objects with configurable timeout guards. Reads and writes cannot interleave within an active atomic transaction.
 
 ### Tool call capture ordering
@@ -561,14 +561,14 @@ sequenceDiagram
 
 **Invocation:** `python benchmarks/bench_checkpointers.py [--checkpoints N] [--payload-bytes B] [--seed S] [--workdir DIR]`. Defaults: `N=200`, `B=256`, `S=0`, `DIR` = a temporary directory deleted at exit. Exit codes: `0` success; `1` if the two savers return different ancestry counts; `2` if `langgraph-checkpoint-sqlite` is not installed (the message says to install the `dev` extra).
 
-**Workload (identical for both savers):** file-backed databases in `DIR` (`relate.rl`, `sqlite.db`). One thread_id; a main chain of N checkpoints where each `put()` receives the config returned by the previous one; channel values `{"step": i, "payload": "x" * B}` with no LangChain messages (so tool call capture adds only its scan); checkpoint ids from `langgraph.checkpoint.base.id.uuid6()`, as LangGraph itself uses. After the timed chain, an untimed branch of `max(1, N // 10)` checkpoints is written from the checkpoint at index `N // 2`. `SqliteSaver` is built as `SqliteSaver(sqlite3.connect(path, check_same_thread=False))` followed by `setup()`.
+**Workload (identical for every run):** file-backed databases in `DIR` (`relate.rl`, `relate-noflush.rl`, `sqlite.db`). RelateSaver runs twice, with the default per-write flush and with `wal_enabled=False`, reported as separate columns. One thread_id; a main chain of N checkpoints where each `put()` receives the config returned by the previous one; channel values `{"step": i, "payload": "x" * B}` with no LangChain messages (so tool call capture adds only its scan); checkpoint ids from `langgraph.checkpoint.base.id.uuid6()`, as LangGraph itself uses. After the timed chain, an untimed branch of `max(1, N // 10)` checkpoints is written from the checkpoint at index `N // 2`. `SqliteSaver` is built as `SqliteSaver(sqlite3.connect(path, check_same_thread=False))` followed by `setup()`.
 
 | Metric | Unit | How it is measured |
 | :--- | :--- | :--- |
 | Put throughput | checkpoints/s | N divided by the `time.perf_counter()` wall time of the N main-chain `put()` calls |
 | Get latency | ms, p50 and p95 | `min(N, 200)` `get_tuple()` calls for checkpoint ids drawn with `random.Random(S)` from the written set, each timed individually |
 | On-disk size | KiB | After the saver and connection are closed: total size of the database file plus every sidecar file sharing its name prefix (WAL, shared-memory) |
-| Ancestry query | ms, median of 5 | All ancestors of the branch leaf back to the root. Relate: one Cypher query over `[:NEXT\|FORKED_TO*0..]` through `saver.proxy.execute_read`. SQLite: one `WITH RECURSIVE` query over the `checkpoints` table's `parent_checkpoint_id` column. Both must return `N // 2 + 1 + max(1, N // 10)` checkpoints. |
+| Ancestry query | ms, median of 5 | All ancestors of the branch leaf back to the root. Relate: one Cypher query over `[:NEXT\|FORKED_TO*0..]`, anchored on the leaf (`(leaf {checkpoint_id})<-[...*0..]-(a)`), through `saver.proxy.execute_read`. The anchor matters: in relate-db 1.0 the unanchored direction expands from every checkpoint and took about 2.3 s at N=1000 against about 9 ms anchored. `trace_root_cause` uses the same anchored shape. SQLite: one `WITH RECURSIVE` query over the `checkpoints` table's `parent_checkpoint_id` column. Both must return `N // 2 + 1 + max(1, N // 10)` checkpoints. |
 
 **Output:** stdout carries only Markdown: an environment block (N, B, OS, CPU from `platform.processor()`, Python version, and the installed versions of `relate-db`, `langgraph-checkpoint`, `langgraph-checkpoint-sqlite` and SQLite) followed by one table with the columns `Metric | RelateSaver | SqliteSaver` and one row per figure (put throughput, get p50, get p95, on-disk size, ancestry query). Progress goes to stderr.
 
@@ -644,7 +644,7 @@ Configuration parameters can be supplied directly to `RelateSaver` or read from 
 | Environment Variable | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `RELATE_DB_PATH` | string | `"checkpoints.rl"` | Default file path for durable embedded graph storage |
-| `RELATE_WAL_ENABLED` | boolean | `true` | Enables Write-Ahead Logging for atomic crash safety |
+| `RELATE_WAL_ENABLED` | boolean | `true` | Enables the per-write WAL flush for crash safety (see the measured cost under the concurrency and crash safety model) |
 | `RELATE_PROXY_TIMEOUT_SEC` | float | `30.0` | Maximum wait time for actor queue transactions before raising timeout |
 | `RELATE_LOG_LEVEL` | string | `"INFO"` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
 
