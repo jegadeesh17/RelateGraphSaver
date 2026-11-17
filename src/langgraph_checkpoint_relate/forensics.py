@@ -433,9 +433,12 @@ class RelateForensics:
         if not error_message:
             error_message = f"Execution error at checkpoint {error_checkpoint_id}"
 
-        # 4. Backward causal path traversal across [:NEXT], [:HAS_WRITE], [:INVOKED]
+        # 4. Backward causal path traversal across [:NEXT], [:HAS_WRITE], [:INVOKED].
+        # The variable-length pattern starts from the uniquely identified error checkpoint
+        # and walks NEXT edges backwards; the reverse direction (antecedent first) makes
+        # the engine expand from every checkpoint in the database.
         causal_query = (
-            "MATCH path = (antecedent:Checkpoint {thread_id: $thread_id})-[:NEXT*0..]->(err:Checkpoint {checkpoint_id: $error_checkpoint_id}) "
+            "MATCH path = (err:Checkpoint {checkpoint_id: $error_checkpoint_id})<-[:NEXT*0..]-(antecedent:Checkpoint {thread_id: $thread_id}) "
             "OPTIONAL MATCH (antecedent)-[:HAS_WRITE]->(w:Write) "
             "OPTIONAL MATCH (antecedent)-[:INVOKED]->(tc1:ToolCall) "
             "OPTIONAL MATCH (w)-[:INVOKED]->(tc2:ToolCall) "

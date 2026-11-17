@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import time
 from collections.abc import Generator
 from pathlib import Path
 from typing import Any, TypedDict
@@ -399,3 +400,44 @@ class TestRelateForensics:
         assert f"Root tool invocation: '{call_id}'. Failing tool: 'get_weather'." in (
             report.diagnostic_summary
         )
+
+    def test_trace_root_cause_long_next_chain_is_fast_ac_27(self, temp_disk_db: str) -> None:
+        """AC-27: root cause on a 300-checkpoint NEXT chain finds the first antecedent quickly."""
+        thread_id = "thread-long-chain-001"
+        chain_length = 300
+        with RelateSaver(db_path=temp_disk_db, wal_enabled=False) as saver:
+            config: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+            first_id = ""
+            for step in range(chain_length):
+                cp: Any = dict(empty_checkpoint())
+                cp["id"] = f"cp-long-{step:04d}"
+                config = saver.put(config, cp, {"step": step, "source": "loop", "parents": {}}, {})
+                if step == 0:
+                    first_id = config["configurable"]["checkpoint_id"]
+
+            saver.proxy.execute_write(
+                "CREATE (tc:ToolCall {call_id: $call_id, tool_name: $name, args_blob: $args, "
+                "error: $err, created_at: $created_at}) "
+                "WITH tc "
+                "MATCH (c:Checkpoint {checkpoint_id: $cid}) "
+                "MERGE (c)-[:INVOKED]->(tc)",
+                {
+                    "call_id": "call-long-chain-1",
+                    "name": "slow_api",
+                    "args": b"{}",
+                    "err": "HTTP 503: upstream unavailable",
+                    "created_at": "2026-11-12T00:00:00Z",
+                    "cid": first_id,
+                },
+            )
+            saver.put_writes(config, [("__error__", "Chain aborted")], task_id="task-long")
+
+            started = time.perf_counter()
+            report = saver.trace_root_cause(thread_id)
+            elapsed = time.perf_counter() - started
+
+        assert report.error_checkpoint_id == config["configurable"]["checkpoint_id"]
+        assert report.root_tool_call_id == "call-long-chain-1"
+        assert report.root_tool_name == "slow_api"
+        assert report.causal_path_length == chain_length - 1
+        assert elapsed < 1.0

@@ -34,12 +34,13 @@ from langgraph_checkpoint_relate import RelateSaver
 
 THREAD_ID = "bench-thread"
 RELATE_FILE = "relate.rl"
+RELATE_NO_FLUSH_FILE = "relate-noflush.rl"
 SQLITE_FILE = "sqlite.db"
 GET_SAMPLE_LIMIT = 200
 ANCESTRY_REPEATS = 5
 
 RELATE_ANCESTRY_CYPHER = (
-    "MATCH (a:Checkpoint)-[:NEXT|FORKED_TO*0..]->(leaf:Checkpoint {checkpoint_id: $leaf}) "
+    "MATCH (leaf:Checkpoint {checkpoint_id: $leaf})<-[:NEXT|FORKED_TO*0..]-(a:Checkpoint) "
     "RETURN count(DISTINCT a) AS n"
 )
 SQLITE_ANCESTRY_SQL = (
@@ -156,20 +157,31 @@ def disk_size_kib(directory: Path, prefix: str) -> float:
 
 
 def bench_relate(
-    workdir: Path, count: int, payload: str, get_ids: Callable[[list[str]], list[str]]
+    workdir: Path,
+    count: int,
+    payload: str,
+    get_ids: Callable[[list[str]], list[str]],
+    *,
+    wal_enabled: bool = True,
 ) -> dict[str, Any]:
-    """Run the workload against RelateSaver on a file-backed database."""
-    saver = RelateSaver(str(workdir / RELATE_FILE))
+    """Run the workload against RelateSaver on a file-backed database.
+
+    ``wal_enabled`` selects the flush mode: True flushes after every write (the default),
+    False skips the per-write flush.
+    """
+    filename = RELATE_FILE if wal_enabled else RELATE_NO_FLUSH_FILE
+    label = "RelateSaver" if wal_enabled else "RelateSaver (wal_enabled=False)"
+    saver = RelateSaver(str(workdir / filename), wal_enabled=wal_enabled)
 
     def ancestry(leaf: str) -> int:
         records = saver.proxy.execute_read(RELATE_ANCESTRY_CYPHER, {"leaf": leaf})
         return int(records[0]["n"])
 
     try:
-        result = run_workload(saver, count, payload, get_ids, ancestry, "RelateSaver")
+        result = run_workload(saver, count, payload, get_ids, ancestry, label)
     finally:
         saver.close()
-    result["size_kib"] = disk_size_kib(workdir, RELATE_FILE)
+    result["size_kib"] = disk_size_kib(workdir, filename)
     return result
 
 
@@ -204,7 +216,11 @@ def package_version(name: str) -> str:
 
 
 def render_markdown(
-    count: int, payload_bytes: int, relate: dict[str, Any], sqlite: dict[str, Any]
+    count: int,
+    payload_bytes: int,
+    relate: dict[str, Any],
+    relate_no_flush: dict[str, Any],
+    sqlite: dict[str, Any],
 ) -> str:
     """Render the environment block and the results table as Markdown."""
     lines = [
@@ -220,8 +236,9 @@ def render_markdown(
         f"- langgraph-checkpoint-sqlite: {package_version('langgraph-checkpoint-sqlite')}",
         f"- SQLite: {sqlite3.sqlite_version}",
         "",
-        "| Metric | RelateSaver | SqliteSaver |",
-        "| :--- | ---: | ---: |",
+        "| Metric | RelateSaver (flush per write, default) | RelateSaver (wal_enabled=False) "
+        "| SqliteSaver |",
+        "| :--- | ---: | ---: | ---: |",
     ]
     rows = [
         ("Put throughput (checkpoints/s)", "put_per_second", "{:.1f}"),
@@ -231,7 +248,8 @@ def render_markdown(
         ("Ancestry query, median of 5 (ms)", "ancestry_ms", "{:.3f}"),
     ]
     for title, key, fmt in rows:
-        lines.append(f"| {title} | {fmt.format(relate[key])} | {fmt.format(sqlite[key])} |")
+        cells = [fmt.format(result[key]) for result in (relate, relate_no_flush, sqlite)]
+        lines.append(f"| {title} | " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
 
@@ -249,7 +267,8 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         default=None,
         help=(
             "directory for the database files (default: a temporary directory deleted at "
-            f"exit); existing {RELATE_FILE}* and {SQLITE_FILE}* files in it are replaced"
+            f"exit); existing {RELATE_FILE}*, {RELATE_NO_FLUSH_FILE}* and {SQLITE_FILE}* files in "
+            "it are replaced"
         ),
     )
     args = parser.parse_args(argv)
@@ -266,7 +285,7 @@ def run(args: argparse.Namespace, workdir: Path) -> int:
     payload = "x" * args.payload_bytes
     workdir.mkdir(parents=True, exist_ok=True)
     for stale in workdir.iterdir():
-        if stale.name.startswith((RELATE_FILE, SQLITE_FILE)):
+        if stale.name.startswith((RELATE_FILE, RELATE_NO_FLUSH_FILE, SQLITE_FILE)):
             stale.unlink()
 
     sample_size = min(count, GET_SAMPLE_LIMIT)
@@ -277,17 +296,24 @@ def run(args: argparse.Namespace, workdir: Path) -> int:
         return [written[i] for i in indexes]
 
     relate = bench_relate(workdir, count, payload, get_ids)
+    relate_no_flush = bench_relate(workdir, count, payload, get_ids, wal_enabled=False)
     sqlite = bench_sqlite(workdir, count, payload, get_ids)
 
     expected = count // 2 + 1 + max(1, count // 10)
-    if relate["ancestry_count"] != expected or sqlite["ancestry_count"] != expected:
+    counts = (
+        relate["ancestry_count"],
+        relate_no_flush["ancestry_count"],
+        sqlite["ancestry_count"],
+    )
+    if any(found != expected for found in counts):
         log(
             f"Ancestry count mismatch: expected {expected}, RelateSaver returned "
-            f"{relate['ancestry_count']}, SqliteSaver returned {sqlite['ancestry_count']}"
+            f"{relate['ancestry_count']}, RelateSaver (wal_enabled=False) returned "
+            f"{relate_no_flush['ancestry_count']}, SqliteSaver returned {sqlite['ancestry_count']}"
         )
         return 1
 
-    print(render_markdown(count, args.payload_bytes, relate, sqlite))
+    print(render_markdown(count, args.payload_bytes, relate, relate_no_flush, sqlite))
     return 0
 
 
