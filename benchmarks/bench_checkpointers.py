@@ -1,4 +1,4 @@
-"""Compare RelateSaver with SqliteSaver on the same checkpoint workload (ADR-0008, AC-56).
+"""Compare RelateSaver with SqliteSaver on the same checkpoint workload (ADR-0008, ADR-0012, AC-56).
 
 Run ``python benchmarks/bench_checkpointers.py --checkpoints 1000`` from a development
 install. Standard output carries only Markdown (an environment block and one table);
@@ -38,6 +38,7 @@ RELATE_NO_FLUSH_FILE = "relate-noflush.rl"
 SQLITE_FILE = "sqlite.db"
 GET_SAMPLE_LIMIT = 200
 ANCESTRY_REPEATS = 5
+SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 
 RELATE_ANCESTRY_CYPHER = (
     "MATCH (leaf:Checkpoint {checkpoint_id: $leaf})<-[:NEXT|FORKED_TO*0..]-(a:Checkpoint) "
@@ -48,8 +49,8 @@ SQLITE_ANCESTRY_SQL = (
     " SELECT checkpoint_id FROM checkpoints"
     "  WHERE thread_id = ? AND checkpoint_ns = '' AND checkpoint_id = ?"
     " UNION ALL"
-    " SELECT c.parent_checkpoint_id FROM checkpoints c"
-    "  JOIN ancestry a ON c.checkpoint_id = a.checkpoint_id"
+    " SELECT c.parent_checkpoint_id"
+    "  FROM ancestry a CROSS JOIN checkpoints c ON c.checkpoint_id = a.checkpoint_id"
     "  WHERE c.thread_id = ? AND c.checkpoint_ns = '' AND c.parent_checkpoint_id IS NOT NULL"
     ") SELECT count(*) FROM ancestry"
 )
@@ -150,9 +151,14 @@ def run_workload(
     }
 
 
-def disk_size_kib(directory: Path, prefix: str) -> float:
-    """Return the total size in KiB of every file in ``directory`` whose name starts with prefix."""
-    total = sum(p.stat().st_size for p in directory.iterdir() if p.name.startswith(prefix))
+def owned_paths(directory: Path, filename: str) -> list[Path]:
+    """Return the database file and its sidecars: the only paths the script may touch."""
+    return [directory / filename] + [directory / (filename + suffix) for suffix in SIDECAR_SUFFIXES]
+
+
+def disk_size_kib(directory: Path, filename: str) -> float:
+    """Return the total size in KiB of ``filename`` and its existing -wal, -shm, -journal files."""
+    total = sum(p.stat().st_size for p in owned_paths(directory, filename) if p.is_file())
     return total / 1024.0
 
 
@@ -267,8 +273,8 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         default=None,
         help=(
             "directory for the database files (default: a temporary directory deleted at "
-            f"exit); existing {RELATE_FILE}*, {RELATE_NO_FLUSH_FILE}* and {SQLITE_FILE}* files in "
-            "it are replaced"
+            f"exit); existing {RELATE_FILE}, {RELATE_NO_FLUSH_FILE} and {SQLITE_FILE} and their "
+            "-wal, -shm and -journal files in it are replaced; nothing else is touched"
         ),
     )
     args = parser.parse_args(argv)
@@ -284,9 +290,10 @@ def run(args: argparse.Namespace, workdir: Path) -> int:
     count: int = args.checkpoints
     payload = "x" * args.payload_bytes
     workdir.mkdir(parents=True, exist_ok=True)
-    for stale in workdir.iterdir():
-        if stale.name.startswith((RELATE_FILE, RELATE_NO_FLUSH_FILE, SQLITE_FILE)):
-            stale.unlink()
+    for filename in (RELATE_FILE, RELATE_NO_FLUSH_FILE, SQLITE_FILE):
+        for stale in owned_paths(workdir, filename):
+            if stale.is_file():
+                stale.unlink()
 
     sample_size = min(count, GET_SAMPLE_LIMIT)
 

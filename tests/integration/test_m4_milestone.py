@@ -389,6 +389,70 @@ class TestBenchmarkScript:
             assert len(values) == 3
             assert all(value >= 0.0 for value in values)
 
+    @pytest.mark.slow
+    def test_run_replaces_only_its_own_files_in_workdir_ac_56(self, tmp_path: Path) -> None:
+        # Files whose names merely start with a database name must survive; stale owned
+        # files and sidecars are replaced.
+        keep = {
+            "relate.rl.keep": b"mine",
+            "relate-noflush.rl.bak": b"mine too",
+            "sqlite.db.notes": b"notes",
+            "unrelated.txt": b"unrelated",
+        }
+        for name, content in keep.items():
+            (tmp_path / name).write_bytes(content)
+        stale_sidecar = tmp_path / "sqlite.db-journal"
+        stale_sidecar.write_bytes(b"stale")
+
+        result = _run_process(
+            [
+                sys.executable,
+                str(_BENCHMARK_SCRIPT),
+                "--checkpoints",
+                "20",
+                "--payload-bytes",
+                "16",
+                "--workdir",
+                str(tmp_path),
+            ],
+            timeout=300.0,
+        )
+        # Exit code 0 means all three runs returned the same ancestry count.
+        assert result.returncode == 0, _output_tail(result)
+        for name, content in keep.items():
+            assert (tmp_path / name).read_bytes() == content, name
+        assert not stale_sidecar.exists()
+        for owned in ("relate.rl", "relate-noflush.rl", "sqlite.db"):
+            assert (tmp_path / owned).is_file(), owned
+
+    def test_disk_size_counts_only_exact_files_and_sidecars_ac_56(self, tmp_path: Path) -> None:
+        module = _load_benchmark_module()
+        (tmp_path / "relate.rl").write_bytes(b"a" * 1024)
+        (tmp_path / "relate.rl-wal").write_bytes(b"b" * 2048)
+        (tmp_path / "relate.rl.keep").write_bytes(b"c" * 4096)
+        (tmp_path / "relate.rl-other").write_bytes(b"d" * 8192)
+        assert module.disk_size_kib(tmp_path, "relate.rl") == 3.0
+
+    def test_sqlite_ancestry_query_uses_primary_key_walk_and_counts_ancestors_ac_56(self) -> None:
+        import sqlite3
+
+        module = _load_benchmark_module()
+        assert "FROM ancestry a CROSS JOIN checkpoints c ON" in module.SQLITE_ANCESTRY_SQL
+        connection = sqlite3.connect(":memory:")
+        try:
+            connection.execute(
+                "CREATE TABLE checkpoints (thread_id TEXT, checkpoint_ns TEXT, "
+                "checkpoint_id TEXT, parent_checkpoint_id TEXT, "
+                "PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id))"
+            )
+            rows = [("t", "", "c1", None), ("t", "", "c2", "c1"), ("t", "", "c3", "c2")]
+            rows.append(("t", "", "b1", "c1"))
+            connection.executemany("INSERT INTO checkpoints VALUES (?, ?, ?, ?)", rows)
+            row = connection.execute(module.SQLITE_ANCESTRY_SQL, ("t", "c3", "t")).fetchone()
+        finally:
+            connection.close()
+        assert row[0] == 3
+
     def test_zero_checkpoints_is_rejected_with_usage_error_ac_56(
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:

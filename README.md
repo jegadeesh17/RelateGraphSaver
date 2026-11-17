@@ -122,7 +122,7 @@ Pass `--no-fail` to let the tool succeed.
 Relate is an embedded graph database from Neo4j. We use these capabilities, and nothing beyond them:
 
 - **Embedded single-file database.** Each saver opens one `.rl` file in-process. Checkpoints need no server, container or credentials, and the whole execution history of an agent is one file you can copy, attach to a bug report or delete (ADR-0001).
-- **Write-ahead logging (WAL).** Every checkpoint is committed through the WAL and flushed, so a committed checkpoint survives a process restart and an interrupted write is rolled back on reopen. An agent that resumes a thread after a crash needs exactly that guarantee.
+- **Write-ahead logging (WAL).** Every checkpoint and every writes save is committed through the WAL and flushed, so a committed checkpoint survives a process restart and an interrupted write is rolled back on reopen. An agent that resumes a thread after a crash needs exactly that guarantee. Tool-call records are committed without their own flush and become durable with the next flushed save or when `close()` is called; they are best effort, and a lost record does not affect the checkpoint (ADR-0014).
 - **Native Cypher queries.** Agent execution is a graph, so we query it as one. `relate-dag forensics trace-error` walks `[:NEXT*0..]` backwards from a failed checkpoint across `[:HAS_WRITE]` and `[:INVOKED]` edges to the write or tool call that caused it. This is a single path query, where a relational schema needs a recursive join (ADR-0003).
 - **Connected schema.** `:Thread`, `:Checkpoint`, `:Write` and `:ToolCall` nodes are linked by `NEXT` (the causal order), `FORKED_TO` (a branch created by replay or a fork), `HAS_WRITE` (pending and channel writes) and `INVOKED` (a tool call made at a checkpoint). Forks and tool calls are edges in the data, so the terminal tree and the forensics reports read them directly instead of reconstructing them.
 - **Uniqueness constraints and indexes.** Constraints on thread, checkpoint, write and tool-call identifiers make writes idempotent and reject duplicates; indexes on thread, namespace, step and state hash keep lookups by thread and by checkpoint from scanning the graph.
@@ -140,7 +140,7 @@ RelateSaver is a single-process engine. Use one `RelateSaver` per process and pe
 python benchmarks/bench_checkpointers.py --checkpoints 1000
 ```
 
-These are the values that command printed, unedited. They are one run on one machine; expect different numbers on yours.
+These are the values that command printed, unedited. They are one run on one machine; numbers vary from run to run on the same machine, so expect different ones on yours.
 
 - Checkpoints (N): 1000
 - Payload bytes (B): 256
@@ -154,20 +154,20 @@ These are the values that command printed, unedited. They are one run on one mac
 
 | Metric | RelateSaver (flush per write, default) | RelateSaver (wal_enabled=False) | SqliteSaver |
 | :--- | ---: | ---: | ---: |
-| Put throughput (checkpoints/s) | 9.6 | 207.1 | 972.7 |
-| Get p50 (ms) | 2.716 | 2.545 | 0.049 |
-| Get p95 (ms) | 3.078 | 3.192 | 0.073 |
-| On-disk size (KiB) | 1648.0 | 11536.0 | 724.0 |
-| Ancestry query, median of 5 (ms) | 12.704 | 9.295 | 238.964 |
+| Put throughput (checkpoints/s) | 14.5 | 309.1 | 1204.1 |
+| Get p50 (ms) | 1.208 | 1.442 | 0.036 |
+| Get p95 (ms) | 1.773 | 1.792 | 0.040 |
+| On-disk size (KiB) | 1648.0 | 11532.0 | 724.0 |
+| Ancestry query, median of 5 (ms) | 6.210 | 6.200 | 0.920 |
 
 What the numbers say:
 
-- SqliteSaver is much faster for writes and for point reads (`get_tuple`), and its file is smaller.
+- SqliteSaver is faster than RelateSaver on every speed metric here: writes, point reads (`get_tuple`) and the ancestry query. Its file is also smaller. Each saver's queries are written in the best form we know for its engine (ADR-0012): the ancestry query is anchored on the branch tip in Relate and walks parents by primary key in SQLite, and both return the same count.
 - With the default settings RelateSaver flushes after every write, which is what makes a committed checkpoint durable. In relate-db 1.0 the cost of that flush grows with the size of the database file, so save latency grows as a run gets longer. We keep it as the default because it is the safe choice (ADR-0001).
-- `wal_enabled=False` skips the per-write flush and keeps put latency flat, but we have not verified its durability across power loss, and the file is larger. It is not recommended for data you cannot lose.
-- The ancestry query is anchored on the target checkpoint and walks its ancestors. At this N it is faster in Relate than SQLite's recursive query. That is one query on one workload and says nothing about overall speed.
+- `wal_enabled=False` skips the per-write flush and keeps put latency flat, but its file is larger, and we have not verified that it survives power loss without the flush. It is not recommended for data you cannot lose.
+- Absolute numbers will differ on your machine. Run the command above to get your own.
 
-Choose RelateSaver for the graph model and the forensics and time-travel features, not for write throughput. If throughput or multi-process access matters more, use SqliteSaver or PostgresSaver.
+We choose Relate for what the connected graph lets you ask and do, not for speed. Forks, tool calls and causal order are edges, so `relate-dag` can trace a failure to the write or tool call behind it with one path query; `fork_in_memory()` gives you a sandboxed copy of the history to replay without touching the production file; and the whole history stays in a single file with no server. If write throughput or multi-process access matters more than those, use SqliteSaver or PostgresSaver.
 
 ## Running tests
 
