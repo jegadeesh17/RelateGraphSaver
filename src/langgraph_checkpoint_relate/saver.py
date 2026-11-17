@@ -10,7 +10,7 @@ import builtins
 import logging
 import random
 import uuid
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -33,6 +33,10 @@ from langgraph.checkpoint.serde.base import SerializerProtocol
 from langgraph_checkpoint_relate.errors import RelateCheckpointError
 from langgraph_checkpoint_relate.proxy import RelateThreadProxy
 from langgraph_checkpoint_relate.serde import RelateStateSerializer, default_serializer
+from langgraph_checkpoint_relate.tool_calls import (
+    build_tool_call_statements,
+    extract_tool_events,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -252,6 +256,14 @@ class RelateSaver(BaseCheckpointSaver[str]):
 
         self.proxy.execute_write(cypher, params)
 
+        channel_values = checkpoint.get("channel_values")
+        if isinstance(channel_values, dict):
+            self._capture_tool_calls(
+                values=channel_values.values(),
+                thread_id=thread_id,
+                checkpoint_id=checkpoint_id,
+            )
+
         return {
             "configurable": {
                 "thread_id": thread_id,
@@ -337,6 +349,42 @@ class RelateSaver(BaseCheckpointSaver[str]):
             statements.append((stmt, params))
 
         self.proxy.execute_batch(statements)
+
+        self._capture_tool_calls(
+            values=[value for _, value in writes],
+            thread_id=thread_id,
+            checkpoint_id=checkpoint_id_str,
+        )
+
+    def _capture_tool_calls(
+        self,
+        values: Iterable[Any],
+        thread_id: str,
+        checkpoint_id: str,
+    ) -> None:
+        """Record tool calls found in saved values as :ToolCall nodes (best effort).
+
+        Runs as its own transaction after the checkpoint or writes have committed, so a
+        failure here is logged and ignored and never affects the save (AC-47). Only the
+        checkpoint id and the exception class name are logged, never call content.
+        """
+        try:
+            events = extract_tool_events(values)
+            statements = build_tool_call_statements(
+                events,
+                thread_id=thread_id,
+                checkpoint_id=checkpoint_id,
+                serde=self.serde,
+                created_at=_utc_now_iso(),
+            )
+            if statements:
+                self.proxy.execute_batch(statements)
+        except Exception as exc:
+            logger.warning(
+                "Tool call capture failed for checkpoint %s: %s",
+                checkpoint_id,
+                type(exc).__name__,
+            )
 
     def get_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
         """Retrieve the latest or targeted checkpoint tuple with pending writes.
