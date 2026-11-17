@@ -25,6 +25,7 @@ Reference documents:
 | [ADR-0011](#adr-0011-send-only-new-tool-call-statements-tracked-per-saver) | Send Only New Tool Call Statements, Tracked per Saver | Accepted | 2026-11-17 |
 | [ADR-0012](#adr-0012-fair-ancestry-query-and-exact-file-cleanup-in-the-benchmark) | Fair Ancestry Query and Exact File Cleanup in the Benchmark | Accepted | 2026-11-17 |
 | [ADR-0013](#adr-0013-clean-install-test-skips-only-when-the-package-index-is-unreachable) | Clean-Install Test Skips Only When the Package Index Is Unreachable | Accepted | 2026-11-17 |
+| [ADR-0014](#adr-0014-tool-call-capture-commits-without-its-own-flush) | Tool Call Capture Commits Without Its Own Flush | Accepted | 2026-11-17 |
 
 ---
 
@@ -62,7 +63,8 @@ The engine writes graph data into a single `.rl` file on disk with Write-Ahead L
 ## ADR-0002: Dedicated Actor Proxy for Thread-Affinity and Single-Writer Concurrency
 
 Date: 2026-11-12  
-Status: Accepted
+Status: Accepted  
+Amended by: [ADR-0014](#adr-0014-tool-call-capture-commits-without-its-own-flush)
 
 ### Context
 
@@ -348,7 +350,8 @@ Details: [`fork_in_memory` contract](ARCHITECTURE.md#fork_in_memory-contract).
 ## ADR-0011: Send Only New Tool Call Statements, Tracked per Saver
 
 Date: 2026-11-17  
-Status: Accepted
+Status: Accepted  
+Amended by: [ADR-0014](#adr-0014-tool-call-capture-commits-without-its-own-flush) (capture transaction flush); clarified 2026-11-17 (see Amendment below)
 
 ### Context
 
@@ -378,8 +381,15 @@ This amends ADR-0005; capture still runs as its own best-effort transaction afte
 - **Negative:** Memory grows with the number of distinct (thread, call) pairs a saver sees, roughly a few hundred bytes each, until the saver object is discarded.
 - **Negative:** `put()` still walks the full message history in memory on every save; only serialization and database work are limited to new events.
 - **Negative:** A tool result that matches no call is never marked, so each later save whose history contains it still issues one capture transaction. Real model runs do not produce such results.
-- **Negative:** If `put_writes()` names a checkpoint that is not stored, the call is recorded without its `[:INVOKED]` edge and is not re-linked to a later checkpoint by the same saver. LangGraph does not do this in normal operation.
+- **Negative (corrected 2026-11-17, see Amendment):** If a save names a checkpoint that is not stored yet, the call's node is created without its `[:INVOKED]` edge; the call is resent by later saves until one names a stored checkpoint, and the edge attaches to that later checkpoint, not the one first named. Under concurrent `ainvoke` LangGraph does this in normal operation.
 - **Negative (unchanged from ADR-0005, now stated in full):** If the process dies between a step's checkpoint commit and its capture transaction, that step's tool call data is missing until a later `put()` on the same thread rescans the history. If the thread never saves again, the data stays missing. See [Tool call capture ordering](ARCHITECTURE.md#tool-call-capture-ordering).
+
+### Amendment (2026-11-17): invocations without an edge are not recorded
+
+We first assumed LangGraph always saves a checkpoint before any `put_writes()` that names it. That is false under concurrent `ainvoke`: a task's writes, carrying the model's tool call, can commit before the checkpoint they name. The invocation statement then creates the `:ToolCall` node but finds no checkpoint to link it from. Recording that invocation as done would leave the call permanently without its `[:INVOKED]` edge, so root-cause analysis could never reach it. The rule above is refined, not replaced:
+- The invocation statement returns, per call, whether the thread now has an edge to it (`attached`).
+- An invocation that committed without an edge is not recorded. The next save that carries the call resends the idempotent statement, which attaches the edge to that save's checkpoint. Its outcome, once the node exists, is recorded as before.
+- Details: [Applied tool call record](ARCHITECTURE.md#applied-tool-call-record).
 
 ---
 
@@ -439,3 +449,38 @@ This amends ADR-0009. The test skips, with a reason naming the failure, only whe
 - **Positive:** The full suite passes offline without hiding dependency defects, and the skip reason says the clean install was not verified.
 - **Negative:** A network failure whose message is not on the list still fails the test; the list is updated when that happens.
 - **Negative:** An offline run does not prove AC-33; it has to be re-run with network access.
+
+---
+
+## ADR-0014: Tool Call Capture Commits Without Its Own Flush
+
+Date: 2026-11-17  
+Status: Accepted
+
+### Context
+
+With the default `wal_enabled=True`, every write transaction ends with a flush to disk, and in relate-db 1.0 a flush takes time proportional to the size of the database file. Tool call capture runs as a second transaction after the checkpoint or writes save ([ADR-0005](#adr-0005-capture-tool-calls-from-persisted-langchain-messages), [ADR-0011](#adr-0011-send-only-new-tool-call-statements-tracked-per-saver)), so every save with new tool activity paid for two flushes. On a 150-step tool-heavy run against a file database we measured about 1.53 s per save at the end of the run with capture, against about 0.8 s with capture replaced by a stub. The difference is the capture transaction's own flush.
+
+### Decision
+
+This amends [ADR-0002](#adr-0002-dedicated-actor-proxy-for-thread-affinity-and-single-writer-concurrency), which flushed after every commit.
+- `RelateThreadProxy.execute_batch` gains a keyword-only argument `flush: bool = True`. With `flush=False` the batch still commits or rolls back as one transaction before the caller gets its answer; only the flush after the commit is skipped. The default is unchanged, so every other caller keeps flushing.
+- Only tool call capture passes `flush=False`. Checkpoint saves, writes saves, single statements, `transaction()` and the fork's population batch keep the default.
+- The capture transaction becomes durable with the next flushed write on the same database (normally the next checkpoint or writes save) or when the database is closed. `close()` flushes explicitly before closing the connection, rather than relying on the engine to do so; `abort()` still does not flush.
+- Durability statement: if the process is killed, data committed without a flush was kept in our tests. Whether it survives a power loss or operating system crash before the next flush is not verified. Tool call records are already best effort: a lost capture is handled like the crash between the two transactions described in [Tool call capture ordering](ARCHITECTURE.md#tool-call-capture-ordering).
+- How we check it: a test spy shows the capture batch commits without a flush while checkpoint and writes saves still flush; tool call nodes, outcomes and edges are present after `close()` and reopening the file; and we re-run the same 150-step measurement and publish the new figure as measured.
+
+### Alternatives considered
+
+1. **Put capture in the same transaction as the checkpoint:** Rejected by ADR-0005 and AC-47; a capture error would roll back the checkpoint.
+2. **Keep flushing the capture transaction:** Rejected; it nearly doubles save time late in tool-heavy runs, as measured above.
+3. **Recommend `wal_enabled=False`:** Rejected; it also drops the flush for checkpoints, which are not best effort.
+4. **Flush on a timer in the background:** Rejected; it adds a second source of database work and a shutdown race for little gain over flushing with the next save.
+
+### Consequences
+
+- **Positive:** A save with new tool activity pays for one flush instead of two, so capture no longer doubles save time.
+- **Positive:** The interface change is one keyword with a safe default; no stored data changes.
+- **Negative:** After the last save of a run, its tool call data is not flushed until `close()` or another write. A program that never closes the saver relies on the operating system to write it out, which held for a process kill in our tests but is unverified for power loss.
+- **Negative:** Save time still grows with file size, because the checkpoint's own flush remains; this decision removes one flush, not the underlying cost.
+- **Negative:** Another process reading the file between the capture commit and the next flush depends on relate-db making committed but unflushed data visible; we have not verified that.

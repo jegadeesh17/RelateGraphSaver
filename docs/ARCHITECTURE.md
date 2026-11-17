@@ -2,10 +2,7 @@
 
 Embedded graph-native checkpointing, thread-affinity serialization, and time-travel persistence architecture for LangGraph workflows.
 
-Reference documents:
-- [specification](SPEC.md)
-- [decisions](DECISIONS.md)
-- [overview](README.md)
+Reference documents: [specification](SPEC.md), [decisions](DECISIONS.md), [overview](README.md).
 
 Date: 2026-11-17  
 Status: FROZEN
@@ -51,7 +48,6 @@ ruff check . && ruff format --check . && mypy src tests && python -m pytest -q -
 All four steps exit 0 (AC-35, AC-36, AC-37, AC-38). `ruff` covers every Python file in the repository, including `benchmarks/` and `examples/`; `mypy` covers `src` and `tests` only. The mypy configuration that makes this possible is described in [ADR-0007](DECISIONS.md#adr-0007-static-quality-gates-pass-through-configuration-and-behavior-neutral-fixes).
 
 ### One file test command
-Runs a targeted test file:
 ```bash
 python -m pytest -q tests/unit/test_<module>.py
 ```
@@ -67,8 +63,6 @@ The benchmark is not collected by pytest (`testpaths = ["tests"]`, and the file 
 ---
 
 ## Components
-
-The system is structured into deep modules with clear seams, high internal cohesion, and minimal surface area.
 
 ```mermaid
 graph TD
@@ -326,8 +320,8 @@ class RelateSaver(BaseCheckpointSaver[str]):
   1. `events = extract_tool_events(values)`.
   2. `plan = self._applied_tool_calls.plan(events, thread_id=thread_id)`.
   3. If `plan.events` has no invocations and no outcomes: return. Nothing is serialized and nothing is submitted to the proxy.
-  4. `statements = build_tool_call_statements(plan.events, ...)` with the same keyword arguments as before; if non-empty, one `self.proxy.execute_batch(statements)`.
-  5. `self._applied_tool_calls.mark_applied(plan, thread_id=thread_id)`, reached only when step 4's batch returned normally or had nothing to send (every entry failed serialization).
+  4. `statements = build_tool_call_statements(plan.events, ...)` with the same keyword arguments as before; if non-empty, `detached = detached_call_ids(self.proxy.execute_batch(statements, flush=False))` ([ADR-0014](DECISIONS.md#adr-0014-tool-call-capture-commits-without-its-own-flush)); otherwise `detached` is empty.
+  5. `self._applied_tool_calls.mark_applied(plan, thread_id=thread_id, detached=detached)`, reached only when step 4's batch returned normally or had nothing to send (every entry failed serialization).
 - It catches every `Exception`, logs at WARNING with the checkpoint id and the exception class name only (never argument or result content), and returns normally. On any exception nothing is marked, so the next save that sees the same calls sends them again. Tool call capture can never make `put()` or `put_writes()` raise or roll back (AC-47).
 - No messages in the values means no statements, no `:ToolCall` nodes and no `[:INVOKED]` edges (AC-46).
 - Observable result: a save whose values contain only calls and outcomes this saver has already committed makes exactly one proxy submission (the checkpoint or write transaction). The graph after any sequence of saves is the same as with the earlier send-everything behavior, except for the cases under [Applied tool call record](#applied-tool-call-record).
@@ -363,7 +357,7 @@ One row per edge. A `RelateCheckpointError` from this read propagates to the cal
 
 ### 2. `RelateThreadProxy` Actor Protocol
 
-Embedded databases require strict thread affinity for file writing. The `RelateThreadProxy` encapsulates all direct database driver calls inside an isolated worker actor thread. Its interface is unchanged; tool call capture and the async methods only add callers.
+Embedded databases require strict thread affinity for file writing. The `RelateThreadProxy` encapsulates all direct database driver calls inside an isolated worker actor thread. Tool call capture and the async methods only add callers; the one interface change is the `flush` keyword on `execute_batch` ([ADR-0014](DECISIONS.md#adr-0014-tool-call-capture-commits-without-its-own-flush)).
 
 ```python
 import concurrent.futures
@@ -381,12 +375,15 @@ class RelateThreadProxy:
     def __init__(self, db_path: str, wal_enabled: bool = True) -> None: ...
     def execute_write(self, cypher: str, params: dict[str, Any]) -> Any: ...
     def execute_read(self, cypher: str, params: dict[str, Any]) -> Any: ...
-    def execute_batch(self, statements: list[tuple[str, dict[str, Any]]]) -> list[Any]:
+    def execute_batch(self, statements: list[tuple[str, dict[str, Any]]], timeout: float | None = None,
+                      *, flush: bool = True) -> list[list[dict[str, Any]]]:
         """Run all statements in one transaction; all commit or all roll back."""
-    def stop(self) -> None: ...
+    def close(self, timeout: float | None = 5.0) -> None: ...   # stop() is an alias
 ```
 
 Callers on any thread (LangGraph worker threads, `asyncio.to_thread` workers) block on the command future; the proxy's single worker thread is the only thread that touches the driver.
+
+**`flush` keyword ([ADR-0014](DECISIONS.md#adr-0014-tool-call-capture-commits-without-its-own-flush)).** `BatchCommand` gains `flush: bool = True`, and `_handle_batch_command` calls `conn.flush()` after the commit only when `self.wal_enabled and cmd.flush`. With `flush=False` the batch still commits (or rolls back) as one transaction before the future resolves; only the per-write flush is skipped. The default keeps every existing caller flushing: `execute_write`, `put()`, `put_writes()`, `transaction()`, the dict `transaction` message and the fork population batch do not pass the keyword. Only `RelateSaver._capture_tool_calls` passes `flush=False`. `close()` flushes explicitly: on shutdown the worker calls `conn.flush()` (when `wal_enabled` and the connection has `flush`) before `conn.close()`; a flush error is logged at WARNING and the connection is still closed. `abort()` does not flush. With `wal_enabled=False` the keyword changes nothing.
 
 ### 3. Forensic Data Models
 
@@ -483,6 +480,9 @@ def build_tool_call_statements(
     serde: BlobSerializer, created_at: str,
 ) -> list[tuple[str, dict[str, Any]]]:
     """Invocation statements first, then outcome statements."""
+
+def detached_call_ids(results: Any) -> frozenset[str]:
+    """call_id of every invocation row in one batch's results with attached = false."""
 ```
 
 **Message discovery** (`extract_tool_events`), applied to each value independently:
@@ -504,7 +504,9 @@ OPTIONAL MATCH (linked:Checkpoint {thread_id: $thread_id})-[:INVOKED]->(tc)
 WITH tc, c, count(linked) AS linked_count
 FOREACH (_ IN CASE WHEN c IS NOT NULL AND linked_count = 0 THEN [1] ELSE [] END |
   MERGE (c)-[:INVOKED]->(tc))
+RETURN tc.call_id AS call_id, (c IS NOT NULL OR linked_count > 0) AS attached
 ```
+`attached` is false only when the named checkpoint is not in the file and the thread has no edge to the call yet; `detached_call_ids` counts only rows whose `attached` is exactly `False` and whose `call_id` is a string; outcome statements return no rows.
 
 Successful outcome (AC-43, AC-49):
 ```cypher
@@ -537,18 +539,20 @@ class CapturePlan:
 class AppliedToolCalls:
     """Per-saver record of tool call statements already committed. Thread-safe."""
     def plan(self, events: ToolEvents, *, thread_id: str) -> CapturePlan: ...
-    def mark_applied(self, plan: CapturePlan, *, thread_id: str) -> None: ...
+    def mark_applied(self, plan: CapturePlan, *, thread_id: str,
+                     detached: frozenset[str] = frozenset()) -> None: ...
     def __len__(self) -> int: ...           # distinct (thread_id, call_id) keys held
 ```
 
 - **Key:** `(thread_id, call_id)`. `thread_id` is part of the key because the `[:INVOKED]` edge condition is per thread; `checkpoint_ns` is not, matching the Cypher. State: two sets of keys, `invoked` (invocation statement committed) and `resolved` (outcome statement committed).
 - **`plan`:** keeps an invocation only if its key is not in `invoked`, and an outcome only if its key is not in `resolved`, preserving the input order. A kept outcome is *confirmable* only if, at the moment `plan` runs, its key is already in `invoked` or its `call_id` is among the kept invocations of the same plan. `plan` never modifies the record.
-- **`mark_applied`:** adds the key of every invocation in `plan.events` to `invoked` and the key of every `call_id` in `plan.confirmable_outcomes` to `resolved`. The saver calls it only after the capture transaction has committed (or when there was nothing to send), never before.
+- **`mark_applied`:** adds the key of every invocation in `plan.events` whose `call_id` is not in `detached` to `invoked`, and the key of every `call_id` in `plan.confirmable_outcomes` to `resolved`. The saver calls it only after the capture transaction has committed (or when there was nothing to send), never before.
+- **Why invocations need an edge:** under concurrent `ainvoke`, LangGraph can commit a task's `put_writes()`, carrying the AI tool call, before the `put()` of the checkpoint it names. The invocation statement then creates the node without an `[:INVOKED]` edge and returns `attached = false`. Such an invocation is not recorded, so the next save that carries the call resends the idempotent statement and attaches the edge to that save's checkpoint. Its outcome, if confirmable, is still recorded, because the node exists.
 - **Why outcomes need confirmation:** the outcome statement uses `MATCH`, so it changes nothing if the `:ToolCall` node does not exist yet. An outcome whose invocation has not been committed is sent but not marked, and is sent again by later saves that see it until it can be confirmed. Without this rule an outcome racing ahead of its invocation could be marked applied after matching nothing, and would be lost.
 - **Thread safety:** one `threading.Lock` inside `AppliedToolCalls` guards `plan` and `mark_applied`. It is held only for set lookups and inserts, never while serializing or while waiting on the proxy. Two callers can plan the same new call concurrently; both send it, which is harmless because the statements are idempotent.
 - **Lifetime and memory:** the record is never pruned. It grows by one entry per distinct (thread, call) the saver sees, roughly a few hundred bytes each, for the lifetime of the `RelateSaver` object. A new saver, including one created after a restart and every fork, starts empty; its first save in each thread re-sends what it finds, and `MERGE` keeps that idempotent.
 - **Known gaps:**
-  - When `put_writes()` names a checkpoint that does not exist, the call is recorded without an `[:INVOKED]` edge (the invocation statement's `OPTIONAL MATCH` finds no checkpoint) and is still marked applied, so later saves by the same saver do not attach the edge to a later checkpoint. LangGraph always calls `put_writes()` with the config of a checkpoint it has already saved.
+  - A detached call's edge attaches to the first later save that names a stored checkpoint, not to the checkpoint first named. In LangGraph the checkpoint saved after the step carries the call in its channel values; if no later save happens (for example the process stops first), the node stays without an edge and forensics cannot reach it.
   - A tool result with no matching call anywhere (AC-49) can never be confirmed, so every later `put()` whose history contains it issues one capture transaction for it. Real model runs do not produce such results.
   - An invocation whose arguments fail serialization is marked applied and not retried by the same saver.
   - `put()` still walks the whole message history in `channel_values` on every save to find events; only serialization and database work are limited to new events.
@@ -579,24 +583,22 @@ sequenceDiagram
     Worker1->>Proxy: put() -> enqueue(DbCommand)
     Worker2->>Proxy: put_writes() -> enqueue(DbCommand)
     activate Proxy
-    Proxy->>Engine: Begin Transaction
-    Proxy->>Engine: Run Cypher (Worker1)
+    Proxy->>Engine: Begin Transaction, Run Cypher (Worker1)
     Proxy->>WAL: Append Log Record & Commit
     Proxy-->>Worker1: Complete Future (Success)
-    Proxy->>Engine: Begin Transaction
-    Proxy->>Engine: Run Cypher (Worker2)
+    Proxy->>Engine: Begin Transaction, Run Cypher (Worker2)
     Proxy->>WAL: Append Log Record & Commit
     Proxy-->>Worker2: Complete Future (Success)
     deactivate Proxy
 ```
 
 1. **Serialized Writes:** All mutating operations (`put`, `put_writes`, tool call capture, `fork`) pass through the `RelateThreadProxy` command queue. The proxy executes strictly on a single dedicated background thread, eliminating DB-API thread-affinity violations and file-lock collisions.
-2. **Crash Resilience:** Every commit flushes through the Write-Ahead Log before acknowledging caller futures. If the host process crashes mid-step, uncommitted transactions are rolled back during WAL recovery on restart, guaranteeing zero orphaned nodes or dangling edges. Measured cost: in relate-db 1.0 each flush takes time proportional to the database file size, so with the default `wal_enabled=True` save latency grows as a thread's history grows (about 25 ms per save early and about 110 ms after 1,000 checkpoints in our benchmark). `wal_enabled=False` skips only the per-write flush and keeps saves flat (about 3 ms); a process kill still kept committed checkpoints in our tests, but durability across power loss without the flush is not verified, and the file grows larger. We keep the flush as the default.
+2. **Crash Resilience:** Every commit flushes through the Write-Ahead Log before acknowledging caller futures, except the tool call capture transaction, which commits without its own flush and becomes durable with the next flushed write or `close()` ([ADR-0014](DECISIONS.md#adr-0014-tool-call-capture-commits-without-its-own-flush)). If the host process crashes mid-step, uncommitted transactions are rolled back during WAL recovery on restart, guaranteeing zero orphaned nodes or dangling edges. Measured cost: in relate-db 1.0 each flush takes time proportional to the database file size, so with the default `wal_enabled=True` save latency grows as a thread's history grows (about 25 ms per save early and about 110 ms after 1,000 checkpoints in our benchmark). `wal_enabled=False` skips only the per-write flush and keeps saves flat (about 3 ms); a process kill still kept committed checkpoints in our tests, but durability across power loss without the flush is not verified, and the file grows larger. We keep the flush as the default.
 3. **Deadlock Prevention:** Calling threads wait synchronously on lightweight `concurrent.futures.Future` objects with configurable timeout guards. Reads and writes cannot interleave within an active atomic transaction.
 
 ### Tool call capture ordering
 
-`put()` and `put_writes()` make at most two proxy submissions: first the existing checkpoint or write transaction, then, only if it committed and the [applied tool call record](#applied-tool-call-record) shows something new, one transaction with the new tool call statements. Another thread's command may run between the two; this is harmless because every tool call statement is idempotent and evaluates its edge condition inside its own transaction. The record is updated only after the capture transaction commits, so a capture failure inside a running process is retried by the next save that sees the same calls.
+`put()` and `put_writes()` make at most two proxy submissions: first the existing checkpoint or write transaction, then, only if it committed and the [applied tool call record](#applied-tool-call-record) shows something new, one transaction with the new tool call statements. Another thread's command may run between the two, and the order of saves across tasks is not guaranteed: under concurrent `ainvoke`, LangGraph can commit a task's `put_writes()`, carrying the AI tool call, before the `put()` of the checkpoint it names. The invocation statement's `OPTIONAL MATCH` then finds no checkpoint, so the `:ToolCall` node is created without an `[:INVOKED]` edge. The statement returns `attached = false`, the saver does not record that invocation as applied, and the next save that carries the call resends the idempotent statement, which attaches the edge to that later checkpoint (see [Applied tool call record](#applied-tool-call-record)). The record is updated only after the capture transaction commits, so a capture failure inside a running process is retried by the next save that sees the same calls. The capture transaction commits without its own flush ([ADR-0014](DECISIONS.md#adr-0014-tool-call-capture-commits-without-its-own-flush)): it is durable once the next checkpoint or writes save flushes, or `close()` runs. A process kill kept such commits in our tests; a power loss before that flush is not verified and is repaired, if at all, like the crash below. Tests: a spy on the connection shows the capture batch commits without `flush()` while checkpoint and writes saves still flush; tool call nodes, outcomes and edges are present after `close()` and reopening the file.
 
 **Known limitation: crash between the two transactions.** If the process dies after a thread's checkpoint or writes have committed and before that step's capture transaction has committed, the step's `:ToolCall` nodes, outcomes and `[:INVOKED]` edges are not in the file. Nothing repairs them in the background. They are recorded only when a later `put()` runs on the same thread, in any process: a saver created after the restart has an empty record, so its first `put()` on that thread rescans the whole message history in `channel_values` and records the missing calls, attaching `[:INVOKED]` to that later checkpoint rather than the original one. `put_writes()` never repairs them, because it only sees its own writes. If no later `put()` happens on that thread, for example because the crashed step was its last, those rows stay missing, and `trace_root_cause()` on that thread cannot name the tool.
 
@@ -741,7 +743,7 @@ Configuration parameters can be supplied directly to `RelateSaver` or read from 
 | Environment Variable | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `RELATE_DB_PATH` | string | `"checkpoints.rl"` | Default file path for durable embedded graph storage |
-| `RELATE_WAL_ENABLED` | boolean | `true` | Enables the per-write WAL flush for crash safety (see the measured cost under the concurrency and crash safety model) |
+| `RELATE_WAL_ENABLED` | boolean | `true` | Enables the per-write WAL flush for crash safety; tool call capture never flushes on its own ([ADR-0014](DECISIONS.md#adr-0014-tool-call-capture-commits-without-its-own-flush)). Measured cost under the concurrency and crash safety model |
 | `RELATE_PROXY_TIMEOUT_SEC` | float | `30.0` | Maximum wait time for actor queue transactions before raising timeout |
 | `RELATE_LOG_LEVEL` | string | `"INFO"` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
 
@@ -767,8 +769,6 @@ None. All graph storage is managed in-process via single-file `.rl` databases or
 
 ## Expensive to change
 
-The following architectural choices are costly to alter post-implementation:
-
 1. **Graph Schema and Relationship Taxonomy:**
    - *Components:* `(:Thread)`, `(:Checkpoint)`, `(:Write)`, `(:ToolCall)` and edges `[:NEXT]`, `[:FORKED_TO]`, `[:HAS_WRITE]`, `[:INVOKED]`.
    - *Why expensive:* Changing node labels or relationship semantics breaks all historical Cypher queries used by `DAGVisualizer`, loop detection, and root-cause analysis, and requires physical database schema migrations.
@@ -776,8 +776,8 @@ The following architectural choices are costly to alter post-implementation:
    - *Components:* `JsonPlusSerializer` envelope stored in `checkpoint_blob`, `write_blob`, `args_blob` and `result_blob`.
    - *Why expensive:* Blobs are written immutably to disk. Modifying the serialization format invalidates previously written checkpoints and tool calls and risks breaking deserialization of complex types (e.g., Pydantic models, LangChain messages).
 3. **Actor Concurrency Model (`RelateThreadProxy`):**
-   - *Components:* Single-writer actor queue dispatch, now also used by tool call capture and async callers.
-   - *Why expensive:* Multi-threaded and async LangGraph executions rely on this boundary to avoid engine crashes and file lock collisions. Replacing it with connection pooling or multi-process sharing would require fundamental rewrites of transaction lifecycle management.
+   - *Components:* Single-writer actor queue dispatch, used by tool call capture and async callers; `execute_batch(..., flush=True)` as the default, with only tool call capture opting out ([ADR-0014](DECISIONS.md#adr-0014-tool-call-capture-commits-without-its-own-flush)).
+   - *Why expensive:* Multi-threaded and async LangGraph executions rely on this boundary to avoid engine crashes and file lock collisions. Replacing it with connection pooling or multi-process sharing would require fundamental rewrites of transaction lifecycle management. Durability rests on the flushing default and on `close()` flushing: changing the default, or letting checkpoint saves opt out, silently weakens crash safety for stored runs.
 4. **LangGraph BaseCheckpointSaver Seam:**
    - *Components:* Method signatures and return structures (`put`, `put_writes`, `get_tuple`, `list`, `aput`, `aput_writes`, `aget_tuple`, `alist`).
    - *Why expensive:* Direct contract adherence to LangGraph's runtime is necessary for plug-and-play compatibility across all LangGraph graphs, subgraphs, and human-in-the-loop constructs, synchronous or async.
@@ -788,7 +788,7 @@ The following architectural choices are costly to alter post-implementation:
    - *Components:* `tool_call_id_unique` constraint, `MERGE` on `call_id`, `ToolMessage.tool_call_id` matching.
    - *Why expensive:* Moving to thread-scoped keys later (for example `{thread_id}:{call_id}`) would change the constraint, every stored node, and what `root_tool_call_id` reports to users.
 7. **Tool call recording rules:**
-   - *Components:* one `[:INVOKED]` edge per (thread, call) from the first checkpoint that saw the call; first outcome wins; orphan results create nothing.
+   - *Components:* one `[:INVOKED]` edge per (thread, call) from the first stored checkpoint whose save saw the call (a call seen before its named checkpoint is stored attaches to a later one); first outcome wins; orphan results create nothing.
    - *Why expensive:* Forensics picks the error checkpoint from where the `[:INVOKED]` edge attaches. Changing which checkpoint gets the edge, or allowing outcomes to be overwritten, changes the reports of already stored runs.
 8. **`RootCauseReport.root_tool_name`:**
    - *Components:* public dataclass field and the `Failing tool:` summary sentence.
