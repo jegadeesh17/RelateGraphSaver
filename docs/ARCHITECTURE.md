@@ -41,7 +41,7 @@ Runs every automated test across unit, integration, and CLI suites, including `s
 ```bash
 python -m pytest -q
 ```
-The slow clean-install test (AC-33) creates a fresh virtual environment and installs the package from the package index, so the full suite needs network access.
+The slow clean-install test (AC-33) creates a fresh virtual environment and installs the package from the package index, so it needs network access. Without it, the test is skipped with a stated reason, and only when pip's own output shows that the package index could not be reached; every other install failure fails the test ([ADR-0013](DECISIONS.md#adr-0013-clean-install-test-skips-only-when-the-package-index-is-unreachable), see [Clean-install test](#clean-install-test-testsintegrationtest_clean_installpy)).
 
 ### Fast test command
 Runs formatting checks, linter, static type checker, and all fast tests (excluding tests tagged with `@pytest.mark.slow`):
@@ -107,7 +107,7 @@ graph TD
 
 ### Component Summary
 - **`RelateSaver`:** Public adapter implementing LangGraph's `BaseCheckpointSaver` interface, handling serialization envelopes (`JsonPlusSerializer`), state versioning, high-level checkpointer semantics, and the async methods that delegate to the synchronous ones.
-- **`tool_calls` (tool call extractor):** Pure functions that find AI tool calls and tool result messages in written values and turn them into idempotent `:ToolCall` Cypher statements. It never raises; malformed entries are skipped.
+- **`tool_calls` (tool call extractor):** Pure functions that find AI tool calls and tool result messages in written values and turn them into idempotent `:ToolCall` Cypher statements, plus `AppliedToolCalls`, the per-saver record of what has already been committed so each save sends only new statements. It never raises; malformed entries are skipped.
 - **`RelateThreadProxy`:** Actor queue and thread-affinity broker running on a dedicated thread, serializing database write transactions and enforcing single-writer access to prevent thread-affinity exceptions and file lock collisions.
 - **`TimeTravelEngine`:** In-memory replay controller that extracts execution subgraphs and clones them into isolated `:memory:` database instances for zero-side-effect what-if debugging.
 - **`DAGVisualizer`:** Graph forensics and diagnostic renderer that executes Cypher path queries to produce Unicode execution trees, cycle detection reports, and failure root-cause traces.
@@ -319,10 +319,47 @@ class RelateSaver(BaseCheckpointSaver[str]):
 - Rationale and rejected options: [ADR-0006](DECISIONS.md#adr-0006-async-checkpointer-methods-delegate-to-the-synchronous-methods-on-worker-threads).
 
 #### Tool call capture inside `put()` and `put_writes()`
+- `__init__` creates `self._applied_tool_calls = AppliedToolCalls()` on every construction path (own proxy, passed proxy, proxy as `db_path`). Two savers sharing one proxy each have their own record; that is safe because every statement is idempotent.
 - `put_writes()`: after its existing `execute_batch` succeeds, calls the private helper `_capture_tool_calls(values=[value for _, value in writes], thread_id=thread_id, checkpoint_id=checkpoint_id_str)`.
 - `put()`: after its existing `execute_write` succeeds, calls `_capture_tool_calls(values=checkpoint["channel_values"].values(), thread_id=thread_id, checkpoint_id=checkpoint_id)` when `channel_values` is a dict; otherwise does nothing.
-- `_capture_tool_calls` builds statements with the [tool call extractor](#6-tool-call-capture-tool_callspy) and, if there are any, submits them with one `self.proxy.execute_batch(statements)`. It catches every `Exception`, logs at WARNING with the checkpoint id and the exception class name only (never argument or result content), and returns normally. Tool call capture can never make `put()` or `put_writes()` raise or roll back (AC-47).
+- `_capture_tool_calls` runs on the calling thread, in this order ([ADR-0011](DECISIONS.md#adr-0011-send-only-new-tool-call-statements-tracked-per-saver)):
+  1. `events = extract_tool_events(values)`.
+  2. `plan = self._applied_tool_calls.plan(events, thread_id=thread_id)`.
+  3. If `plan.events` has no invocations and no outcomes: return. Nothing is serialized and nothing is submitted to the proxy.
+  4. `statements = build_tool_call_statements(plan.events, ...)` with the same keyword arguments as before; if non-empty, one `self.proxy.execute_batch(statements)`.
+  5. `self._applied_tool_calls.mark_applied(plan, thread_id=thread_id)`, reached only when step 4's batch returned normally or had nothing to send (every entry failed serialization).
+- It catches every `Exception`, logs at WARNING with the checkpoint id and the exception class name only (never argument or result content), and returns normally. On any exception nothing is marked, so the next save that sees the same calls sends them again. Tool call capture can never make `put()` or `put_writes()` raise or roll back (AC-47).
 - No messages in the values means no statements, no `:ToolCall` nodes and no `[:INVOKED]` edges (AC-46).
+- Observable result: a save whose values contain only calls and outcomes this saver has already committed makes exactly one proxy submission (the checkpoint or write transaction). The graph after any sequence of saves is the same as with the earlier send-everything behavior, except for the cases under [Applied tool call record](#applied-tool-call-record).
+
+#### `fork_in_memory` contract
+
+`fork_in_memory(thread_id, checkpoint_id, *, branch_thread_id=None)` delegates to `TimeTravelEngine.fork_in_memory` in `time_travel.py` ([ADR-0004](DECISIONS.md#adr-0004-in-memory-graph-cloning-for-zero-side-effect-time-travel-sandboxing), amended by [ADR-0010](DECISIONS.md#adr-0010-in-memory-forks-copy-tool-call-data)).
+
+**Copied set.** The lineage is the target checkpoint plus every ancestor reached by following `parent_checkpoint_id` (unchanged). Into a new `RelateSaver(":memory:")` the fork copies:
+- the source `:Thread` node, every lineage `:Checkpoint` with its `[:HAS_CHECKPOINT]` edge, and the `[:NEXT]` / `[:FORKED_TO]` edges between lineage checkpoints (unchanged);
+- every `:Write` linked by `[:HAS_WRITE]` from a lineage checkpoint (unchanged);
+- **new:** every `:ToolCall` that has an `[:INVOKED]` edge from a lineage checkpoint, and each of those `(:Checkpoint)-[:INVOKED]->(:ToolCall)` edges whose checkpoint is in the lineage. Not copied: `:ToolCall` nodes reached only from checkpoints outside the lineage (later checkpoints, other branches, other threads), `[:INVOKED]` edges from checkpoints outside the lineage, and the reserved `(:Write)-[:INVOKED]->(:ToolCall)` edges.
+
+**Tool call read.** One read on the source proxy, after the lineage ids are known:
+```cypher
+MATCH (c:Checkpoint)-[:INVOKED]->(tc:ToolCall) WHERE c.checkpoint_id IN $ids
+RETURN c.checkpoint_id AS checkpoint_id, tc.call_id AS call_id, tc.tool_name AS tool_name, tc.args_blob AS args_blob,
+       tc.result_blob AS result_blob, tc.error AS error, tc.created_at AS created_at
+```
+One row per edge. A `RelateCheckpointError` from this read propagates to the caller; the fork is not returned without its tool calls, because forensics on such a fork would silently differ from the source.
+
+**Outcomes only up to the fork point.** Before building statements, the fork deserializes the fork-point checkpoint's `checkpoint_blob` (already read with the lineage) with `source_saver.serde.loads(_extract_bytes(...))` and, if its `channel_values` is a dict, runs `extract_tool_events(channel_values.values())` from `tool_calls.py`; no other parsing is added. The `call_id`s of the resulting outcomes form the *fork-point outcome set* (empty when `channel_values` is missing or not a dict). A copied node keeps the source's stored `result_blob` or `error` only if its `call_id` is in that set; otherwise it is copied without either property, so a replay in the fork records its own first outcome. Results that exist only in the fork point's pending writes, or only in later checkpoints, do not count. If the blob cannot be deserialized, the fork raises `RelateCheckpointError`.
+
+**Tool call writes**, appended to the existing single population batch after the `:Write` statements and before the optional branch `[:FORKED_TO]` statement:
+- One node statement per distinct `call_id`: `MERGE (tc:ToolCall {call_id: $call_id})` followed by `SET tc.<p> = $<p>` for each of `tool_name`, `args_blob`, `created_at` whose source value is not null, plus `result_blob` and `error` under the same condition only when the `call_id` is in the fork-point outcome set. Null properties are left absent, matching the [`:ToolCall` schema](#4-toolcall). The property names come from this fixed list, never from data. Blob values pass through `_extract_bytes`.
+- One edge statement per row: `MATCH (c:Checkpoint {checkpoint_id: $checkpoint_id}), (tc:ToolCall {call_id: $call_id}) MERGE (c)-[:INVOKED]->(tc)`.
+
+**Guarantees.**
+- For a fork taken at a checkpoint whose channel values already contain the failing tool's result message (for example the thread's latest checkpoint), `trace_root_cause(thread_id)` on the fork returns the same `error_checkpoint_id`, `error_message`, `root_tool_call_id` and `root_tool_name` as on the source.
+- For a fork taken before that result, the call is present with no `result_blob` and no `error`; resuming the graph in the fork with the tool succeeding records `result_blob` on that node, and `error` stays absent.
+- The source is only read. Its file is not written, and its node and relationship counts are unchanged. The test compares the sha256 of the source `.rl` file before and after the fork; if relate-db proves to modify the main file on read-only access, the test compares node and relationship counts instead and says why in a comment.
+- The population batch goes straight to the fork's proxy, not through `put()`, so the fork's `AppliedToolCalls` record starts empty. The first `put()` in a replay rescans and resends what it sees; `MERGE`, the per-thread edge condition and the first-outcome-wins guard make that a no-op for data already copied.
 
 ### 2. `RelateThreadProxy` Actor Protocol
 
@@ -487,6 +524,35 @@ SET tc.error = $error
 - `error`: `content` if it is a non-empty string; if it is a list, the `str` items and the `"text"` values of dict items joined with newlines; otherwise `str(content)`. If the result is empty, the text is `Tool call returned status 'error' with no message`.
 - `MATCH` (not `MERGE`) means an orphan result creates nothing (AC-49). Invocation statements come before outcome statements in the batch, so a tool call and its result found in the same `put()` both land in one pass.
 
+#### Applied tool call record
+
+`AppliedToolCalls` lives in `tool_calls.py`, has no database access, and is unit-tested without a saver ([ADR-0011](DECISIONS.md#adr-0011-send-only-new-tool-call-statements-tracked-per-saver)).
+
+```python
+@dataclass(frozen=True)
+class CapturePlan:
+    events: ToolEvents                      # only invocations and outcomes not yet applied
+    confirmable_outcomes: frozenset[str]    # call_ids whose outcome may be marked after commit
+
+class AppliedToolCalls:
+    """Per-saver record of tool call statements already committed. Thread-safe."""
+    def plan(self, events: ToolEvents, *, thread_id: str) -> CapturePlan: ...
+    def mark_applied(self, plan: CapturePlan, *, thread_id: str) -> None: ...
+    def __len__(self) -> int: ...           # distinct (thread_id, call_id) keys held
+```
+
+- **Key:** `(thread_id, call_id)`. `thread_id` is part of the key because the `[:INVOKED]` edge condition is per thread; `checkpoint_ns` is not, matching the Cypher. State: two sets of keys, `invoked` (invocation statement committed) and `resolved` (outcome statement committed).
+- **`plan`:** keeps an invocation only if its key is not in `invoked`, and an outcome only if its key is not in `resolved`, preserving the input order. A kept outcome is *confirmable* only if, at the moment `plan` runs, its key is already in `invoked` or its `call_id` is among the kept invocations of the same plan. `plan` never modifies the record.
+- **`mark_applied`:** adds the key of every invocation in `plan.events` to `invoked` and the key of every `call_id` in `plan.confirmable_outcomes` to `resolved`. The saver calls it only after the capture transaction has committed (or when there was nothing to send), never before.
+- **Why outcomes need confirmation:** the outcome statement uses `MATCH`, so it changes nothing if the `:ToolCall` node does not exist yet. An outcome whose invocation has not been committed is sent but not marked, and is sent again by later saves that see it until it can be confirmed. Without this rule an outcome racing ahead of its invocation could be marked applied after matching nothing, and would be lost.
+- **Thread safety:** one `threading.Lock` inside `AppliedToolCalls` guards `plan` and `mark_applied`. It is held only for set lookups and inserts, never while serializing or while waiting on the proxy. Two callers can plan the same new call concurrently; both send it, which is harmless because the statements are idempotent.
+- **Lifetime and memory:** the record is never pruned. It grows by one entry per distinct (thread, call) the saver sees, roughly a few hundred bytes each, for the lifetime of the `RelateSaver` object. A new saver, including one created after a restart and every fork, starts empty; its first save in each thread re-sends what it finds, and `MERGE` keeps that idempotent.
+- **Known gaps:**
+  - When `put_writes()` names a checkpoint that does not exist, the call is recorded without an `[:INVOKED]` edge (the invocation statement's `OPTIONAL MATCH` finds no checkpoint) and is still marked applied, so later saves by the same saver do not attach the edge to a later checkpoint. LangGraph always calls `put_writes()` with the config of a checkpoint it has already saved.
+  - A tool result with no matching call anywhere (AC-49) can never be confirmed, so every later `put()` whose history contains it issues one capture transaction for it. Real model runs do not produce such results.
+  - An invocation whose arguments fail serialization is marked applied and not retried by the same saver.
+  - `put()` still walks the whole message history in `channel_values` on every save to find events; only serialization and database work are limited to new events.
+
 ### 7. Tool-calling demo (`examples/tool_agent.py`)
 
 The existing `examples/research_agent.py` has no messages or tools and stays unchanged. AC-45 runs against a separate, key-free demo:
@@ -530,7 +596,9 @@ sequenceDiagram
 
 ### Tool call capture ordering
 
-`put()` and `put_writes()` make two proxy submissions: first the existing checkpoint or write transaction, then, only if it committed, one transaction with the tool call statements. Another thread's command may run between the two; this is harmless because every tool call statement is idempotent and evaluates its edge condition inside its own transaction. A crash between the two submissions leaves a committed checkpoint without its `:ToolCall` nodes. The next `put()` in that thread rescans the accumulated message history in `channel_values` and records the missing calls, attaching `[:INVOKED]` to that later checkpoint.
+`put()` and `put_writes()` make at most two proxy submissions: first the existing checkpoint or write transaction, then, only if it committed and the [applied tool call record](#applied-tool-call-record) shows something new, one transaction with the new tool call statements. Another thread's command may run between the two; this is harmless because every tool call statement is idempotent and evaluates its edge condition inside its own transaction. The record is updated only after the capture transaction commits, so a capture failure inside a running process is retried by the next save that sees the same calls.
+
+**Known limitation: crash between the two transactions.** If the process dies after a thread's checkpoint or writes have committed and before that step's capture transaction has committed, the step's `:ToolCall` nodes, outcomes and `[:INVOKED]` edges are not in the file. Nothing repairs them in the background. They are recorded only when a later `put()` runs on the same thread, in any process: a saver created after the restart has an empty record, so its first `put()` on that thread rescans the whole message history in `channel_values` and records the missing calls, attaching `[:INVOKED]` to that later checkpoint rather than the original one. `put_writes()` never repairs them, because it only sees its own writes. If no later `put()` happens on that thread, for example because the crashed step was its last, those rows stay missing, and `trace_root_cause()` on that thread cannot name the tool.
 
 ### Async execution
 
@@ -557,9 +625,13 @@ sequenceDiagram
 
 ## Benchmark
 
-`benchmarks/bench_checkpointers.py` compares `RelateSaver` with `SqliteSaver` on the same workload ([ADR-0008](DECISIONS.md#adr-0008-standalone-benchmark-script-against-sqlitesaver)). It is a standalone script, not part of either pytest suite, and the README publishes its output as measured (AC-58), whichever saver is faster.
+`benchmarks/bench_checkpointers.py` compares `RelateSaver` with `SqliteSaver` on the same workload ([ADR-0008](DECISIONS.md#adr-0008-standalone-benchmark-script-against-sqlitesaver), amended by [ADR-0012](DECISIONS.md#adr-0012-fair-ancestry-query-and-exact-file-cleanup-in-the-benchmark)). It is a standalone script, not part of either pytest suite, and the README publishes its output as measured (AC-58), whichever saver is faster.
 
-**Invocation:** `python benchmarks/bench_checkpointers.py [--checkpoints N] [--payload-bytes B] [--seed S] [--workdir DIR]`. Defaults: `N=200`, `B=256`, `S=0`, `DIR` = a temporary directory deleted at exit. Exit codes: `0` success; `1` if the two savers return different ancestry counts; `2` if `langgraph-checkpoint-sqlite` is not installed (the message says to install the `dev` extra).
+**Fairness rule:** each saver's queries are written in their best known form for that engine. The README states a saver is faster on a metric only when the published table, produced by this script in that form, shows it; it never carries a claim from an earlier, unfair measurement.
+
+**Invocation:** `python benchmarks/bench_checkpointers.py [--checkpoints N] [--payload-bytes B] [--seed S] [--workdir DIR]`. Defaults: `N=200`, `B=256`, `S=0`, `DIR` = a temporary directory created by the script and deleted at exit. Exit codes: `0` success; `1` if the savers return different ancestry counts; `2` if `langgraph-checkpoint-sqlite` is not installed (the message says to install the `dev` extra).
+
+**Files and cleanup:** the script owns exactly three database names, `relate.rl`, `relate-noflush.rl` and `sqlite.db`, and for each the sidecars `<name>-wal`, `<name>-shm` and `<name>-journal`: twelve paths in total. Before the run it deletes whichever of those twelve paths exist in `DIR`, and nothing else; other files and subdirectories in a user-supplied `--workdir` are never read, renamed or deleted, even if their names start with the same text. With `--workdir` the files are left in place after the run for inspection. On-disk size counts the same exact paths (database file plus its three sidecars), not a name-prefix match. If relate-db turns out to create sidecar files with any other name, the pattern is not widened: the developer stops and reports the names so the list is changed deliberately.
 
 **Workload (identical for every run):** file-backed databases in `DIR` (`relate.rl`, `relate-noflush.rl`, `sqlite.db`). RelateSaver runs twice, with the default per-write flush and with `wal_enabled=False`, reported as separate columns. One thread_id; a main chain of N checkpoints where each `put()` receives the config returned by the previous one; channel values `{"step": i, "payload": "x" * B}` with no LangChain messages (so tool call capture adds only its scan); checkpoint ids from `langgraph.checkpoint.base.id.uuid6()`, as LangGraph itself uses. After the timed chain, an untimed branch of `max(1, N // 10)` checkpoints is written from the checkpoint at index `N // 2`. `SqliteSaver` is built as `SqliteSaver(sqlite3.connect(path, check_same_thread=False))` followed by `setup()`.
 
@@ -567,10 +639,35 @@ sequenceDiagram
 | :--- | :--- | :--- |
 | Put throughput | checkpoints/s | N divided by the `time.perf_counter()` wall time of the N main-chain `put()` calls |
 | Get latency | ms, p50 and p95 | `min(N, 200)` `get_tuple()` calls for checkpoint ids drawn with `random.Random(S)` from the written set, each timed individually |
-| On-disk size | KiB | After the saver and connection are closed: total size of the database file plus every sidecar file sharing its name prefix (WAL, shared-memory) |
-| Ancestry query | ms, median of 5 | All ancestors of the branch leaf back to the root. Relate: one Cypher query over `[:NEXT\|FORKED_TO*0..]`, anchored on the leaf (`(leaf {checkpoint_id})<-[...*0..]-(a)`), through `saver.proxy.execute_read`. The anchor matters: in relate-db 1.0 the unanchored direction expands from every checkpoint and took about 2.3 s at N=1000 against about 9 ms anchored. `trace_root_cause` uses the same anchored shape. SQLite: one `WITH RECURSIVE` query over the `checkpoints` table's `parent_checkpoint_id` column. Both must return `N // 2 + 1 + max(1, N // 10)` checkpoints. |
+| On-disk size | KiB | After the saver and connection are closed: total size of the database file plus those of its `-wal`, `-shm` and `-journal` sidecars that exist |
+| Ancestry query | ms, median of 5 | All ancestors of the branch leaf back to the root. Both queries below; all three runs must return `N // 2 + 1 + max(1, N // 10)` checkpoints. |
 
-**Output:** stdout carries only Markdown: an environment block (N, B, OS, CPU from `platform.processor()`, Python version, and the installed versions of `relate-db`, `langgraph-checkpoint`, `langgraph-checkpoint-sqlite` and SQLite) followed by one table with the columns `Metric | RelateSaver | SqliteSaver` and one row per figure (put throughput, get p50, get p95, on-disk size, ancestry query). Progress goes to stderr.
+**Relate ancestry query** (through `saver.proxy.execute_read`), anchored on the leaf: `MATCH (leaf:Checkpoint {checkpoint_id: $leaf})<-[:NEXT|FORKED_TO*0..]-(a:Checkpoint) RETURN count(DISTINCT a) AS n`. The anchor matters: in relate-db 1.0 the unanchored direction expands from every checkpoint and took about 2.3 s at N=1000 against about 9 ms anchored. `trace_root_cause` uses the same anchored shape.
+
+**SQLite ancestry query** (`SQLITE_ANCESTRY_SQL`, parameters `(thread_id, leaf_id, thread_id)`):
+```sql
+WITH RECURSIVE ancestry(checkpoint_id) AS (
+  SELECT checkpoint_id FROM checkpoints
+   WHERE thread_id = ? AND checkpoint_ns = '' AND checkpoint_id = ?
+  UNION ALL
+  SELECT c.parent_checkpoint_id
+    FROM ancestry a CROSS JOIN checkpoints c ON c.checkpoint_id = a.checkpoint_id
+   WHERE c.thread_id = ? AND c.checkpoint_ns = '' AND c.parent_checkpoint_id IS NOT NULL
+) SELECT count(*) FROM ancestry
+```
+The recursive member must start `FROM ancestry a CROSS JOIN checkpoints c`. In SQLite, `CROSS JOIN` fixes the left table as the outer loop, so each step looks up one row through the `checkpoints` primary key. The earlier form, `FROM checkpoints c JOIN ancestry a`, let the planner scan `checkpoints` at every step: about 170 ms against about 0.93 ms at N=1000, with the same count.
+
+**Output:** stdout carries only Markdown: an environment block (N, B, OS, CPU from `platform.processor()`, Python version, and the installed versions of `relate-db`, `langgraph-checkpoint`, `langgraph-checkpoint-sqlite` and SQLite) followed by one table with four columns, `Metric | RelateSaver (flush per write, default) | RelateSaver (wal_enabled=False) | SqliteSaver`, and one row per figure (put throughput, get p50, get p95, on-disk size, ancestry query). Progress goes to stderr.
+
+---
+
+## Clean-install test (`tests/integration/test_clean_install.py`)
+
+The slow test proving AC-33 ([ADR-0009](DECISIONS.md#adr-0009-declare-every-directly-imported-runtime-dependency-and-prove-it-with-a-clean-install), amended by [ADR-0013](DECISIONS.md#adr-0013-clean-install-test-skips-only-when-the-package-index-is-unreachable)) creates a fresh virtual environment, runs `pip install <repository root>` with no extras, then runs that environment's `relate-dag --help`.
+
+- **Skip rule:** if `pip install` exits non-zero and its combined stdout and stderr contain at least one marker from `_INDEX_UNREACHABLE_MARKERS`, the test calls `pytest.skip("package index unreachable, clean install not verified: <first matching output line>")`. In every other case a non-zero exit fails the test with pip's full output, as today.
+- **Markers** (a module-level tuple, matched as case-sensitive substrings): `Failed to establish a new connection`, `NewConnectionError`, `ConnectTimeoutError`, `Max retries exceeded with url`, `Temporary failure in name resolution`, `getaddrinfo failed`, `Name or service not known`, `nodename nor servname provided`, `Network is unreachable`, `No route to host`, `ProxyError`.
+- **Never a skip on its own:** `No matching distribution found`, `Could not find a version that satisfies the requirement`, build or metadata errors, SSL certificate errors, `subprocess.TimeoutExpired`, a missing `relate-dag` executable, and any failure of the `relate-dag --help` step. A resolver message without a connection marker means a real dependency problem. The decision lives in a pure helper, `_index_unreachable(output: str) -> str | None` (returns the first matching line, or `None`), covered by a fast, unmarked test in the same file with canned pip output: an offline output returns a line; `No matching distribution found` alone returns `None`.
 
 ---
 
@@ -696,3 +793,6 @@ The following architectural choices are costly to alter post-implementation:
 8. **`RootCauseReport.root_tool_name`:**
    - *Components:* public dataclass field and the `Failing tool:` summary sentence.
    - *Why expensive:* It is public API; removing or renaming it breaks callers of `trace_root_cause()`.
+9. **What an in-memory fork contains:**
+   - *Components:* the copied set of `fork_in_memory()`: lineage checkpoints, their writes, and the tool calls they invoked, with the edges between them and only the outcomes already visible at the fork point ([ADR-0010](DECISIONS.md#adr-0010-in-memory-forks-copy-tool-call-data)).
+   - *Why expensive:* Users run forensics and `relate-dag replay` on forks and expect the same answer as on the original run. Dropping a node type from the copy, narrowing which tool calls are included, or changing which outcomes are kept silently changes those answers without any error.

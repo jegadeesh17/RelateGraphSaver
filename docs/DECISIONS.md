@@ -21,6 +21,10 @@ Reference documents:
 | [ADR-0007](#adr-0007-static-quality-gates-pass-through-configuration-and-behavior-neutral-fixes) | Static Quality Gates Pass Through Configuration and Behavior-Neutral Fixes | Accepted | 2026-11-17 |
 | [ADR-0008](#adr-0008-standalone-benchmark-script-against-sqlitesaver) | Standalone Benchmark Script Against SqliteSaver | Accepted | 2026-11-17 |
 | [ADR-0009](#adr-0009-declare-every-directly-imported-runtime-dependency-and-prove-it-with-a-clean-install) | Declare Every Directly Imported Runtime Dependency and Prove It with a Clean Install | Accepted | 2026-11-17 |
+| [ADR-0010](#adr-0010-in-memory-forks-copy-tool-call-data) | In-Memory Forks Copy Tool Call Data | Accepted | 2026-11-17 |
+| [ADR-0011](#adr-0011-send-only-new-tool-call-statements-tracked-per-saver) | Send Only New Tool Call Statements, Tracked per Saver | Accepted | 2026-11-17 |
+| [ADR-0012](#adr-0012-fair-ancestry-query-and-exact-file-cleanup-in-the-benchmark) | Fair Ancestry Query and Exact File Cleanup in the Benchmark | Accepted | 2026-11-17 |
+| [ADR-0013](#adr-0013-clean-install-test-skips-only-when-the-package-index-is-unreachable) | Clean-Install Test Skips Only When the Package Index Is Unreachable | Accepted | 2026-11-17 |
 
 ---
 
@@ -122,7 +126,8 @@ We decided to adopt a hybrid graph-blob data schema:
 ## ADR-0004: In-Memory Graph Cloning for Zero-Side-Effect Time-Travel Sandboxing
 
 Date: 2026-11-12  
-Status: Accepted
+Status: Accepted  
+Amended by: [ADR-0010](#adr-0010-in-memory-forks-copy-tool-call-data)
 
 ### Context
 
@@ -152,7 +157,8 @@ When a developer targets a checkpoint for replay, `TimeTravelEngine` queries the
 ## ADR-0005: Capture Tool Calls from Persisted LangChain Messages
 
 Date: 2026-11-17  
-Status: Accepted
+Status: Accepted  
+Amended by: [ADR-0011](#adr-0011-send-only-new-tool-call-statements-tracked-per-saver)
 
 ### Context
 
@@ -248,7 +254,8 @@ The fast test command (`ruff check .`, `ruff format --check .`, `mypy src tests`
 ## ADR-0008: Standalone Benchmark Script Against SqliteSaver
 
 Date: 2026-11-17  
-Status: Accepted
+Status: Accepted  
+Amended by: [ADR-0012](#adr-0012-fair-ancestry-query-and-exact-file-cleanup-in-the-benchmark)
 
 ### Context
 
@@ -276,7 +283,8 @@ We add `benchmarks/bench_checkpointers.py`, a standalone script taking the check
 ## ADR-0009: Declare Every Directly Imported Runtime Dependency and Prove It with a Clean Install
 
 Date: 2026-11-17  
-Status: Accepted
+Status: Accepted  
+Amended by: [ADR-0013](#adr-0013-clean-install-test-skips-only-when-the-package-index-is-unreachable)
 
 ### Context
 
@@ -298,3 +306,136 @@ Status: Accepted
 
 - **Positive:** A clean `pip install` gives a working CLI, and a future undeclared import fails a fast test.
 - **Negative:** The full suite needs network access for the clean-install test, and that test takes tens of seconds.
+
+---
+
+## ADR-0010: In-Memory Forks Copy Tool Call Data
+
+Date: 2026-11-17  
+Status: Accepted
+
+### Context
+
+[ADR-0004](#adr-0004-in-memory-graph-cloning-for-zero-side-effect-time-travel-sandboxing) copies a thread's checkpoints, their writes and the edges between them into an in-memory database. Since [ADR-0005](#adr-0005-capture-tool-calls-from-persisted-langchain-messages), real runs also store `:ToolCall` nodes linked from checkpoints by `[:INVOKED]`, and root-cause analysis reads them to name the failing tool. A fork did not copy them, so `trace_root_cause()` on a fork of a failed run could not name the tool that the same call on the original run names.
+
+### Decision
+
+This amends ADR-0004; its other parts are unchanged.
+- A fork also copies every `:ToolCall` node that has an `[:INVOKED]` edge from a copied checkpoint, with `call_id`, `tool_name`, `args_blob` and `created_at`, and the `[:INVOKED]` edges from copied checkpoints to those nodes. Tool calls linked only from checkpoints outside the copied history are not copied, nor are the reserved write-to-tool-call edges.
+- A copied node keeps its stored outcome (`result_blob` or `error`) only if the tool's result message for that call is already in the channel values of the checkpoint the fork starts from. The fork finds those messages by deserializing that checkpoint and running the existing tool call extractor over its channel values; no new parsing is added. Otherwise the node is copied without an outcome, so a replay in the fork records its own first outcome.
+- The copy is part of the fork's single population transaction. A failed read of the tool calls, or a fork-point checkpoint that cannot be deserialized, makes the fork fail with an error instead of returning an incomplete copy. The source database is only read.
+
+Details: [`fork_in_memory` contract](ARCHITECTURE.md#fork_in_memory-contract).
+
+### Alternatives considered
+
+1. **Copy tool calls invoked from any checkpoint of the thread:** Rejected; it would bring in calls from after the fork point and from other branches.
+2. **Recreate tool calls in the fork by re-running capture over the copied writes and checkpoints:** Rejected; it repeats the capture logic, and the copy would differ from the source whenever capture rules or crash gaps made the source differ from a fresh scan.
+3. **Copy every outcome as stored:** Rejected by the project owner; an outcome recorded after the fork point would leak into the fork, and because the first outcome wins, a what-if replay could never replace it.
+4. **Copy calls without any outcomes:** Rejected; forensics on a fork of a failed run could then never name the failing tool.
+
+### Consequences
+
+- **Positive:** Forensics on a fork taken at the thread's latest checkpoint, or at any checkpoint that already contains the failing tool's result, names the same failing tool and call id as on the source.
+- **Positive:** A fork taken before a tool ran shows the call with no outcome, and a replay in the fork records the outcome it actually produces.
+- **Negative:** A result that is only in the fork point's pending writes, not yet in its channel values, is not counted; the call shows no outcome until a replay records it.
+- **Negative:** Forking now deserializes the fork-point checkpoint once, and fails if that checkpoint cannot be read back.
+- **Negative:** Forks of tool-heavy runs use more memory, in proportion to the copied tool calls and their argument and result sizes.
+- **Testing default:** the "source untouched" check compares the source file's sha256 before and after the fork. If relate-db proves to modify the main file even on read-only access, the test compares node and relationship counts instead and says why in a comment.
+
+---
+
+## ADR-0011: Send Only New Tool Call Statements, Tracked per Saver
+
+Date: 2026-11-17  
+Status: Accepted
+
+### Context
+
+Under [ADR-0005](#adr-0005-capture-tool-calls-from-persisted-langchain-messages), every `put()` scanned the whole message history and re-sent one statement for every tool call and every result seen so far, in a second transaction that was issued and flushed to disk even when nothing was new. On a tool-heavy 150-step run we measured that this more than doubles save time.
+
+### Decision
+
+This amends ADR-0005; capture still runs as its own best-effort transaction after the checkpoint or writes commit, and the stored graph rules are unchanged.
+- Each `RelateSaver` keeps an in-memory record, `AppliedToolCalls`, of which tool call statements it has already committed, keyed by (thread id, call id), with separate marks for "call recorded" and "outcome recorded".
+- On each save the saver still finds the tool events in the values, then keeps only those the record does not mark. If none are left, it issues no capture transaction at all. Otherwise it serializes and sends only the new ones.
+- The record is updated only after the capture transaction commits. An outcome is marked only if its call was already recorded, or is recorded in the same transaction; otherwise it is sent again by later saves until it can be marked.
+- The comparison runs on the caller's thread, under a lock held only for the record lookups and updates. The single database thread does no extra work, and the proxy's interface does not change.
+- `put()` and `put_writes()` share the same record. A new saver, including one created after a restart and the saver returned by a fork, starts with an empty record; its first save on a thread re-sends what it finds, which the idempotent statements make harmless.
+- The record is never pruned during the saver's lifetime.
+
+### Alternatives considered
+
+1. **Run the comparison inside the database thread:** Rejected; it would add serialization work to the single writer that every caller waits on, and change the proxy's interface, which is costly to change.
+2. **Ask the database which calls already exist before each save:** Rejected; it replaces one transaction with one read per save, so a save with nothing new still pays a database round trip.
+3. **Remember how many messages of each thread were already scanned and scan only the rest:** Rejected for now; message histories can be edited or trimmed between steps, so a position is not a reliable bookmark.
+4. **A size-limited record that forgets the oldest entries:** Not needed yet. It would be safe, since a forgotten entry only causes one idempotent resend, and can be added later without changing stored data.
+
+### Consequences
+
+- **Positive:** In steady state each tool call costs one capture transaction when it first appears and one when its result appears; saves that add no tool activity make no capture transaction.
+- **Positive:** After a restart the first save on a thread re-checks its whole history, so calls lost to an earlier failed capture are recorded then, as before.
+- **Negative:** Memory grows with the number of distinct (thread, call) pairs a saver sees, roughly a few hundred bytes each, until the saver object is discarded.
+- **Negative:** `put()` still walks the full message history in memory on every save; only serialization and database work are limited to new events.
+- **Negative:** A tool result that matches no call is never marked, so each later save whose history contains it still issues one capture transaction. Real model runs do not produce such results.
+- **Negative:** If `put_writes()` names a checkpoint that is not stored, the call is recorded without its `[:INVOKED]` edge and is not re-linked to a later checkpoint by the same saver. LangGraph does not do this in normal operation.
+- **Negative (unchanged from ADR-0005, now stated in full):** If the process dies between a step's checkpoint commit and its capture transaction, that step's tool call data is missing until a later `put()` on the same thread rescans the history. If the thread never saves again, the data stays missing. See [Tool call capture ordering](ARCHITECTURE.md#tool-call-capture-ordering).
+
+---
+
+## ADR-0012: Fair Ancestry Query and Exact File Cleanup in the Benchmark
+
+Date: 2026-11-17  
+Status: Accepted
+
+### Context
+
+The benchmark of [ADR-0008](#adr-0008-standalone-benchmark-script-against-sqlitesaver) compared an anchored Relate ancestry query with a SQLite recursive query whose join order made SQLite scan the whole `checkpoints` table at every step. At N=1000 that form took about 170 ms; with the join order fixed the same query took about 0.93 ms and returned the same count. The README's statement that the ancestry query was faster in Relate came from the unfair form. Separately, the script deleted every file in the working directory whose name merely started with one of its database names, which could remove a user's unrelated files when `--workdir` points at an existing directory.
+
+### Decision
+
+This amends ADR-0008; the workload, metrics and exit codes are unchanged.
+- Every query in the benchmark is written in its best known form for its engine. The SQLite recursive member reads `FROM ancestry a CROSS JOIN checkpoints c ON c.checkpoint_id = a.checkpoint_id`, which makes SQLite walk from the current ancestor and look up one row by primary key per step. The Relate query stays anchored on the branch tip.
+- The output table has four columns: Metric, RelateSaver with the default flush per write, RelateSaver with `wal_enabled=False`, and SqliteSaver.
+- The script deletes only the files it creates, `relate.rl`, `relate-noflush.rl` and `sqlite.db`, and their `-wal`, `-shm` and `-journal` sidecars, and nothing else. On-disk size counts the same files.
+- The README may say a saver is faster on a metric only when the published, fairly measured table shows it.
+
+### Alternatives considered
+
+1. **Keep the earlier SQLite query as "the natural way":** Rejected; a query with a known fix that is about 180 times slower is not a fair comparison.
+2. **Compare only through the public checkpointer methods:** Rejected again, for the reason in ADR-0008: there is no ancestry method to compare.
+3. **Refuse to run in a non-empty `--workdir`:** Rejected; re-running into the same directory is the normal way to inspect results.
+
+### Consequences
+
+- **Positive:** The published numbers can be defended: neither saver is handicapped by a query form we know to be slow.
+- **Positive:** Pointing `--workdir` at an existing directory cannot delete unrelated files.
+- **Negative:** On current measurements SQLite answers the ancestry query faster than Relate, and the README must say so.
+- **Negative:** If relate-db creates sidecar files with other names, they are neither cleaned nor counted in on-disk size until this list is updated. We do not widen the pattern to catch them; whoever finds such a file reports its name so the list is changed deliberately.
+
+---
+
+## ADR-0013: Clean-Install Test Skips Only When the Package Index Is Unreachable
+
+Date: 2026-11-17  
+Status: Accepted
+
+### Context
+
+The clean-install test of [ADR-0009](#adr-0009-declare-every-directly-imported-runtime-dependency-and-prove-it-with-a-clean-install) installs the package from the public package index. On a machine without network access it failed, which made the full suite fail for a reason that says nothing about the code. Skipping it on any install failure would hide exactly the missing-dependency defects it exists to catch.
+
+### Decision
+
+This amends ADR-0009. The test skips, with a reason naming the failure, only when `pip install` fails and pip's own output contains one of a fixed list of connection-failure messages (connection refused or timed out, name resolution failure, unreachable network, proxy error). Every other failure fails the test, including "no matching distribution" without a connection message, build errors, SSL errors, timeouts of the test itself, and any failure of `relate-dag --help`. The decision is made by a small helper covered by a fast test with sample pip output. Details: [Clean-install test](ARCHITECTURE.md#clean-install-test-testsintegrationtest_clean_installpy).
+
+### Alternatives considered
+
+1. **Skip on any install failure:** Rejected; it turns real dependency defects into skips.
+2. **Check connectivity to the index before installing:** Rejected; the check can succeed while the install still fails on the network, or fail behind a proxy pip can use.
+3. **A command-line option or environment variable to skip the test:** Rejected; it relies on people remembering to set it, and a skipped proof looks the same as a passing one in quick reads.
+
+### Consequences
+
+- **Positive:** The full suite passes offline without hiding dependency defects, and the skip reason says the clean install was not verified.
+- **Negative:** A network failure whose message is not on the list still fails the test; the list is updated when that happens.
+- **Negative:** An offline run does not prove AC-33; it has to be re-run with network access.
