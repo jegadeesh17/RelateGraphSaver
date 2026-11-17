@@ -120,7 +120,7 @@ def seeded_loop_db() -> Generator[tuple[str, str]]:
         for i in range(4):
             node = "ping_agent" if i % 2 == 0 else "pong_agent"
             cid = f"chk-loop-step-{i}"
-            parent = f"chk-loop-step-{i-1}" if i > 0 else None
+            parent = f"chk-loop-step-{i - 1}" if i > 0 else None
             cfg: RunnableConfig = {
                 "configurable": {
                     "thread_id": thread_id,
@@ -477,9 +477,7 @@ class TestCliForensicsCommand:
     ) -> None:
         """Verify relate-dag forensics loops exits with code 1 on non-existent thread."""
         db_file, _, _ = seeded_db
-        result = runner.invoke(
-            app, ["forensics", "loops", "non-existent-thread", "--db", db_file]
-        )
+        result = runner.invoke(app, ["forensics", "loops", "non-existent-thread", "--db", db_file])
         assert result.exit_code == 1
         assert "Error:" in result.output
         assert "non-existent-thread" in result.output
@@ -497,9 +495,7 @@ class TestCliForensicsCommand:
     ) -> None:
         """AC-27: Verify relate-dag forensics trace-error renders root cause trace for failed thread."""
         db_file, thread_id, error_cid = seeded_error_db
-        result = runner.invoke(
-            app, ["forensics", "trace-error", thread_id, "--db", db_file]
-        )
+        result = runner.invoke(app, ["forensics", "trace-error", thread_id, "--db", db_file])
         assert result.exit_code == 0
         assert "Root Cause Analysis" in result.output
         assert error_cid in result.output
@@ -521,9 +517,7 @@ class TestCliForensicsCommand:
     ) -> None:
         """AC-28: Verify relate-dag forensics trace-error confirms no error detected on healthy thread."""
         db_file, thread_id, _ = seeded_db
-        result = runner.invoke(
-            app, ["forensics", "trace-error", thread_id, "--db", db_file]
-        )
+        result = runner.invoke(app, ["forensics", "trace-error", thread_id, "--db", db_file])
         assert result.exit_code == 0
         assert "No error detected" in result.output
         assert thread_id in result.output
@@ -540,14 +534,10 @@ class TestCliForensicsCommand:
         assert "Error:" in result.output
         assert "unknown-error-thread" in result.output
 
-    def test_forensics_trace_error_non_existent_database_file(
-        self, runner: CliRunner
-    ) -> None:
+    def test_forensics_trace_error_non_existent_database_file(self, runner: CliRunner) -> None:
         """Verify relate-dag forensics trace-error exits with code 1 on missing DB file."""
         missing_db = "missing_trace_db.rl"
-        result = runner.invoke(
-            app, ["forensics", "trace-error", "th-1", "--db", missing_db]
-        )
+        result = runner.invoke(app, ["forensics", "trace-error", "th-1", "--db", missing_db])
         assert result.exit_code == 1
         assert "Error:" in result.output
         assert missing_db in result.output

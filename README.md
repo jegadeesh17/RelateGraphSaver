@@ -43,12 +43,15 @@ from typing import TypedDict
 from langgraph.graph import StateGraph, START, END
 from langgraph_checkpoint_relate import RelateSaver
 
+
 class AgentState(TypedDict):
     query: str
     response: str
 
+
 def plan_step(state: AgentState) -> dict[str, str]:
     return {"response": f"Processed: {state['query']}"}
+
 
 # Build a standard StateGraph
 builder = StateGraph(AgentState)
@@ -60,7 +63,7 @@ builder.add_edge("planner", END)
 with RelateSaver("checkpoints.rl") as checkpointer:
     app = builder.compile(checkpointer=checkpointer)
     config = {"configurable": {"thread_id": "session-42"}}
-    
+
     # Execute workflow
     result = app.invoke({"query": "Graph-native persistence"}, config=config)
     print("Execution output:", result)

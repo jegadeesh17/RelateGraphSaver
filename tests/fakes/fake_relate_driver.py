@@ -16,6 +16,7 @@ try:
         ResultNotSingleError,
     )
 except ImportError:  # pragma: no cover
+
     class DatabaseError(Exception):  # type: ignore[no-redef]
         """Database error fallback."""
 
@@ -30,6 +31,7 @@ except ImportError:  # pragma: no cover
 
     class ResultNotSingleError(ProgrammingError):  # type: ignore[no-redef]
         """Result not single error fallback."""
+
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +53,11 @@ class FakeRecord(dict[str, Any]):
 class FakeCursor:
     """Cursor fake supporting DB-API 2.0 and Relate-specific cursor methods."""
 
-    def __init__(self, records: Sequence[Mapping[str, Any]] | None = None, connection: FakeConnection | None = None) -> None:
+    def __init__(
+        self,
+        records: Sequence[Mapping[str, Any]] | None = None,
+        connection: FakeConnection | None = None,
+    ) -> None:
         self._records: list[FakeRecord] = [FakeRecord(r) for r in (records or [])]
         self._index: int = 0
         self._connection = connection
@@ -93,9 +99,7 @@ class FakeCursor:
         if self.is_closed:
             raise InterfaceError("Cannot fetch from a closed cursor")
         if len(self._records) != 1:
-            raise ResultNotSingleError(
-                f"expected exactly one row, got {len(self._records)}"
-            )
+            raise ResultNotSingleError(f"expected exactly one row, got {len(self._records)}")
         return self._records[0]
 
     def peek(self) -> FakeRecord | None:
@@ -167,7 +171,10 @@ class FakeRelateDriver:
         self.unique_rules: dict[str, str] = {}  # label -> property
         self.executed_queries: list[tuple[str, dict[str, Any] | None]] = []
         self._handlers: list[
-            tuple[re.Pattern[str], Callable[[re.Match[str], dict[str, Any] | None], list[dict[str, Any]]]]
+            tuple[
+                re.Pattern[str],
+                Callable[[re.Match[str], dict[str, Any] | None], list[dict[str, Any]]],
+            ]
         ] = []
 
     def connect(self, database: str = ":memory:", **kwargs: Any) -> FakeConnection:
@@ -258,7 +265,9 @@ class FakeRelateDriver:
                                 f"ConstraintValidationFailed: `{label}_{unique_prop}_unique` uniqueness constraint violated for {unique_val}"
                             )
 
-            node_key = f"{label}:{resolved_props.get(self.unique_rules.get(label, 'id'), len(self.nodes))}"
+            node_key = (
+                f"{label}:{resolved_props.get(self.unique_rules.get(label, 'id'), len(self.nodes))}"
+            )
             node_record = {"__label__": label, **resolved_props}
             self.nodes[node_key] = node_record
 
@@ -278,7 +287,11 @@ class FakeRelateDriver:
         )
         if match_node:
             var_name, label, match_props_str, return_expr = match_node.groups()
-            match_props = self._parse_and_bind_properties(match_props_str, parameters) if match_props_str else {}
+            match_props = (
+                self._parse_and_bind_properties(match_props_str, parameters)
+                if match_props_str
+                else {}
+            )
 
             matching_nodes = []
             for n in self.nodes.values():
@@ -307,7 +320,9 @@ class FakeRelateDriver:
                         subparts = re.split(r"\s+AS\s+", part, flags=re.IGNORECASE)
                         if len(subparts) == 2:
                             prop_expr, alias = subparts[0].strip(), subparts[1].strip()
-                            prop_key = prop_expr.split(".", 1)[-1] if "." in prop_expr else prop_expr
+                            prop_key = (
+                                prop_expr.split(".", 1)[-1] if "." in prop_expr else prop_expr
+                            )
                             rec[alias] = clean_n.get(prop_key)
                         else:
                             prop_key = part.split(".", 1)[-1] if "." in part else part
@@ -321,7 +336,9 @@ class FakeRelateDriver:
         # Default fallback: return empty cursor
         return FakeCursor([], connection=connection)
 
-    def _parse_and_bind_properties(self, props_str: str, parameters: dict[str, Any] | None) -> dict[str, Any]:
+    def _parse_and_bind_properties(
+        self, props_str: str, parameters: dict[str, Any] | None
+    ) -> dict[str, Any]:
         """Parse property string key: $param or key: literal, and bind parameters."""
         resolved: dict[str, Any] = {}
         pairs = [p.strip() for p in props_str.split(",") if p.strip()]
@@ -335,7 +352,9 @@ class FakeRelateDriver:
                     resolved[k] = parameters[param_name]
                 else:
                     resolved[k] = None
-            elif (raw_v.startswith("'") and raw_v.endswith("'")) or (raw_v.startswith('"') and raw_v.endswith('"')):
+            elif (raw_v.startswith("'") and raw_v.endswith("'")) or (
+                raw_v.startswith('"') and raw_v.endswith('"')
+            ):
                 resolved[k] = raw_v[1:-1]
             elif raw_v.isdigit():
                 resolved[k] = int(raw_v)

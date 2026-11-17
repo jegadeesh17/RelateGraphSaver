@@ -12,6 +12,7 @@ import threading
 import time
 from collections.abc import Generator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -46,10 +47,10 @@ def temp_disk_db() -> Generator[str]:
 def _worker_multistep_workflow_and_crash(db_path: str, thread_id: str, exit_code: int = 42) -> None:
     """Subprocess worker that executes a multi-step LangGraph workflow and crashes abruptly."""
     saver = RelateSaver(db_path=db_path, wal_enabled=True)
-    base_config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+    base_config: Any = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
 
     # Step 0: Initial user input
-    chk_0 = {
+    chk_0: Any = {
         "v": 1,
         "id": "chk-crash-000",
         "ts": "2026-11-12T10:00:00Z",
@@ -58,20 +59,30 @@ def _worker_multistep_workflow_and_crash(db_path: str, thread_id: str, exit_code
             "agent_state": "ready",
             "step_count": 0,
         },
-        "channel_versions": {"messages": "00000001", "agent_state": "00000001", "step_count": "00000001"},
+        "channel_versions": {
+            "messages": "00000001",
+            "agent_state": "00000001",
+            "step_count": "00000001",
+        },
         "versions_seen": {},
         "pending_sends": [],
     }
-    saver.put(base_config, chk_0, {"step": 0, "node": "input"}, {})
+    saver.put(base_config, chk_0, {"step": 0, "node": "input"}, {})  # type: ignore[typeddict-unknown-key]
 
     # Step 1: Agent planning with channel writes
-    cfg_step1 = {"configurable": {"thread_id": thread_id, "checkpoint_ns": "", "checkpoint_id": "chk-crash-000"}}
+    cfg_step1: Any = {
+        "configurable": {
+            "thread_id": thread_id,
+            "checkpoint_ns": "",
+            "checkpoint_id": "chk-crash-000",
+        }
+    }
     saver.put_writes(
         cfg_step1,
         [("plan_notes", "Risk profile is moderate. Querying market data.")],
         task_id="task-planner-1",
     )
-    chk_1 = {
+    chk_1: Any = {
         "v": 1,
         "id": "chk-crash-001",
         "ts": "2026-11-12T10:00:05Z",
@@ -81,20 +92,30 @@ def _worker_multistep_workflow_and_crash(db_path: str, thread_id: str, exit_code
             "agent_state": "planning",
             "step_count": 1,
         },
-        "channel_versions": {"messages": "00000002", "agent_state": "00000002", "step_count": "00000002"},
+        "channel_versions": {
+            "messages": "00000002",
+            "agent_state": "00000002",
+            "step_count": "00000002",
+        },
         "versions_seen": {},
         "pending_sends": [],
     }
-    saver.put(cfg_step1, chk_1, {"step": 1, "node": "planner"}, {})
+    saver.put(cfg_step1, chk_1, {"step": 1, "node": "planner"}, {})  # type: ignore[typeddict-unknown-key]
 
     # Step 2: Tool execution with structured writes
-    cfg_step2 = {"configurable": {"thread_id": thread_id, "checkpoint_ns": "", "checkpoint_id": "chk-crash-001"}}
+    cfg_step2: Any = {
+        "configurable": {
+            "thread_id": thread_id,
+            "checkpoint_ns": "",
+            "checkpoint_id": "chk-crash-001",
+        }
+    }
     saver.put_writes(
         cfg_step2,
         [("tool_payload", {"allocations": [40, 40, 20], "variance": 0.05})],
         task_id="task-tool-2",
     )
-    chk_2 = {
+    chk_2: Any = {
         "v": 1,
         "id": "chk-crash-002",
         "ts": "2026-11-12T10:00:10Z",
@@ -108,15 +129,25 @@ def _worker_multistep_workflow_and_crash(db_path: str, thread_id: str, exit_code
             "agent_state": "executing",
             "step_count": 2,
         },
-        "channel_versions": {"messages": "00000003", "agent_state": "00000003", "step_count": "00000003"},
+        "channel_versions": {
+            "messages": "00000003",
+            "agent_state": "00000003",
+            "step_count": "00000003",
+        },
         "versions_seen": {},
         "pending_sends": [],
     }
-    saver.put(cfg_step2, chk_2, {"step": 2, "node": "tools"}, {})
+    saver.put(cfg_step2, chk_2, {"step": 2, "node": "tools"}, {})  # type: ignore[typeddict-unknown-key]
 
     # Step 3: Synthesis / completion
-    cfg_step3 = {"configurable": {"thread_id": thread_id, "checkpoint_ns": "", "checkpoint_id": "chk-crash-002"}}
-    chk_3 = {
+    cfg_step3: Any = {
+        "configurable": {
+            "thread_id": thread_id,
+            "checkpoint_ns": "",
+            "checkpoint_id": "chk-crash-002",
+        }
+    }
+    chk_3: Any = {
         "v": 1,
         "id": "chk-crash-003",
         "ts": "2026-11-12T10:00:15Z",
@@ -131,11 +162,15 @@ def _worker_multistep_workflow_and_crash(db_path: str, thread_id: str, exit_code
             "agent_state": "completed",
             "step_count": 3,
         },
-        "channel_versions": {"messages": "00000004", "agent_state": "00000004", "step_count": "00000004"},
+        "channel_versions": {
+            "messages": "00000004",
+            "agent_state": "00000004",
+            "step_count": "00000004",
+        },
         "versions_seen": {},
         "pending_sends": [],
     }
-    saver.put(cfg_step3, chk_3, {"step": 3, "node": "synthesizer"}, {})
+    saver.put(cfg_step3, chk_3, {"step": 3, "node": "synthesizer"}, {})  # type: ignore[typeddict-unknown-key]
 
     # Abrupt process termination: do not call close() or flush()
     os._exit(exit_code)
@@ -149,10 +184,10 @@ def _worker_committed_then_uncommitted_crash(
 ) -> None:
     """Subprocess worker that commits valid checkpoints then crashes with uncommitted write in flight."""
     saver = RelateSaver(db_path=db_path, wal_enabled=True)
-    base_config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+    base_config: Any = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
 
     # Commit step 0 cleanly
-    chk_0 = {
+    chk_0: Any = {
         "v": 1,
         "id": "chk-valid-000",
         "ts": "2026-11-12T11:00:00Z",
@@ -164,8 +199,14 @@ def _worker_committed_then_uncommitted_crash(
     saver.put(base_config, chk_0, {"step": 0}, {})
 
     # Commit step 1 cleanly
-    cfg_step1 = {"configurable": {"thread_id": thread_id, "checkpoint_ns": "", "checkpoint_id": "chk-valid-000"}}
-    chk_1 = {
+    cfg_step1: Any = {
+        "configurable": {
+            "thread_id": thread_id,
+            "checkpoint_ns": "",
+            "checkpoint_id": "chk-valid-000",
+        }
+    }
+    chk_1: Any = {
         "v": 1,
         "id": "chk-valid-001",
         "ts": "2026-11-12T11:00:05Z",
@@ -210,14 +251,14 @@ def _worker_concurrent_threads_and_crash(
             last_cid: str | None = None
             for step in range(checkpoints_per_thread):
                 cid = f"chk-{t_idx:02d}-{step:03d}"
-                cfg = {
+                cfg: Any = {
                     "configurable": {
                         "thread_id": tid,
                         "checkpoint_ns": "",
                         "checkpoint_id": last_cid,
                     }
                 }
-                chk = {
+                chk: Any = {
                     "v": 1,
                     "id": cid,
                     "ts": f"2026-11-12T12:00:{step:02d}Z",
@@ -270,19 +311,23 @@ class TestCrashRecovery:
         proc.start()
         proc.join(timeout=30.0)
 
-        assert proc.exitcode == crash_code, f"Expected crash exitcode {crash_code}, got {proc.exitcode}"
+        assert proc.exitcode == crash_code, (
+            f"Expected crash exitcode {crash_code}, got {proc.exitcode}"
+        )
 
         # Reopen brand-new checkpointer instance on the exact same disk file
         with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as recovered_saver:
-            config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+            config: Any = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
 
             # Verify AC-11: get_tuple retrieves exact last committed checkpoint (step 3)
             latest_tuple = recovered_saver.get_tuple(config)
-            assert latest_tuple is not None, "Failed to retrieve latest checkpoint from recovered store"
+            assert latest_tuple is not None, (
+                "Failed to retrieve latest checkpoint from recovered store"
+            )
 
             assert latest_tuple.checkpoint["id"] == "chk-crash-003"
             assert latest_tuple.metadata["step"] == 3
-            assert latest_tuple.metadata["node"] == "synthesizer"
+            assert latest_tuple.metadata["node"] == "synthesizer"  # type: ignore[typeddict-item]
 
             expected_messages = [
                 "User query: Analyze portfolio",
@@ -295,21 +340,30 @@ class TestCrashRecovery:
             assert latest_tuple.checkpoint["channel_values"]["step_count"] == 3
 
             # Verify pending writes for intermediate steps
-            cfg_chk0 = {"configurable": {"thread_id": thread_id, "checkpoint_id": "chk-crash-000"}}
-            chk0_tuple = recovered_saver.get_tuple(cfg_chk0)
+            cfg_chk0: Any = {
+                "configurable": {"thread_id": thread_id, "checkpoint_id": "chk-crash-000"}
+            }
+            chk0_tuple: Any = recovered_saver.get_tuple(cfg_chk0)
             assert chk0_tuple is not None
             assert len(chk0_tuple.pending_writes) == 1
             assert chk0_tuple.pending_writes[0][0] == "task-planner-1"
             assert chk0_tuple.pending_writes[0][1] == "plan_notes"
-            assert chk0_tuple.pending_writes[0][2] == "Risk profile is moderate. Querying market data."
+            assert (
+                chk0_tuple.pending_writes[0][2] == "Risk profile is moderate. Querying market data."
+            )
 
-            cfg_chk1 = {"configurable": {"thread_id": thread_id, "checkpoint_id": "chk-crash-001"}}
-            chk1_tuple = recovered_saver.get_tuple(cfg_chk1)
+            cfg_chk1: Any = {
+                "configurable": {"thread_id": thread_id, "checkpoint_id": "chk-crash-001"}
+            }
+            chk1_tuple: Any = recovered_saver.get_tuple(cfg_chk1)
             assert chk1_tuple is not None
             assert len(chk1_tuple.pending_writes) == 1
             assert chk1_tuple.pending_writes[0][0] == "task-tool-2"
             assert chk1_tuple.pending_writes[0][1] == "tool_payload"
-            assert chk1_tuple.pending_writes[0][2] == {"allocations": [40, 40, 20], "variance": 0.05}
+            assert chk1_tuple.pending_writes[0][2] == {
+                "allocations": [40, 40, 20],
+                "variance": 0.05,
+            }
 
             # Verify causal [:NEXT] lineage graph structure
             query_lineage = (
@@ -351,13 +405,13 @@ class TestCrashRecovery:
 
         # 2. Reopen and append new steps to the recovered thread
         with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
-            config_latest = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+            config_latest: Any = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
             current_tuple = saver.get_tuple(config_latest)
             assert current_tuple is not None
             assert current_tuple.checkpoint["id"] == "chk-crash-003"
 
             # Append Step 4 (human feedback)
-            cfg_step4 = {
+            cfg_step4: Any = {
                 "configurable": {
                     "thread_id": thread_id,
                     "checkpoint_ns": "",
@@ -369,7 +423,7 @@ class TestCrashRecovery:
                 [("feedback", "Looks great, please re-run next quarter.")],
                 task_id="task-human-feedback-4",
             )
-            chk_4 = {
+            chk_4: Any = {
                 "v": 1,
                 "id": "chk-resumed-004",
                 "ts": "2026-11-12T10:01:00Z",
@@ -380,21 +434,25 @@ class TestCrashRecovery:
                     "agent_state": "feedback_received",
                     "step_count": 4,
                 },
-                "channel_versions": {"messages": "00000005", "agent_state": "00000005", "step_count": "00000005"},
+                "channel_versions": {
+                    "messages": "00000005",
+                    "agent_state": "00000005",
+                    "step_count": "00000005",
+                },
                 "versions_seen": {},
                 "pending_sends": [],
             }
-            saver.put(cfg_step4, chk_4, {"step": 4, "node": "human_input"}, {})
+            saver.put(cfg_step4, chk_4, {"step": 4, "node": "human_input"}, {})  # type: ignore[typeddict-unknown-key]
 
             # Append Step 5 (acknowledgement)
-            cfg_step5 = {
+            cfg_step5: Any = {
                 "configurable": {
                     "thread_id": thread_id,
                     "checkpoint_ns": "",
                     "checkpoint_id": "chk-resumed-004",
                 }
             }
-            chk_5 = {
+            chk_5: Any = {
                 "v": 1,
                 "id": "chk-resumed-005",
                 "ts": "2026-11-12T10:01:05Z",
@@ -405,11 +463,15 @@ class TestCrashRecovery:
                     "agent_state": "finalized",
                     "step_count": 5,
                 },
-                "channel_versions": {"messages": "00000006", "agent_state": "00000006", "step_count": "00000006"},
+                "channel_versions": {
+                    "messages": "00000006",
+                    "agent_state": "00000006",
+                    "step_count": "00000006",
+                },
                 "versions_seen": {},
                 "pending_sends": [],
             }
-            saver.put(cfg_step5, chk_5, {"step": 5, "node": "final_agent"}, {})
+            saver.put(cfg_step5, chk_5, {"step": 5, "node": "final_agent"}, {})  # type: ignore[typeddict-unknown-key]
 
             # 3. Verify step 5 is now the active head
             head_tuple = saver.get_tuple(config_latest)
@@ -438,7 +500,7 @@ class TestCrashRecovery:
 
         # Reopen with RelateSaver to inspect WAL recovery result
         with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
-            config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+            config: Any = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
 
             # Verify committed checkpoints are intact
             latest = saver.get_tuple(config)
@@ -451,7 +513,9 @@ class TestCrashRecovery:
                 "MATCH (c:Checkpoint {checkpoint_id: $cid}) RETURN count(c) AS cnt",
                 {"cid": uncommitted_cid},
             )
-            assert uncommitted_check[0]["cnt"] == 0, "Uncommitted checkpoint leaked into persistent store"
+            assert uncommitted_check[0]["cnt"] == 0, (
+                "Uncommitted checkpoint leaked into persistent store"
+            )
 
             # Verify total checkpoint count for this thread is exactly 2
             total_check = saver.proxy.execute_read(
@@ -461,14 +525,14 @@ class TestCrashRecovery:
             assert total_check[0]["cnt"] == 2
 
             # Verify store can continue appending without conflict
-            cfg_step2 = {
+            cfg_step2: Any = {
                 "configurable": {
                     "thread_id": thread_id,
                     "checkpoint_ns": "",
                     "checkpoint_id": "chk-valid-001",
                 }
             }
-            chk_2 = {
+            chk_2: Any = {
                 "v": 1,
                 "id": "chk-valid-002",
                 "ts": "2026-11-12T11:00:10Z",
@@ -489,8 +553,8 @@ class TestCrashRecovery:
         thread_id = "thread-in-process-004"
 
         saver1 = RelateSaver(db_path=temp_disk_db, wal_enabled=True)
-        config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
-        chk_0 = {
+        config: Any = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+        chk_0: Any = {
             "v": 1,
             "id": "chk-inproc-000",
             "ts": "2026-11-12T11:30:00Z",
@@ -529,7 +593,7 @@ class TestCrashRecovery:
         with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
             for t_idx in range(num_threads):
                 tid = f"mp-thread-{t_idx:02d}"
-                cfg = {"configurable": {"thread_id": tid, "checkpoint_ns": ""}}
+                cfg: Any = {"configurable": {"thread_id": tid, "checkpoint_ns": ""}}
                 tup = saver.get_tuple(cfg)
                 assert tup is not None, f"Failed to retrieve tuple for thread {tid}"
                 assert tup.metadata["step"] == checkpoints_per_thread - 1
@@ -538,7 +602,9 @@ class TestCrashRecovery:
                 # Verify all steps present in reverse order
                 steps = list(saver.list(cfg))
                 assert len(steps) == checkpoints_per_thread
-                assert [s.metadata["step"] for s in steps] == list(reversed(range(checkpoints_per_thread)))
+                assert [s.metadata["step"] for s in steps] == list(
+                    reversed(range(checkpoints_per_thread))
+                )
 
     def test_failed_batch_transaction_rolls_back_cleanly_ac_10(self, temp_disk_db: str) -> None:
         """AC-10: A failing transaction rolls back cleanly without leaving partial records."""
@@ -546,7 +612,7 @@ class TestCrashRecovery:
             proxy.execute_write("CREATE (t:Thread {thread_id: 'clean-t-1'})")
 
             # Execute batch where the second statement has intentional Cypher syntax error
-            failing_statements = [
+            failing_statements: list[tuple[str, dict[str, Any]]] = [
                 ("CREATE (c:Checkpoint {checkpoint_id: 'ghost-c-1', thread_id: 'clean-t-1'})", {}),
                 ("INVALID SYNTAX STATEMENT THAT FAILS PARSER", {}),
             ]
@@ -554,14 +620,18 @@ class TestCrashRecovery:
                 proxy.transaction(failing_statements)
 
             # Assert first statement was rolled back
-            res = proxy.execute_read("MATCH (c:Checkpoint {checkpoint_id: 'ghost-c-1'}) RETURN count(c) AS cnt")
-            assert res[0]["cnt"] == 0, "Partial batch write was committed despite subsequent statement failure"
+            res = proxy.execute_read(
+                "MATCH (c:Checkpoint {checkpoint_id: 'ghost-c-1'}) RETURN count(c) AS cnt"
+            )
+            assert res[0]["cnt"] == 0, (
+                "Partial batch write was committed despite subsequent statement failure"
+            )
 
     def test_wal_flush_method_guarantees_durability(self, temp_disk_db: str) -> None:
         """Verify that explicit flush() synchronously commits and syncs WAL to disk."""
         with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
-            config = {"configurable": {"thread_id": "flush-test-01", "checkpoint_ns": ""}}
-            chk = {
+            config: Any = {"configurable": {"thread_id": "flush-test-01", "checkpoint_ns": ""}}
+            chk: Any = {
                 "v": 1,
                 "id": "chk-flush-01",
                 "ts": "2026-11-12T12:00:00Z",

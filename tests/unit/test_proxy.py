@@ -61,6 +61,7 @@ class TestProxyLifecycle:
 
     def test_proxy_startup_failure_raises_connection_error(self) -> None:
         """Verify startup exception in connection factory raises RelateConnectionError."""
+
         def broken_factory(path: str) -> Any:
             raise RuntimeError("Database driver failed to initialize")
 
@@ -93,13 +94,15 @@ class TestProxyExecution:
             res1 = proxy.execute("CREATE (t:Thread {thread_id: $tid})", {"tid": "thread-102"})
             assert isinstance(res1, list)
 
-            res2 = proxy.execute("MATCH (t:Thread {thread_id: $tid}) RETURN t.thread_id AS id", {"tid": "thread-102"})
+            res2 = proxy.execute(
+                "MATCH (t:Thread {thread_id: $tid}) RETURN t.thread_id AS id", {"tid": "thread-102"}
+            )
             assert res2 == [{"id": "thread-102"}]
 
     def test_execute_batch_atomicity_ac_08(self) -> None:
         """AC-08: Verify execute_batch executes multiple statements in a single transaction."""
         with RelateThreadProxy(db_path=":memory:") as proxy:
-            statements = [
+            statements: list[tuple[str, dict[str, Any]]] = [
                 ("CREATE (t:Thread {thread_id: 'batch-1'})", {}),
                 ("CREATE (t:Thread {thread_id: 'batch-2'})", {}),
                 ("CREATE (t:Thread {thread_id: 'batch-3'})", {}),
@@ -113,7 +116,7 @@ class TestProxyExecution:
     def test_transaction_alias_ac_08(self) -> None:
         """AC-08: Verify transaction() alias behaves identically to execute_batch()."""
         with RelateThreadProxy(db_path=":memory:") as proxy:
-            statements = [
+            statements: list[tuple[str, dict[str, Any]]] = [
                 ("CREATE (t:Thread {thread_id: 'tx-1'})", {}),
                 ("CREATE (t:Thread {thread_id: 'tx-2'})", {}),
             ]
@@ -127,7 +130,7 @@ class TestProxyExecution:
         """AC-08: Verify failed statement in transaction rolls back all statements."""
         with RelateThreadProxy(db_path=":memory:") as proxy:
             # Statement 1 succeeds, Statement 2 has syntax error
-            statements = [
+            statements: list[tuple[str, dict[str, Any]]] = [
                 ("CREATE (t:Thread {thread_id: 'rollback-item'})", {}),
                 ("INVALID CYPHER SYNTAX", {}),
             ]
@@ -160,21 +163,25 @@ class TestProxyExecution:
         with RelateThreadProxy(db_path=":memory:") as proxy:
             # Test execute dict
             exec_fut: concurrent.futures.Future[Any] = concurrent.futures.Future()
-            proxy._queue.put({
-                "type": "execute",
-                "cypher": "CREATE (t:Thread {thread_id: 'dict-1'}) RETURN t.thread_id AS id",
-                "params": {},
-                "future": exec_fut,
-            })
+            proxy._queue.put(
+                {
+                    "type": "execute",
+                    "cypher": "CREATE (t:Thread {thread_id: 'dict-1'}) RETURN t.thread_id AS id",
+                    "params": {},
+                    "future": exec_fut,
+                }
+            )
             assert exec_fut.result(timeout=5.0) == [{"id": "dict-1"}]
 
             # Test transaction dict
             tx_fut: concurrent.futures.Future[Any] = concurrent.futures.Future()
-            proxy._queue.put({
-                "type": "transaction",
-                "statements": [("CREATE (t:Thread {thread_id: 'dict-2'})", {})],
-                "future": tx_fut,
-            })
+            proxy._queue.put(
+                {
+                    "type": "transaction",
+                    "statements": [("CREATE (t:Thread {thread_id: 'dict-2'})", {})],
+                    "future": tx_fut,
+                }
+            )
             assert len(tx_fut.result(timeout=5.0)) == 1
 
             # Test is_alive dict
@@ -211,13 +218,13 @@ class TestProxyValidationAndErrors:
                 proxy.execute_batch("not a list")  # type: ignore[arg-type]
 
             with pytest.raises(RelateCheckpointError, match="2-tuple"):
-                proxy.execute_batch(["invalid item"])  # type: ignore[arg-type]
+                proxy.execute_batch(["invalid item"])  # type: ignore[list-item]
 
             with pytest.raises(RelateCheckpointError, match="invalid or empty query"):
                 proxy.execute_batch([("", {})])
 
             with pytest.raises(RelateCheckpointError, match="parameters must be a dictionary"):
-                proxy.execute_batch([("RETURN 1", "not a dict")])  # type: ignore[arg-type]
+                proxy.execute_batch([("RETURN 1", "not a dict")])  # type: ignore[list-item]
 
     def test_cypher_syntax_error_wrapped(self) -> None:
         """Verify database syntax errors are wrapped into RelateCheckpointError."""
@@ -232,7 +239,10 @@ class TestProxyValidationAndErrors:
             proxy.execute_write("CREATE (t:Thread {thread_id: 'dup-id'})")
             with pytest.raises(RelateCheckpointError) as exc_info:
                 proxy.execute_write("CREATE (t:Thread {thread_id: 'dup-id'})")
-            assert "ConstraintValidationFailed" in str(exc_info.value) or "unique" in str(exc_info.value).lower()
+            assert (
+                "ConstraintValidationFailed" in str(exc_info.value)
+                or "unique" in str(exc_info.value).lower()
+            )
 
     def test_closed_proxy_operations_raise_relate_connection_error(self) -> None:
         """Verify calling methods on a closed proxy raises RelateConnectionError."""

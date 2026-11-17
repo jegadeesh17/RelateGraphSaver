@@ -6,6 +6,7 @@ conforming to LangGraph's BaseCheckpointSaver interface.
 
 from __future__ import annotations
 
+import builtins
 import logging
 import random
 import uuid
@@ -652,7 +653,7 @@ class RelateSaver(BaseCheckpointSaver[str]):
         self,
         thread_id: str,
         threshold: int = 2,
-    ) -> list[LoopReport]:
+    ) -> builtins.list[LoopReport]:
         """Identify state oscillation or repeating cycle paths in the Cypher DAG.
 
         Delegates to RelateForensics.detect_loops.

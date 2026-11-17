@@ -29,10 +29,10 @@ if _PROJECT_ROOT not in sys.path:
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from langgraph_checkpoint_relate.errors import CheckpointNotFoundError
-from langgraph_checkpoint_relate.forensics import RelateForensics
-from langgraph_checkpoint_relate.models import LoopReport, RootCauseReport
-from langgraph_checkpoint_relate.saver import RelateSaver
+from langgraph_checkpoint_relate.errors import CheckpointNotFoundError  # noqa: E402
+from langgraph_checkpoint_relate.forensics import RelateForensics  # noqa: E402
+from langgraph_checkpoint_relate.models import LoopReport, RootCauseReport  # noqa: E402
+from langgraph_checkpoint_relate.saver import RelateSaver  # noqa: E402
 
 
 @pytest.fixture
@@ -106,8 +106,12 @@ class TestRelateForensics:
         workflow.add_node("ping", node_ping)
         workflow.add_node("pong", node_pong)
         workflow.add_edge(START, "ping")
-        workflow.add_conditional_edges("ping", route_condition, {"ping": "ping", "pong": "pong", END: END})
-        workflow.add_conditional_edges("pong", route_condition, {"ping": "ping", "pong": "pong", END: END})
+        workflow.add_conditional_edges(
+            "ping", route_condition, {"ping": "ping", "pong": "pong", END: END}
+        )
+        workflow.add_conditional_edges(
+            "pong", route_condition, {"ping": "ping", "pong": "pong", END: END}
+        )
 
         thread_id = "thread-oscillation-001"
         config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
@@ -244,17 +248,25 @@ class TestRelateForensics:
         """Verify CheckpointNotFoundError for non-existent thread and argument validation."""
         with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
             # 1. Non-existent thread
-            with pytest.raises(CheckpointNotFoundError, match="not found or contains no checkpoints"):
+            with pytest.raises(
+                CheckpointNotFoundError, match="not found or contains no checkpoints"
+            ):
                 saver.detect_loops("missing-thread-xyz")
 
-            with pytest.raises(CheckpointNotFoundError, match="not found or contains no checkpoints"):
+            with pytest.raises(
+                CheckpointNotFoundError, match="not found or contains no checkpoints"
+            ):
                 saver.trace_root_cause("missing-thread-xyz")
 
             # 2. Empty or invalid thread_id
-            with pytest.raises(CheckpointNotFoundError, match="thread_id must be a non-empty string"):
+            with pytest.raises(
+                CheckpointNotFoundError, match="thread_id must be a non-empty string"
+            ):
                 saver.detect_loops("")
 
-            with pytest.raises(CheckpointNotFoundError, match="thread_id must be a non-empty string"):
+            with pytest.raises(
+                CheckpointNotFoundError, match="thread_id must be a non-empty string"
+            ):
                 saver.trace_root_cause("")
 
             # 3. Invalid threshold
@@ -292,11 +304,11 @@ class TestRelateForensics:
                         "checkpoint_id": cid,
                     }
                 }
-                cp = dict(empty_checkpoint())
+                cp: Any = dict(empty_checkpoint())
                 cp["id"] = cid
                 if prev_cid:
                     cp["parent_checkpoint_id"] = prev_cid
-                saver.put(cfg, cp, {"node": node_name, "step": idx}, {})
+                saver.put(cfg, cp, {"node": node_name, "step": idx}, {})  # type: ignore[typeddict-unknown-key]
                 prev_cid = cid
 
             reports = saver.detect_loops(thread_id, threshold=2)
@@ -312,10 +324,12 @@ class TestRelateForensics:
         with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
             # Step 1: Checkpoint with ToolCall that failed
             cid_step1 = "cp-tool-001"
-            cfg1: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_id": cid_step1}}
-            cp1 = dict(empty_checkpoint())
+            cfg1: RunnableConfig = {
+                "configurable": {"thread_id": thread_id, "checkpoint_id": cid_step1}
+            }
+            cp1: Any = dict(empty_checkpoint())
             cp1["id"] = cid_step1
-            saver.put(cfg1, cp1, {"step": 1, "node": "tool_executor"}, {})
+            saver.put(cfg1, cp1, {"step": 1, "node": "tool_executor"}, {})  # type: ignore[typeddict-unknown-key]
 
             # Create tool call and link via INVOKED
             saver.proxy.execute_write(
@@ -335,11 +349,13 @@ class TestRelateForensics:
 
             # Step 2: Checkpoint downstream where error is recorded
             cid_step2 = "cp-tool-002"
-            cfg2: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_id": cid_step2}}
-            cp2 = dict(empty_checkpoint())
+            cfg2: RunnableConfig = {
+                "configurable": {"thread_id": thread_id, "checkpoint_id": cid_step2}
+            }
+            cp2: Any = dict(empty_checkpoint())
             cp2["id"] = cid_step2
             cp2["parent_checkpoint_id"] = cid_step1
-            saver.put(cfg2, cp2, {"step": 2, "node": "error_handler"}, {})
+            saver.put(cfg2, cp2, {"step": 2, "node": "error_handler"}, {})  # type: ignore[typeddict-unknown-key]
 
             # Put __error__ write at step 2
             saver.put_writes(
@@ -355,4 +371,3 @@ class TestRelateForensics:
             assert report.causal_path_length == 1
             assert "HTTP 429" in report.error_message or "search_api" in report.error_message
             assert "call-search-err-99" in report.diagnostic_summary
-

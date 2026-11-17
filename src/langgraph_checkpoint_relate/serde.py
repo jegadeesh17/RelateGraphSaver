@@ -17,9 +17,7 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 from langgraph_checkpoint_relate.errors import CheckpointSerializationError
 
-KNOWN_TYPES: frozenset[str] = frozenset(
-    {"msgpack", "json", "bytes", "bytearray", "null", "pickle"}
-)
+KNOWN_TYPES: frozenset[str] = frozenset({"msgpack", "json", "bytes", "bytearray", "null", "pickle"})
 
 
 class RelateStateSerializer(SerializerProtocol):
@@ -45,9 +43,7 @@ class RelateStateSerializer(SerializerProtocol):
             inner_serializer: Optional custom JsonPlusSerializer instance.
             pickle_fallback: Whether to fall back to pickle for unsupported types.
         """
-        self._serializer = inner_serializer or JsonPlusSerializer(
-            pickle_fallback=pickle_fallback
-        )
+        self._serializer = inner_serializer or JsonPlusSerializer(pickle_fallback=pickle_fallback)
 
     def _find_offending_key(
         self,
@@ -255,15 +251,11 @@ class RelateStateSerializer(SerializerProtocol):
             CheckpointSerializationError: If decoding or deserialization fails.
         """
         if not isinstance(data, str):
-            raise CheckpointSerializationError(
-                f"Expected base64 str, got {type(data).__name__}"
-            )
+            raise CheckpointSerializationError(f"Expected base64 str, got {type(data).__name__}")
         try:
             byte_data = base64.b64decode(data.encode("ascii"))
         except (binascii.Error, ValueError) as exc:
-            raise CheckpointSerializationError(
-                f"Failed to decode base64 payload: {exc}"
-            ) from exc
+            raise CheckpointSerializationError(f"Failed to decode base64 payload: {exc}") from exc
 
         return self.loads(byte_data)
 
@@ -307,7 +299,11 @@ class RelateStateSerializer(SerializerProtocol):
             return hashlib.sha256(state).hexdigest()
 
         # If a full Checkpoint dict is passed, extract channel_values
-        if isinstance(state, dict) and "channel_values" in state and isinstance(state["channel_values"], dict):
+        if (
+            isinstance(state, dict)
+            and "channel_values" in state
+            and isinstance(state["channel_values"], dict)
+        ):
             target = state["channel_values"]
         else:
             target = state

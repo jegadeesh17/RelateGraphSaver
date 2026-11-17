@@ -21,8 +21,7 @@ CONSTRAINT_CHECKPOINT_UNIQUE: str = (
 )
 
 CONSTRAINT_WRITE_UNIQUE: str = (
-    "CREATE CONSTRAINT write_id_unique IF NOT EXISTS\n"
-    "FOR (w:Write) REQUIRE w.write_id IS UNIQUE;"
+    "CREATE CONSTRAINT write_id_unique IF NOT EXISTS\nFOR (w:Write) REQUIRE w.write_id IS UNIQUE;"
 )
 
 CONSTRAINT_TOOL_CALL_UNIQUE: str = (
@@ -37,13 +36,11 @@ INDEX_CHECKPOINT_THREAD: str = (
 )
 
 INDEX_CHECKPOINT_HASH: str = (
-    "CREATE INDEX checkpoint_hash_idx IF NOT EXISTS\n"
-    "FOR (c:Checkpoint) ON (c.state_hash);"
+    "CREATE INDEX checkpoint_hash_idx IF NOT EXISTS\nFOR (c:Checkpoint) ON (c.state_hash);"
 )
 
 INDEX_CHECKPOINT_NS: str = (
-    "CREATE INDEX checkpoint_ns_idx IF NOT EXISTS\n"
-    "FOR (c:Checkpoint) ON (c.checkpoint_ns);"
+    "CREATE INDEX checkpoint_ns_idx IF NOT EXISTS\nFOR (c:Checkpoint) ON (c.checkpoint_ns);"
 )
 
 SCHEMA_CONSTRAINTS: tuple[str, ...] = (
@@ -87,11 +84,16 @@ def initialize_schema(conn: Any) -> None:
         if hasattr(conn, "commit") and not getattr(conn, "autocommit", True):
             conn.commit()
 
-        logger.debug("Relate graph schema successfully initialized (%d statements)", len(ALL_SCHEMA_STATEMENTS))
+        logger.debug(
+            "Relate graph schema successfully initialized (%d statements)",
+            len(ALL_SCHEMA_STATEMENTS),
+        )
     except RelateConnectionError:
         raise
     except Exception as exc:
-        raise RelateConnectionError(f"Failed to execute schema initialization statement: {exc}") from exc
+        raise RelateConnectionError(
+            f"Failed to execute schema initialization statement: {exc}"
+        ) from exc
 
 
 __all__ = [

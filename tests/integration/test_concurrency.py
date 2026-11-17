@@ -65,6 +65,7 @@ class TestConcurrencyEngine:
         )
 
         with RelateThreadProxy(db_path=temp_db_path) as proxy:
+
             def worker(thread_idx: int) -> None:
                 try:
                     for i in range(writes_per_thread):
@@ -87,7 +88,9 @@ class TestConcurrencyEngine:
                 t.join()
 
             # Assert zero exceptions occurred during concurrent execution
-            assert not thread_errors, f"Encountered {len(thread_errors)} concurrent write errors: {thread_errors}"
+            assert not thread_errors, (
+                f"Encountered {len(thread_errors)} concurrent write errors: {thread_errors}"
+            )
 
             # Verify deterministic record persistence
             count_res = proxy.execute_read("MATCH (c:Checkpoint) RETURN count(c) AS total_count")
@@ -95,7 +98,9 @@ class TestConcurrencyEngine:
 
         # Reopen from disk to verify durable commit persistence
         with RelateThreadProxy(db_path=temp_db_path) as verify_proxy:
-            persisted_res = verify_proxy.execute_read("MATCH (c:Checkpoint) RETURN count(c) AS total_count")
+            persisted_res = verify_proxy.execute_read(
+                "MATCH (c:Checkpoint) RETURN count(c) AS total_count"
+            )
             assert persisted_res[0]["total_count"] == total_expected_records
 
     def test_concurrent_transactions_20_threads_ac_08(self, temp_db_path: str) -> None:
@@ -107,6 +112,7 @@ class TestConcurrencyEngine:
         tx_errors: list[Exception] = []
 
         with RelateThreadProxy(db_path=temp_db_path) as proxy:
+
             def tx_worker(thread_idx: int) -> None:
                 try:
                     tid = f"tx-thread-{thread_idx:02d}"
@@ -142,9 +148,15 @@ class TestConcurrencyEngine:
             assert not tx_errors, f"Encountered transaction errors: {tx_errors}"
 
             # Verify atomic persistence of all 20 threads, checkpoints, and relationships
-            threads_count = proxy.execute_read("MATCH (t:Thread) RETURN count(t) AS count")[0]["count"]
-            checkpoints_count = proxy.execute_read("MATCH (c:Checkpoint) RETURN count(c) AS count")[0]["count"]
-            edges_count = proxy.execute_read("MATCH ()-[r:HAS_CHECKPOINT]->() RETURN count(r) AS count")[0]["count"]
+            threads_count = proxy.execute_read("MATCH (t:Thread) RETURN count(t) AS count")[0][
+                "count"
+            ]
+            checkpoints_count = proxy.execute_read("MATCH (c:Checkpoint) RETURN count(c) AS count")[
+                0
+            ]["count"]
+            edges_count = proxy.execute_read(
+                "MATCH ()-[r:HAS_CHECKPOINT]->() RETURN count(r) AS count"
+            )[0]["count"]
 
             assert threads_count == num_threads
             assert checkpoints_count == num_threads
@@ -174,6 +186,7 @@ class TestConcurrencyEngine:
         )
 
         with RelateThreadProxy(db_path=temp_db_path) as proxy:
+
             def writer(w_id: int) -> None:
                 try:
                     for i in range(writes_per_writer):
@@ -222,7 +235,9 @@ class TestConcurrencyEngine:
 
             assert not errors, f"Encountered errors during concurrent read/write test: {errors}"
 
-            final_count = proxy.execute_read("MATCH (c:Checkpoint) RETURN count(c) AS cnt")[0]["cnt"]
+            final_count = proxy.execute_read("MATCH (c:Checkpoint) RETURN count(c) AS cnt")[0][
+                "cnt"
+            ]
             assert final_count == num_writers * writes_per_writer
 
     def test_high_contention_mixed_workload_ac_08_ac_09(self, temp_db_path: str) -> None:
@@ -235,6 +250,7 @@ class TestConcurrencyEngine:
         errors: list[Exception] = []
 
         with RelateThreadProxy(db_path=temp_db_path) as proxy:
+
             def mixed_worker(w_id: int) -> None:
                 try:
                     for i in range(ops_per_worker):
@@ -247,12 +263,18 @@ class TestConcurrencyEngine:
                             )
                         elif op_type == 1:
                             # Batch transaction
-                            proxy.transaction([
-                                (
-                                    "CREATE (c:Checkpoint {checkpoint_id: $cid, thread_id: $tid, checkpoint_ns: '', step: $step, state_hash: 'h'})",
-                                    {"cid": f"mixed-c-{w_id}-{i}", "tid": f"mixed-t-{w_id}-{i}", "step": i},
-                                ),
-                            ])
+                            proxy.transaction(
+                                [
+                                    (
+                                        "CREATE (c:Checkpoint {checkpoint_id: $cid, thread_id: $tid, checkpoint_ns: '', step: $step, state_hash: 'h'})",
+                                        {
+                                            "cid": f"mixed-c-{w_id}-{i}",
+                                            "tid": f"mixed-t-{w_id}-{i}",
+                                            "step": i,
+                                        },
+                                    ),
+                                ]
+                            )
                         else:
                             # Read
                             proxy.execute_read("MATCH (t:Thread) RETURN count(t) AS total")

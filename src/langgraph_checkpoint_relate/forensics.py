@@ -8,17 +8,11 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-from langgraph_checkpoint_relate.errors import (
-    CheckpointNotFoundError,
-    RelateCheckpointError,
-)
+from langgraph_checkpoint_relate.errors import CheckpointNotFoundError
 from langgraph_checkpoint_relate.models import LoopReport, RootCauseReport
 from langgraph_checkpoint_relate.saver import RelateSaver, _extract_bytes
-
-if TYPE_CHECKING:
-    from langgraph_checkpoint_relate.proxy import RelateThreadProxy
 
 logger = logging.getLogger(__name__)
 
@@ -59,23 +53,26 @@ def _detect_sequence_cycles(
     while i < n:
         best_match: tuple[int, int, list[str]] | None = None
         max_l = (n - i) // threshold
-        for l in range(1, max_l + 1):
-            pattern = tokens[i : i + l]
+        for length in range(1, max_l + 1):
+            pattern = tokens[i : i + length]
             if not _is_primitive(pattern):
                 continue
 
             k = 1
-            while i + (k + 1) * l <= n and tokens[i + k * l : i + (k + 1) * l] == pattern:
+            while (
+                i + (k + 1) * length <= n
+                and tokens[i + k * length : i + (k + 1) * length] == pattern
+            ):
                 k += 1
 
             if k >= threshold:
-                cycle_nodes = [str(items[idx]["node"]) for idx in range(i, i + l)]
-                if best_match is None or (k * l > best_match[0] * len(best_match[2])):
-                    best_match = (k, l, cycle_nodes)
+                cycle_nodes = [str(items[idx]["node"]) for idx in range(i, i + length)]
+                if best_match is None or (k * length > best_match[0] * len(best_match[2])):
+                    best_match = (k, length, cycle_nodes)
 
         if best_match:
-            k, l, cycle_nodes = best_match
-            end_idx = i + k * l - 1
+            k, length, cycle_nodes = best_match
+            end_idx = i + k * length - 1
             found_cycles.append((i, end_idx, k, cycle_nodes))
             i = end_idx + 1
         else:
@@ -283,10 +280,7 @@ class RelateForensics:
 
         for start_idx, end_idx, k, cycle_nodes in hash_cycles:
             # Avoid duplicate reporting if already covered by node cycles
-            if any(
-                s <= start_idx and end_idx <= e
-                for s, e in covered_ranges
-            ):
+            if any(s <= start_idx and end_idx <= e for s, e in covered_ranges):
                 continue
             reports.append(
                 LoopReport(
@@ -359,7 +353,9 @@ class RelateForensics:
                 "ORDER BY c.step DESC, c.created_at DESC "
                 "LIMIT 1"
             )
-            error_records = self._saver.proxy.execute_read(error_tool_query, {"thread_id": thread_id})
+            error_records = self._saver.proxy.execute_read(
+                error_tool_query, {"thread_id": thread_id}
+            )
 
         # 3. Look for error checkpoint via metadata tags/status
         if not error_records:
@@ -493,7 +489,9 @@ class RelateForensics:
                             pass
                     if is_poison:
                         root_channel_write = str(r["write_id"])
-                        root_tool_call_id = str(r["tool_call_id"]) if r.get("tool_call_id") else None
+                        root_tool_call_id = (
+                            str(r["tool_call_id"]) if r.get("tool_call_id") else None
+                        )
                         causal_path_length = int(r.get("distance_to_error", 0))
                         break
 

@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import logging
 import os
+from typing import Any
 
-import click
 import typer
 from rich.console import Console
 from rich.panel import Panel
@@ -173,7 +173,9 @@ def replay(
 class ForensicsGroup(TyperGroup):
     """Custom TyperGroup routing 'relate-dag forensics <thread_id>' to default diagnose command."""
 
-    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+    # ``ctx`` is typed Any because the Context class differs between Typer releases
+    # (real click or Typer's vendored copy).
+    def parse_args(self, ctx: Any, args: list[str]) -> list[str]:
         if args:
             first_non_option = next((a for a in args if not a.startswith("-")), None)
             if first_non_option and first_non_option not in self.commands:

@@ -126,7 +126,7 @@ class TestCheckpointNode:
             thread_id="th-001",
             step=0,
             checkpoint_blob=byte_list,  # type: ignore[arg-type]
-            metadata_blob=bytearray(b"meta"),
+            metadata_blob=bytearray(b"meta"),  # type: ignore[arg-type]
             state_hash="hash123",
         )
         assert isinstance(node.checkpoint_blob, bytes)
@@ -466,24 +466,48 @@ class TestSchemaDDLAndConstraints:
         initialize_schema(conn)
 
         # 1. Thread constraint
-        conn.execute("CREATE (:Thread {thread_id: $thread_id, created_at: $created_at})", {"thread_id": "t1", "created_at": "2026-11-12T00:00:00Z"})
+        conn.execute(
+            "CREATE (:Thread {thread_id: $thread_id, created_at: $created_at})",
+            {"thread_id": "t1", "created_at": "2026-11-12T00:00:00Z"},
+        )
         with pytest.raises(IntegrityError, match="uniqueness constraint violated"):
-            conn.execute("CREATE (:Thread {thread_id: $thread_id, created_at: $created_at})", {"thread_id": "t1", "created_at": "2026-11-12T01:00:00Z"})
+            conn.execute(
+                "CREATE (:Thread {thread_id: $thread_id, created_at: $created_at})",
+                {"thread_id": "t1", "created_at": "2026-11-12T01:00:00Z"},
+            )
 
         # 2. Checkpoint constraint
-        conn.execute("CREATE (:Checkpoint {checkpoint_id: $checkpoint_id, thread_id: $thread_id})", {"checkpoint_id": "cp1", "thread_id": "t1"})
+        conn.execute(
+            "CREATE (:Checkpoint {checkpoint_id: $checkpoint_id, thread_id: $thread_id})",
+            {"checkpoint_id": "cp1", "thread_id": "t1"},
+        )
         with pytest.raises(IntegrityError, match="uniqueness constraint violated"):
-            conn.execute("CREATE (:Checkpoint {checkpoint_id: $checkpoint_id, thread_id: $thread_id})", {"checkpoint_id": "cp1", "thread_id": "t1"})
+            conn.execute(
+                "CREATE (:Checkpoint {checkpoint_id: $checkpoint_id, thread_id: $thread_id})",
+                {"checkpoint_id": "cp1", "thread_id": "t1"},
+            )
 
         # 3. Write constraint
-        conn.execute("CREATE (:Write {write_id: $write_id, channel: $channel})", {"write_id": "w1", "channel": "c"})
+        conn.execute(
+            "CREATE (:Write {write_id: $write_id, channel: $channel})",
+            {"write_id": "w1", "channel": "c"},
+        )
         with pytest.raises(IntegrityError, match="uniqueness constraint violated"):
-            conn.execute("CREATE (:Write {write_id: $write_id, channel: $channel})", {"write_id": "w1", "channel": "c"})
+            conn.execute(
+                "CREATE (:Write {write_id: $write_id, channel: $channel})",
+                {"write_id": "w1", "channel": "c"},
+            )
 
         # 4. ToolCall constraint
-        conn.execute("CREATE (:ToolCall {call_id: $call_id, tool_name: $tool_name})", {"call_id": "tc1", "tool_name": "calc"})
+        conn.execute(
+            "CREATE (:ToolCall {call_id: $call_id, tool_name: $tool_name})",
+            {"call_id": "tc1", "tool_name": "calc"},
+        )
         with pytest.raises(IntegrityError, match="uniqueness constraint violated"):
-            conn.execute("CREATE (:ToolCall {call_id: $call_id, tool_name: $tool_name})", {"call_id": "tc1", "tool_name": "calc"})
+            conn.execute(
+                "CREATE (:ToolCall {call_id: $call_id, tool_name: $tool_name})",
+                {"call_id": "tc1", "tool_name": "calc"},
+            )
 
     def test_constraint_uniqueness_enforcement_real_relate(self) -> None:
         """Verify real Relate database enforces uniqueness constraints matching schema DDL."""
@@ -583,7 +607,9 @@ class TestFakeRelateDriverFeatures:
         assert InMemoryRelateDriver is FakeRelateDriver
 
         driver = FakeRelateDriver()
-        driver.connect().execute("CREATE CONSTRAINT c1 IF NOT EXISTS FOR (t:Thread) REQUIRE t.thread_id IS UNIQUE")
+        driver.connect().execute(
+            "CREATE CONSTRAINT c1 IF NOT EXISTS FOR (t:Thread) REQUIRE t.thread_id IS UNIQUE"
+        )
         assert len(driver.constraints) == 1
 
         driver.reset()
