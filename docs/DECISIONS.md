@@ -469,6 +469,7 @@ This amends [ADR-0002](#adr-0002-dedicated-actor-proxy-for-thread-affinity-and-s
 - The capture transaction becomes durable with the next flushed write on the same database (normally the next checkpoint or writes save) or when the database is closed. `close()` flushes explicitly before closing the connection, rather than relying on the engine to do so; `abort()` still does not flush.
 - Durability statement: if the process is killed, data committed without a flush was kept in our tests. Whether it survives a power loss or operating system crash before the next flush is not verified. Tool call records are already best effort: a lost capture is handled like the crash between the two transactions described in [Tool call capture ordering](ARCHITECTURE.md#tool-call-capture-ordering).
 - How we check it: a test spy shows the capture batch commits without a flush while checkpoint and writes saves still flush; tool call nodes, outcomes and edges are present after `close()` and reopening the file; and we re-run the same 150-step measurement and publish the new figure as measured.
+- Measured result (2026-11-17, same 150-step tool-heavy run, file database, default flush, two runs): the average of the last 20 saves fell from about 1.53 s to about 0.94 s (total about 97 s to about 59 s), against about 0.8 s with capture disabled. Before ADR-0011 the same run averaged about 1.7 s. These are local measurements and vary from run to run.
 
 ### Alternatives considered
 
