@@ -6,11 +6,12 @@ conforming to LangGraph's BaseCheckpointSaver interface.
 
 from __future__ import annotations
 
+import asyncio
 import builtins
 import logging
 import random
 import uuid
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import AsyncIterator, Iterable, Iterator, Sequence
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -664,6 +665,49 @@ class RelateSaver(BaseCheckpointSaver[str]):
             yielded_count += 1
             if limit is not None and yielded_count >= limit:
                 break
+
+    async def aget_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
+        """Async counterpart of get_tuple; runs it on a worker thread (AC-50, AC-54)."""
+        return await asyncio.to_thread(self.get_tuple, config)
+
+    async def alist(
+        self,
+        config: RunnableConfig | None,
+        *,
+        filter: dict[str, Any] | None = None,
+        before: RunnableConfig | None = None,
+        limit: int | None = None,
+    ) -> AsyncIterator[CheckpointTuple]:
+        """Async counterpart of list.
+
+        The synchronous generator is fully materialized in one worker-thread call,
+        then the tuples are yielded in order (AC-50, AC-54).
+        """
+        tuples = await asyncio.to_thread(
+            lambda: builtins.list(self.list(config, filter=filter, before=before, limit=limit))
+        )
+        for tup in tuples:
+            yield tup
+
+    async def aput(
+        self,
+        config: RunnableConfig,
+        checkpoint: Checkpoint,
+        metadata: CheckpointMetadata,
+        new_versions: ChannelVersions,
+    ) -> RunnableConfig:
+        """Async counterpart of put; runs it on a worker thread (AC-50, AC-54)."""
+        return await asyncio.to_thread(self.put, config, checkpoint, metadata, new_versions)
+
+    async def aput_writes(
+        self,
+        config: RunnableConfig,
+        writes: Sequence[tuple[str, Any]],
+        task_id: str,
+        task_path: str = "",
+    ) -> None:
+        """Async counterpart of put_writes; runs it on a worker thread (AC-50, AC-54)."""
+        await asyncio.to_thread(self.put_writes, config, writes, task_id, task_path)
 
     def fork_in_memory(
         self,
