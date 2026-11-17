@@ -7,6 +7,9 @@ Validates (ADR-0005):
 - Malformed entries are skipped and capture failures never affect the save (AC-47).
 - Re-saving the same call never duplicates the node or the INVOKED edge (AC-48).
 - A result with no recorded call creates nothing (AC-49).
+
+Also validates ADR-0011: a saver sends only tool call statements it has not already committed,
+issues no capture transaction when nothing is new, and retries after a failed capture.
 """
 
 from __future__ import annotations
@@ -334,3 +337,159 @@ def test_tool_call_and_result_in_one_put_land_together(saver: RelateSaver) -> No
     node = _tool_nodes(saver)[cid]
     assert saver.serde.loads(bytes(node["result_blob"])) == "done"
     assert _edges(saver) == [("chk-42b", cid)]
+
+
+def _count_batches(saver: RelateSaver, monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Wrap execute_batch and return a list that records the size of every submitted batch."""
+    original = saver.proxy.execute_batch
+    sizes: list[int] = []
+
+    def counting(statements: list[tuple[str, dict[str, Any]]], timeout: float | None = None) -> Any:
+        sizes.append(len(statements))
+        return original(statements, timeout)
+
+    monkeypatch.setattr(saver.proxy, "execute_batch", counting)
+    return sizes
+
+
+def test_applied_save_with_nothing_new_makes_only_the_checkpoint_submission(
+    saver: RelateSaver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR-0011: a put() whose calls and results are all committed issues no capture batch."""
+    cid = _call_id()
+    history: list[Any] = [_ai((cid, "search", {})), ToolMessage(content="r", tool_call_id=cid)]
+    _put(saver, "t11a", "chk-11a", {"messages": list(history)})
+    submissions: list[str] = []
+    original_write = saver.proxy.execute_write
+    original_batch = saver.proxy.execute_batch
+
+    def write(*args: Any, **kwargs: Any) -> Any:
+        submissions.append("write")
+        return original_write(*args, **kwargs)
+
+    def batch(*args: Any, **kwargs: Any) -> Any:
+        submissions.append("batch")
+        return original_batch(*args, **kwargs)
+
+    monkeypatch.setattr(saver.proxy, "execute_write", write)
+    monkeypatch.setattr(saver.proxy, "execute_batch", batch)
+
+    _put(saver, "t11a", "chk-11b", {"messages": list(history)}, step=1)
+
+    assert submissions == ["write"]
+    assert list(_tool_nodes(saver)) == [cid]
+
+
+def test_applied_only_new_statements_are_sent(
+    saver: RelateSaver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR-0011: a growing history sends each call once and each result once."""
+    first, second = _call_id(), _call_id()
+    ai1, ai2 = _ai((first, "t", {})), _ai((second, "t", {}))
+    tm1 = ToolMessage(content="r1", tool_call_id=first)
+    sizes = _count_batches(saver, monkeypatch)
+
+    _put(saver, "t11b", "chk-1", {"messages": [ai1]})
+    _put(saver, "t11b", "chk-2", {"messages": [ai1, tm1]}, step=1)
+    _put(saver, "t11b", "chk-3", {"messages": [ai1, tm1, ai2]}, step=2)
+    _put(saver, "t11b", "chk-4", {"messages": [ai1, tm1, ai2]}, step=3)
+
+    assert sizes == [1, 1, 1]
+    assert _edges(saver) == sorted([("chk-1", first), ("chk-3", second)])
+    assert saver.serde.loads(bytes(_tool_nodes(saver)[first]["result_blob"])) == "r1"
+
+
+def test_applied_failed_capture_is_retried_by_next_save(
+    saver: RelateSaver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR-0011: a capture failure marks nothing, so the next save sends the same call again."""
+    cid = _call_id()
+    message = _ai((cid, "t", {}))
+    original = saver.proxy.execute_batch
+    attempts: list[int] = []
+
+    def flaky(statements: list[tuple[str, dict[str, Any]]], timeout: float | None = None) -> Any:
+        attempts.append(len(statements))
+        if len(attempts) == 1:
+            raise RuntimeError("capture exploded")
+        return original(statements, timeout)
+
+    monkeypatch.setattr(saver.proxy, "execute_batch", flaky)
+
+    _put(saver, "t11c", "chk-c1", {"messages": [message]})
+    assert _tool_nodes(saver) == {}
+    _put(saver, "t11c", "chk-c2", {"messages": [message]}, step=1)
+
+    assert attempts == [1, 1]
+    assert list(_tool_nodes(saver)) == [cid]
+    assert _edges(saver) == [("chk-c2", cid)]
+
+
+def test_applied_outcome_before_invocation_is_resent_until_confirmed(
+    saver: RelateSaver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR-0011: a result seen before its call is sent again until the call is committed."""
+    cid = _call_id()
+    result = ToolMessage(content="late", tool_call_id=cid)
+    _put(saver, "t11d", "chk-d1", {})
+    sizes = _count_batches(saver, monkeypatch)
+
+    saver.put_writes(_config("t11d", "chk-d1"), [("messages", [result])], "task-1")
+    saver.put_writes(_config("t11d", "chk-d1"), [("messages", [result])], "task-1")
+    _put(saver, "t11d", "chk-d2", {"messages": [_ai((cid, "t", {})), result]}, step=1)
+    _put(saver, "t11d", "chk-d3", {"messages": [_ai((cid, "t", {})), result]}, step=2)
+
+    # put_writes: write batch + unconfirmed outcome batch, twice; put d2: call + result; d3: nothing.
+    assert sizes == [1, 1, 1, 1, 2]
+    assert saver.serde.loads(bytes(_tool_nodes(saver)[cid]["result_blob"])) == "late"
+    assert _edges(saver) == [("chk-d2", cid)]
+
+
+def test_applied_put_writes_and_put_share_the_record(
+    saver: RelateSaver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR-0011: a call recorded by put_writes() is not resent by a later put()."""
+    cid = _call_id()
+    message = _ai((cid, "t", {}))
+    _put(saver, "t11e", "chk-e1", {})
+    saver.put_writes(_config("t11e", "chk-e1"), [("messages", [message])], "task-1")
+    sizes = _count_batches(saver, monkeypatch)
+
+    _put(saver, "t11e", "chk-e2", {"messages": [message]}, step=1)
+
+    assert sizes == []
+    assert _edges(saver) == [("chk-e1", cid)]
+
+
+def test_applied_new_saver_starts_empty_and_resends_idempotently() -> None:
+    """ADR-0011: a second saver on the same proxy re-sends once and leaves the graph unchanged."""
+    first = RelateSaver(db_path=":memory:")
+    try:
+        second = RelateSaver(proxy=first.proxy)
+        cid = _call_id()
+        message = _ai((cid, "t", {}))
+        _put(first, "t11f", "chk-f1", {"messages": [message]})
+        assert len(second._applied_tool_calls) == 0
+
+        _put(second, "t11f", "chk-f2", {"messages": [message]}, step=1)
+
+        assert len(first._applied_tool_calls) == 1
+        assert len(second._applied_tool_calls) == 1
+        assert list(_tool_nodes(first)) == [cid]
+        assert _edges(first) == [("chk-f1", cid)]
+    finally:
+        first.close()
+
+
+def test_applied_fork_starts_with_an_empty_record(saver: RelateSaver) -> None:
+    """ADR-0011: the saver returned by fork_in_memory does not share the source's record."""
+    cid = _call_id()
+    _put(saver, "t11g", "chk-g1", {"messages": [_ai((cid, "t", {}))]})
+    assert len(saver._applied_tool_calls) == 1
+
+    forked = saver.fork_in_memory("t11g", "chk-g1")
+    try:
+        assert forked._applied_tool_calls is not saver._applied_tool_calls
+        assert len(forked._applied_tool_calls) == 0
+    finally:
+        forked.close()

@@ -1,13 +1,15 @@
-"""Tool call extraction and Cypher statement building (ADR-0005).
+"""Tool call extraction, statement building and the applied-call record (ADR-0005, ADR-0011).
 
-Pure functions with no database access. ``extract_tool_events`` finds tool calls made by
-the model and tool results in values written to a checkpointer; ``build_tool_call_statements``
-turns them into idempotent ``:ToolCall`` Cypher statements for the caller to execute.
+No database access. ``extract_tool_events`` finds tool calls made by the model and tool results
+in values written to a checkpointer; ``build_tool_call_statements`` turns them into idempotent
+``:ToolCall`` Cypher statements for the caller to execute; ``AppliedToolCalls`` remembers which
+statements a saver has already committed so only new ones are sent.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -227,3 +229,63 @@ def build_tool_call_statements(
         except Exception as exc:
             logger.warning("Skipping tool call outcome (%s)", type(exc).__name__)
     return statements
+
+
+@dataclass(frozen=True)
+class CapturePlan:
+    """The tool call statements still to send for one save."""
+
+    events: ToolEvents
+    """Only the invocations and outcomes not yet applied."""
+
+    confirmable_outcomes: frozenset[str]
+    """``call_id`` values whose outcome may be marked applied after the commit."""
+
+
+class AppliedToolCalls:
+    """Per-saver record of tool call statements already committed. Thread-safe.
+
+    Keyed by ``(thread_id, call_id)``. ``invoked`` holds keys whose invocation statement has
+    committed, ``resolved`` holds keys whose outcome statement has committed. The record is
+    never pruned; a forgotten or unknown entry only causes one idempotent resend (ADR-0011).
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._invoked: set[tuple[str, str]] = set()
+        self._resolved: set[tuple[str, str]] = set()
+
+    def plan(self, events: ToolEvents, *, thread_id: str) -> CapturePlan:
+        """Keep only events not yet applied. Never modifies the record.
+
+        An outcome is confirmable only if its invocation was already recorded or is among the
+        kept invocations of this plan; the outcome statement matches an existing node, so it
+        would change nothing otherwise.
+        """
+        with self._lock:
+            invocations = tuple(
+                inv for inv in events.invocations if (thread_id, inv.call_id) not in self._invoked
+            )
+            outcomes = tuple(
+                out for out in events.outcomes if (thread_id, out.call_id) not in self._resolved
+            )
+            planned_ids = {inv.call_id for inv in invocations}
+            confirmable = frozenset(
+                out.call_id
+                for out in outcomes
+                if (thread_id, out.call_id) in self._invoked or out.call_id in planned_ids
+            )
+        return CapturePlan(ToolEvents(invocations, outcomes), confirmable)
+
+    def mark_applied(self, plan: CapturePlan, *, thread_id: str) -> None:
+        """Record a plan as committed. Call only after its transaction has committed."""
+        with self._lock:
+            for inv in plan.events.invocations:
+                self._invoked.add((thread_id, inv.call_id))
+            for call_id in plan.confirmable_outcomes:
+                self._resolved.add((thread_id, call_id))
+
+    def __len__(self) -> int:
+        """Number of distinct ``(thread_id, call_id)`` keys held."""
+        with self._lock:
+            return len(self._invoked | self._resolved)

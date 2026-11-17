@@ -35,6 +35,7 @@ from langgraph_checkpoint_relate.errors import RelateCheckpointError
 from langgraph_checkpoint_relate.proxy import RelateThreadProxy
 from langgraph_checkpoint_relate.serde import RelateStateSerializer, default_serializer
 from langgraph_checkpoint_relate.tool_calls import (
+    AppliedToolCalls,
     build_tool_call_statements,
     extract_tool_events,
 )
@@ -89,6 +90,7 @@ class RelateSaver(BaseCheckpointSaver[str]):
         """
         self.serde: RelateStateSerializer | Any = serde or default_serializer
         super().__init__(serde=self.serde)
+        self._applied_tool_calls = AppliedToolCalls()
 
         if isinstance(db_path, RelateThreadProxy):
             self.proxy = db_path
@@ -363,16 +365,21 @@ class RelateSaver(BaseCheckpointSaver[str]):
         thread_id: str,
         checkpoint_id: str,
     ) -> None:
-        """Record tool calls found in saved values as :ToolCall nodes (best effort).
+        """Record new tool calls found in saved values as :ToolCall nodes (best effort).
 
         Runs as its own transaction after the checkpoint or writes have committed, so a
-        failure here is logged and ignored and never affects the save (AC-47). Only the
-        checkpoint id and the exception class name are logged, never call content.
+        failure here is logged and ignored and never affects the save (AC-47). Only events
+        this saver has not already committed are serialized and sent; when none are new, no
+        transaction is issued (ADR-0011). Only the checkpoint id and the exception class
+        name are logged, never call content.
         """
         try:
             events = extract_tool_events(values)
+            plan = self._applied_tool_calls.plan(events, thread_id=thread_id)
+            if not plan.events.invocations and not plan.events.outcomes:
+                return
             statements = build_tool_call_statements(
-                events,
+                plan.events,
                 thread_id=thread_id,
                 checkpoint_id=checkpoint_id,
                 serde=self.serde,
@@ -380,6 +387,7 @@ class RelateSaver(BaseCheckpointSaver[str]):
             )
             if statements:
                 self.proxy.execute_batch(statements)
+            self._applied_tool_calls.mark_applied(plan, thread_id=thread_id)
         except Exception as exc:
             logger.warning(
                 "Tool call capture failed for checkpoint %s: %s",

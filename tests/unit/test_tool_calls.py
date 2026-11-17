@@ -1,7 +1,11 @@
-"""Unit tests for tool call extraction and statement building (AC-46..AC-49, ADR-0005)."""
+"""Unit tests for tool call extraction, statement building and the applied-call record.
+
+Covers AC-46..AC-49 (ADR-0005) and the applied-call record (ADR-0011).
+"""
 
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 import pytest
@@ -15,6 +19,7 @@ from langchain_core.messages import (
 from langgraph_checkpoint_relate.serde import default_serializer
 from langgraph_checkpoint_relate.tool_calls import (
     EMPTY_ERROR_TEXT,
+    AppliedToolCalls,
     ToolEvents,
     ToolInvocation,
     ToolOutcome,
@@ -336,3 +341,136 @@ def test_real_serializer_blobs_roundtrip() -> None:
     inv, out = _build(events, default_serializer)
     assert default_serializer.loads(inv[1]["args_blob"]) == {"q": "x"}
     assert default_serializer.loads(out[1]["result_blob"]) == "result"
+
+
+def _events(invocation_ids: tuple[str, ...] = (), outcome_ids: tuple[str, ...] = ()) -> ToolEvents:
+    return ToolEvents(
+        tuple(ToolInvocation(cid, "t", {}) for cid in invocation_ids),
+        tuple(ToolOutcome(cid, False, "ok") for cid in outcome_ids),
+    )
+
+
+def _ids(events: ToolEvents) -> tuple[list[str], list[str]]:
+    return (
+        [inv.call_id for inv in events.invocations],
+        [out.call_id for out in events.outcomes],
+    )
+
+
+def test_applied_record_starts_empty_and_plan_keeps_everything_new() -> None:
+    """ADR-0011: a fresh record keeps all events in input order and does not modify itself."""
+    record = AppliedToolCalls()
+
+    plan = record.plan(_events(("a", "b"), ("a",)), thread_id="t1")
+
+    assert _ids(plan.events) == (["a", "b"], ["a"])
+    assert plan.confirmable_outcomes == frozenset({"a"})
+    assert len(record) == 0
+
+
+def test_applied_record_marked_invocations_and_outcomes_are_dropped() -> None:
+    """ADR-0011: after mark_applied, the same events yield an empty plan."""
+    record = AppliedToolCalls()
+    events = _events(("a",), ("a",))
+    record.mark_applied(record.plan(events, thread_id="t1"), thread_id="t1")
+
+    plan = record.plan(events, thread_id="t1")
+
+    assert _ids(plan.events) == ([], [])
+    assert plan.confirmable_outcomes == frozenset()
+    assert len(record) == 1
+
+
+def test_applied_record_outcome_without_recorded_invocation_is_not_confirmable() -> None:
+    """ADR-0011: an outcome racing ahead of its invocation is sent but never marked."""
+    record = AppliedToolCalls()
+    events = _events((), ("orphan",))
+
+    plan = record.plan(events, thread_id="t1")
+    record.mark_applied(plan, thread_id="t1")
+
+    assert _ids(plan.events) == ([], ["orphan"])
+    assert plan.confirmable_outcomes == frozenset()
+    assert len(record) == 0
+    assert _ids(record.plan(events, thread_id="t1").events) == ([], ["orphan"])
+
+
+def test_applied_record_outcome_confirmable_when_invocation_already_recorded() -> None:
+    """ADR-0011: a later outcome for an already-recorded call is confirmable and then dropped."""
+    record = AppliedToolCalls()
+    record.mark_applied(record.plan(_events(("a",)), thread_id="t1"), thread_id="t1")
+
+    plan = record.plan(_events(("a",), ("a",)), thread_id="t1")
+
+    assert _ids(plan.events) == ([], ["a"])
+    assert plan.confirmable_outcomes == frozenset({"a"})
+    record.mark_applied(plan, thread_id="t1")
+    assert _ids(record.plan(_events(("a",), ("a",)), thread_id="t1").events) == ([], [])
+
+
+def test_applied_record_unconfirmed_outcome_is_resent_with_its_invocation() -> None:
+    """ADR-0011: an unconfirmed outcome stays pending and becomes confirmable with its call."""
+    record = AppliedToolCalls()
+    record.mark_applied(record.plan(_events((), ("a",)), thread_id="t1"), thread_id="t1")
+
+    plan = record.plan(_events(("a",), ("a",)), thread_id="t1")
+
+    assert _ids(plan.events) == (["a"], ["a"])
+    assert plan.confirmable_outcomes == frozenset({"a"})
+
+
+def test_applied_record_plan_does_not_mark() -> None:
+    """ADR-0011: planning twice without mark_applied returns the same plan."""
+    record = AppliedToolCalls()
+    events = _events(("a",), ("a",))
+
+    first = record.plan(events, thread_id="t1")
+    second = record.plan(events, thread_id="t1")
+
+    assert first == second
+    assert len(record) == 0
+
+
+def test_applied_record_is_keyed_by_thread() -> None:
+    """ADR-0011: the same call id in another thread is still new (the edge is per thread)."""
+    record = AppliedToolCalls()
+    record.mark_applied(record.plan(_events(("a",), ("a",)), thread_id="t1"), thread_id="t1")
+
+    plan = record.plan(_events(("a",), ("a",)), thread_id="t2")
+
+    assert _ids(plan.events) == (["a"], ["a"])
+    record.mark_applied(plan, thread_id="t2")
+    assert len(record) == 2
+
+
+def test_applied_record_len_counts_distinct_keys_once() -> None:
+    """ADR-0011: a call whose invocation and outcome are both marked counts as one key."""
+    record = AppliedToolCalls()
+    record.mark_applied(record.plan(_events(("a", "b"), ("a",)), thread_id="t1"), thread_id="t1")
+
+    assert len(record) == 2
+
+
+def test_applied_record_concurrent_marking_is_consistent() -> None:
+    """ADR-0011: concurrent plan and mark calls from many threads lose no entries."""
+    record = AppliedToolCalls()
+    ids = tuple(f"c{i}" for i in range(50))
+    errors: list[BaseException] = []
+
+    def worker(offset: int) -> None:
+        try:
+            for i in range(offset, offset + 50):
+                events = _events((ids[i % 50],), (ids[i % 50],))
+                record.mark_applied(record.plan(events, thread_id="t1"), thread_id="t1")
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(n,)) for n in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert len(record) == 50
+    assert _ids(record.plan(_events(ids, ids), thread_id="t1").events) == ([], [])
