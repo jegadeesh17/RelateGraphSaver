@@ -227,3 +227,30 @@ def test_src_imports_are_declared_dependencies_ac_34() -> None:
         assert _normalize_name(distribution) in declared, (
             f"Module {module!r} imported in {path} needs {distribution!r} in [project].dependencies"
         )
+
+
+def _dev_extra_names(data: dict[str, Any]) -> set[str]:
+    dev = data.get("project", {}).get("optional-dependencies", {}).get("dev", [])
+    return {_requirement_name(requirement) for requirement in dev}
+
+
+def test_sqlite_checkpointer_is_dev_only_ac_57() -> None:
+    """AC-57: langgraph-checkpoint-sqlite is in the dev extra and not a runtime dependency."""
+    with open(_REPO_ROOT / "pyproject.toml", "rb") as f:
+        data = tomllib.load(f)
+
+    assert "langgraph-checkpoint-sqlite" in _dev_extra_names(data)
+    assert "langgraph-checkpoint-sqlite" not in _runtime_dependency_names(data)
+
+
+def test_sqlite_dev_only_check_rejects_runtime_declaration_ac_57() -> None:
+    """AC-57: the check tells a runtime declaration apart from a dev-extra one."""
+    config: dict[str, Any] = {
+        "project": {
+            "dependencies": ["langgraph-checkpoint-sqlite>=2.0.0"],
+            "optional-dependencies": {"dev": ["pytest>=8.3.0"]},
+        }
+    }
+
+    assert "langgraph-checkpoint-sqlite" in _runtime_dependency_names(config)
+    assert "langgraph-checkpoint-sqlite" not in _dev_extra_names(config)
