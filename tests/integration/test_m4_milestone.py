@@ -321,11 +321,14 @@ class TestForkOfToolRun:
                 assert source_latest.config["configurable"]["checkpoint_id"] == target_id
                 assert _count_tool_nodes(source) == 1
 
-                # Current behavior: fork_in_memory clones Thread, Checkpoint and Write nodes
-                # but not ToolCall nodes, so forensics on the sandbox cannot name the failing
-                # tool. Update these assertions if the clone starts including ToolCall nodes.
-                assert _count_tool_nodes(fork) == 0
-                assert fork.trace_root_cause(thread_id).root_tool_name is None
+                # ADR-0010: the fork copies the ToolCall node (and its outcome, because the
+                # fork point is the latest checkpoint), so forensics names the same failing tool.
+                assert _count_tool_nodes(fork) == 1
+                source_report = source.trace_root_cause(thread_id)
+                fork_report = fork.trace_root_cause(thread_id)
+                assert source_report.root_tool_name == TOOL_NAME
+                assert fork_report.root_tool_name == source_report.root_tool_name
+                assert fork_report.root_tool_call_id == source_report.root_tool_call_id
             finally:
                 fork.close()
 

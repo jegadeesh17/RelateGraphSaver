@@ -10,6 +10,7 @@ from langgraph_checkpoint_relate.errors import (
     RelateCheckpointError,
 )
 from langgraph_checkpoint_relate.saver import _extract_bytes, _utc_now_iso
+from langgraph_checkpoint_relate.tool_calls import extract_tool_events
 
 if TYPE_CHECKING:
     from langgraph_checkpoint_relate.saver import RelateSaver
@@ -38,8 +39,9 @@ class TimeTravelEngine:
         """Clone history up to checkpoint_id into an isolated :memory: database.
 
         Implements AC-19 by extracting the ancestor lineage of the target checkpoint
-        and populating a fresh in-memory database with cloned Thread, Checkpoint, and
-        Write nodes and relationships.
+        and populating a fresh in-memory database with cloned Thread, Checkpoint, Write and
+        ToolCall nodes and relationships (ADR-0010). A copied ToolCall keeps its outcome only
+        when the tool's result message is already in the fork-point checkpoint's channel values.
 
         Args:
             source_saver: Active RelateSaver holding the durable execution graph.
@@ -52,7 +54,8 @@ class TimeTravelEngine:
 
         Raises:
             CheckpointNotFoundError: If checkpoint_id does not exist for thread_id.
-            RelateCheckpointError: If database read or clone operations fail.
+            RelateCheckpointError: If the tool call read fails or the fork-point checkpoint
+                cannot be deserialized.
         """
         # Validate target checkpoint existence and fetch candidates ordered by step ASC
         candidates_query = (
@@ -144,6 +147,38 @@ class TimeTravelEngine:
             writes_records = source_saver.proxy.execute_read(writes_query, {"ids": ancestor_ids})
         except RelateCheckpointError:
             writes_records = []
+
+        # Query tool calls invoked from lineage checkpoints. A failure propagates: a fork
+        # without its tool calls would make forensics on it differ silently from the source.
+        tool_calls_query = (
+            "MATCH (c:Checkpoint)-[:INVOKED]->(tc:ToolCall) WHERE c.checkpoint_id IN $ids "
+            "RETURN c.checkpoint_id AS checkpoint_id, tc.call_id AS call_id, "
+            "       tc.tool_name AS tool_name, tc.args_blob AS args_blob, "
+            "       tc.result_blob AS result_blob, tc.error AS error, "
+            "       tc.created_at AS created_at"
+        )
+        tool_call_records = source_saver.proxy.execute_read(tool_calls_query, {"ids": ancestor_ids})
+
+        # Outcomes count only if the tool's result message is already in the fork point's
+        # channel values (ADR-0010).
+        fork_point = lineage_map[checkpoint_id]
+        try:
+            fork_checkpoint = source_saver.serde.loads(
+                _extract_bytes(fork_point["checkpoint_blob"])
+            )
+        except Exception as exc:
+            raise RelateCheckpointError(
+                f"Cannot deserialize fork-point checkpoint '{checkpoint_id}' "
+                f"of thread '{thread_id}': {exc}"
+            ) from exc
+        channel_values = (
+            fork_checkpoint.get("channel_values") if isinstance(fork_checkpoint, dict) else None
+        )
+        fork_point_outcome_ids: set[str] = (
+            {o.call_id for o in extract_tool_events(channel_values.values()).outcomes}
+            if isinstance(channel_values, dict)
+            else set()
+        )
 
         # Query existing relationships between ancestor checkpoints
         edges_query = (
@@ -287,6 +322,36 @@ class TimeTravelEngine:
                 "MERGE (c)-[:HAS_WRITE]->(w)"
             )
             statements.append((w_stmt, w_params))
+
+        # Recreate ToolCall nodes (one per distinct call_id) and [:INVOKED] edges from
+        # lineage checkpoints. Property names come from fixed lists, never from data.
+        seen_call_ids: set[str] = set()
+        for row in tool_call_records:
+            call_id = str(row["call_id"])
+            if call_id in seen_call_ids:
+                continue
+            seen_call_ids.add(call_id)
+            props = ["tool_name", "args_blob", "created_at"]
+            if call_id in fork_point_outcome_ids:
+                props += ["result_blob", "error"]
+            tc_params: dict[str, Any] = {"call_id": call_id}
+            for prop in props:
+                value = row.get(prop)
+                if value is None:
+                    continue
+                tc_params[prop] = _extract_bytes(value) if prop.endswith("_blob") else value
+            assignments = [f"tc.{prop} = ${prop}" for prop in tc_params if prop != "call_id"]
+            set_clause = f" SET {', '.join(assignments)}" if assignments else ""
+            statements.append(("MERGE (tc:ToolCall {call_id: $call_id})" + set_clause, tc_params))
+
+        for row in tool_call_records:
+            statements.append(
+                (
+                    "MATCH (c:Checkpoint {checkpoint_id: $checkpoint_id}), "
+                    "(tc:ToolCall {call_id: $call_id}) MERGE (c)-[:INVOKED]->(tc)",
+                    {"checkpoint_id": str(row["checkpoint_id"]), "call_id": str(row["call_id"])},
+                )
+            )
 
         # Link target checkpoint to branch_thread_id via [:FORKED_TO] if specified
         if branch_thread_id:
