@@ -493,3 +493,43 @@ def test_applied_fork_starts_with_an_empty_record(saver: RelateSaver) -> None:
         assert len(forked._applied_tool_calls) == 0
     finally:
         forked.close()
+
+
+def test_ac42_call_saved_before_its_checkpoint_is_linked_by_a_later_put(
+    saver: RelateSaver, caplog: pytest.LogCaptureFixture
+) -> None:
+    """AC-42, ADR-0011: writes that commit before their checkpoint do not lose the INVOKED edge.
+
+    Concurrent async runs save a checkpoint and the writes of the task that follows it on
+    different threads, so the writes can commit first. The call must not be recorded as applied
+    while it has no edge, or no later save would ever attach it.
+    """
+    cid = _call_id()
+    message = _ai((cid, "t", {}))
+
+    with caplog.at_level(logging.WARNING, logger="langgraph_checkpoint_relate"):
+        saver.put_writes(_config("t42b", "chk-b1"), [("messages", [message])], "task-1")
+        assert _edges(saver) == []
+        assert len(saver._applied_tool_calls) == 0
+
+        _put(saver, "t42b", "chk-b1", {})
+        _put(saver, "t42b", "chk-b2", {"messages": [message]}, step=1)
+
+    assert list(_tool_nodes(saver)) == [cid]
+    assert _edges(saver) == [("chk-b2", cid)]
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_ac42_call_saved_before_its_checkpoint_is_attached_by_a_resend_to_that_checkpoint(
+    saver: RelateSaver,
+) -> None:
+    """AC-42: resending a detached call after its checkpoint exists attaches it there."""
+    cid = _call_id()
+    message = _ai((cid, "t", {}))
+    saver.put_writes(_config("t42c", "chk-c1"), [("messages", [message])], "task-1")
+    _put(saver, "t42c", "chk-c1", {})
+
+    saver.put_writes(_config("t42c", "chk-c1"), [("messages", [message])], "task-1")
+
+    assert _edges(saver) == [("chk-c1", cid)]
+    assert len(saver._applied_tool_calls) == 1

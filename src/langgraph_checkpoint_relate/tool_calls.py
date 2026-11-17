@@ -29,7 +29,8 @@ _INVOCATION_CYPHER = (
     "OPTIONAL MATCH (linked:Checkpoint {thread_id: $thread_id})-[:INVOKED]->(tc)\n"
     "WITH tc, c, count(linked) AS linked_count\n"
     "FOREACH (_ IN CASE WHEN c IS NOT NULL AND linked_count = 0 THEN [1] ELSE [] END |\n"
-    "  MERGE (c)-[:INVOKED]->(tc))"
+    "  MERGE (c)-[:INVOKED]->(tc))\n"
+    "RETURN tc.call_id AS call_id, (c IS NOT NULL OR linked_count > 0) AS attached"
 )
 
 _SUCCESS_OUTCOME_CYPHER = (
@@ -158,6 +159,28 @@ def extract_tool_events(values: Iterable[Any]) -> ToolEvents:
     return ToolEvents(tuple(invocations.values()), tuple(outcomes.values()))
 
 
+def detached_call_ids(results: Any) -> frozenset[str]:
+    """Return the ``call_id`` of each invocation whose statement left no ``[:INVOKED]`` edge.
+
+    ``results`` is what the proxy returned for the statements of one capture transaction. It
+    happens when the checkpoint named in the statement is not in the file yet, for example
+    because another thread is still committing it. Rows that are not invocation results are
+    ignored.
+    """
+    detached: set[str] = set()
+    if not isinstance(results, (list, tuple)):
+        return frozenset()
+    for rows in results:
+        if not isinstance(rows, (list, tuple)):
+            continue
+        for row in rows:
+            if isinstance(row, dict) and row.get("attached") is False:
+                call_id = row.get("call_id")
+                if isinstance(call_id, str):
+                    detached.add(call_id)
+    return frozenset(detached)
+
+
 def _error_text(content: Any) -> str:
     """Render tool error content as text; never empty."""
     if isinstance(content, str):
@@ -277,11 +300,23 @@ class AppliedToolCalls:
             )
         return CapturePlan(ToolEvents(invocations, outcomes), confirmable)
 
-    def mark_applied(self, plan: CapturePlan, *, thread_id: str) -> None:
-        """Record a plan as committed. Call only after its transaction has committed."""
+    def mark_applied(
+        self,
+        plan: CapturePlan,
+        *,
+        thread_id: str,
+        detached: frozenset[str] = frozenset(),
+    ) -> None:
+        """Record a plan as committed. Call only after its transaction has committed.
+
+        ``detached`` lists invocations that committed without an ``[:INVOKED]`` edge because
+        their checkpoint was not in the file yet. They are not recorded, so the next save that
+        carries the same call sends the statement again and attaches the edge.
+        """
         with self._lock:
             for inv in plan.events.invocations:
-                self._invoked.add((thread_id, inv.call_id))
+                if inv.call_id not in detached:
+                    self._invoked.add((thread_id, inv.call_id))
             for call_id in plan.confirmable_outcomes:
                 self._resolved.add((thread_id, call_id))
 

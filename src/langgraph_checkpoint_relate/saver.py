@@ -37,6 +37,7 @@ from langgraph_checkpoint_relate.serde import RelateStateSerializer, default_ser
 from langgraph_checkpoint_relate.tool_calls import (
     AppliedToolCalls,
     build_tool_call_statements,
+    detached_call_ids,
     extract_tool_events,
 )
 
@@ -385,9 +386,10 @@ class RelateSaver(BaseCheckpointSaver[str]):
                 serde=self.serde,
                 created_at=_utc_now_iso(),
             )
+            detached: frozenset[str] = frozenset()
             if statements:
-                self.proxy.execute_batch(statements)
-            self._applied_tool_calls.mark_applied(plan, thread_id=thread_id)
+                detached = detached_call_ids(self.proxy.execute_batch(statements))
+            self._applied_tool_calls.mark_applied(plan, thread_id=thread_id, detached=detached)
         except Exception as exc:
             logger.warning(
                 "Tool call capture failed for checkpoint %s: %s",
