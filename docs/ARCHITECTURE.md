@@ -7,15 +7,9 @@ Reference documents: [specification](SPEC.md), [decisions](DECISIONS.md), [overv
 Date: 2026-11-18  
 Status: FROZEN
 
-Change note (2026-11-18): inspection commands open the store read-only ([ADR-0015](DECISIONS.md#adr-0015-read-only-opening-for-inspection-commands)). Amended sections: [`RelateSaver` Interface](#1-relatesaver-interface) (new [Read-only mode](#read-only-mode)), [`fork_in_memory` contract](#fork_in_memory-contract) guarantees, [`RelateThreadProxy` Actor Protocol](#2-relatethreadproxy-actor-protocol), [CLI Command Interface](#4-cli-command-interface-relate-dag), [Expensive to change](#expensive-to-change).
-
----
-
 ## Overview
 
-RelateGraphSaver provides an embedded, graph-native checkpoint saver for LangGraph powered by the embedded Relate database engine from Neo4j. It eliminates the need for external database servers (e.g., PostgreSQL or Neo4j server daemons) by persisting agent execution state into a single local file (`.rl`) backed by Write-Ahead Logging (WAL). Workflows, branching paths, tool executions, and pending writes are mapped directly to a directed property graph. A dedicated actor queue (`RelateThreadProxy`) handles thread affinity and guarantees serialized write access across concurrent worker threads, while `TimeTravelEngine` enables zero-cleanup in-memory branching replays, and `DAGVisualizer` provides terminal-native Cypher diagnostics. Tool calls made by the model during a real run are captured from the persisted LangChain messages into `:ToolCall` nodes, so root-cause analysis works on data the run itself produced ([ADR-0005](DECISIONS.md#adr-0005-capture-tool-calls-from-persisted-langchain-messages)). Async graph execution (`ainvoke`, `astream`) is supported by running the synchronous methods off the event loop ([ADR-0006](DECISIONS.md#adr-0006-async-checkpointer-methods-delegate-to-the-synchronous-methods-on-worker-threads)). Architectural rationale and alternatives are documented in [decisions](DECISIONS.md).
-
----
+RelateGraphSaver provides an embedded, graph-native checkpoint saver for LangGraph powered by the embedded Relate database engine from Neo4j. It needs no external database server (PostgreSQL or a Neo4j server daemon): execution state is persisted into a single local `.rl` file backed by Write-Ahead Logging (WAL). Workflows, branching paths, tool executions, and pending writes map directly to a directed property graph. A dedicated actor queue (`RelateThreadProxy`) handles thread affinity and serializes write access across concurrent worker threads, `TimeTravelEngine` enables zero-cleanup in-memory branching replays, and `DAGVisualizer` provides terminal-native Cypher diagnostics. Tool calls made by the model during a real run are captured from the persisted LangChain messages into `:ToolCall` nodes, so root-cause analysis works on data the run itself produced ([ADR-0005](DECISIONS.md#adr-0005-capture-tool-calls-from-persisted-langchain-messages)). Async graph execution (`ainvoke`, `astream`) runs the synchronous methods off the event loop ([ADR-0006](DECISIONS.md#adr-0006-async-checkpointer-methods-delegate-to-the-synchronous-methods-on-worker-threads)). Inspection commands open the store read-only ([ADR-0015](DECISIONS.md#adr-0015-read-only-opening-for-inspection-commands)). Rationale and alternatives are in [decisions](DECISIONS.md).
 
 ## Technology stack
 
@@ -28,8 +22,6 @@ RelateGraphSaver provides an embedded, graph-native checkpoint saver for LangGra
 - **Type Checking & Linting:** `mypy >= 1.11.0`, `ruff >= 0.6.0`
 - **Testing Runner:** `pytest >= 8.3.0`, `pytest-mock >= 3.14.0`. Async tests call `asyncio.run(...)` inside ordinary test functions; no pytest async plugin is added.
 - **Benchmark (dev only):** `langgraph-checkpoint-sqlite >= 2.0.0` in the `dev` extra, never in `[project].dependencies` ([ADR-0008](DECISIONS.md#adr-0008-standalone-benchmark-script-against-sqlitesaver))
-
----
 
 ## Test commands
 
@@ -61,8 +53,6 @@ python benchmarks/bench_checkpointers.py --checkpoints 1000
 The benchmark is not collected by pytest (`testpaths = ["tests"]`, and the file is not named `test_*`). See [Benchmark](#benchmark).
 
 *Note on test performance:* Tests that run full multi-agent simulation loops, process termination crash simulations, fresh-environment installs, or large graph workloads are marked `@pytest.mark.slow`. The fast suite completes in under 15 seconds.
-
----
 
 ## Components
 
@@ -107,8 +97,6 @@ graph TD
 - **`RelateThreadProxy`:** Actor queue and thread-affinity broker running on a dedicated thread, serializing database write transactions and enforcing single-writer access to prevent thread-affinity exceptions and file lock collisions.
 - **`TimeTravelEngine`:** In-memory replay controller that extracts execution subgraphs and clones them into isolated `:memory:` database instances for zero-side-effect what-if debugging.
 - **`DAGVisualizer`:** Graph forensics and diagnostic renderer that executes Cypher path queries to produce Unicode execution trees, cycle detection reports, and failure root-cause traces.
-
----
 
 ## Graph schema and data models
 
@@ -211,8 +199,8 @@ Validation and invariants:
 - A tool call without a non-empty string `id` or `name` is skipped (AC-47).
 - At most one of `result_blob` and `error` is ever set. The first outcome recorded wins; later outcome writes for the same `call_id` change nothing.
 - Properties not yet known are absent (read back as null), never empty strings. Forensics treats `error IS NOT NULL AND error <> ''` as a failure.
-- `call_id` is globally unique (existing `tool_call_id_unique` constraint). If two threads reuse the same id (typical only of hand-written fakes), they share one node; each thread still gets its own `[:INVOKED]` edge, and the first outcome wins. Real model providers generate unique ids; the demo and tests generate `call_<uuid4 hex>` ids.
-- `ToolCallNode` in `models.py` already matches this shape and is unchanged.
+- `call_id` is globally unique (`tool_call_id_unique` constraint). If two threads reuse the same id (typical only of hand-written fakes), they share one node; each thread still gets its own `[:INVOKED]` edge, and the first outcome wins. Real model providers generate unique ids; the demo and tests generate `call_<uuid4 hex>` ids.
+- `ToolCallNode` in `models.py` has this shape.
 
 ### Relationship Types
 
@@ -221,49 +209,37 @@ Validation and invariants:
 - `(:Checkpoint)-[:FORKED_TO]->(:Checkpoint)`: Branch edge linking a historical checkpoint to the root checkpoint of a branched or replayed thread.
 - `(:Checkpoint)-[:HAS_WRITE]->(:Write)`: Links a checkpoint to its pending or committed writes.
 - `(:Checkpoint)-[:INVOKED]->(:ToolCall)`: Links the checkpoint at which a thread first recorded a tool call to that call. For `put_writes()` this is the checkpoint named by `config["configurable"]["checkpoint_id"]` (the checkpoint the model's task ran from, AC-41); for `put()` it is the checkpoint being stored (AC-42). Exactly one such edge exists per (thread, `call_id`): a later save in the same thread that sees the same call adds no edge. In a normal LangGraph run the model's write arrives through `put_writes()` first, so the edge attaches to the checkpoint the model step ran from.
-- `(:Write)-[:INVOKED]->(:ToolCall)`: Reserved. The saver does not write this edge; forensics reads it if present, so existing data that contains it keeps working.
+- `(:Write)-[:INVOKED]->(:ToolCall)`: Reserved. The saver does not write this edge; forensics reads it if present, so data that contains it keeps working.
 
 ### Cypher DDL Constraints and Indexes
 
-Initialized automatically on database creation (unchanged):
+Initialized automatically on database creation:
 ```cypher
 CREATE CONSTRAINT thread_id_unique IF NOT EXISTS
 FOR (t:Thread) REQUIRE t.thread_id IS UNIQUE;
-
 CREATE CONSTRAINT checkpoint_id_unique IF NOT EXISTS
 FOR (c:Checkpoint) REQUIRE c.checkpoint_id IS UNIQUE;
-
 CREATE CONSTRAINT write_id_unique IF NOT EXISTS
 FOR (w:Write) REQUIRE w.write_id IS UNIQUE;
-
 CREATE CONSTRAINT tool_call_id_unique IF NOT EXISTS
 FOR (tc:ToolCall) REQUIRE tc.call_id IS UNIQUE;
-
 CREATE INDEX checkpoint_thread_idx IF NOT EXISTS
 FOR (c:Checkpoint) ON (c.thread_id, c.checkpoint_ns, c.step);
-
 CREATE INDEX checkpoint_hash_idx IF NOT EXISTS
 FOR (c:Checkpoint) ON (c.state_hash);
 ```
-
----
 
 ## Interfaces and contracts
 
 ### 1. `RelateSaver` Interface
 
-`RelateSaver` inherits from `langgraph.checkpoint.base.BaseCheckpointSaver` and implements the synchronous checkpoint operations plus their async counterparts. Existing synchronous signatures and return values are unchanged; `put()` and `put_writes()` additionally capture tool calls after the checkpoint or writes are committed.
+`RelateSaver` inherits from `langgraph.checkpoint.base.BaseCheckpointSaver` and implements the synchronous checkpoint operations plus their async counterparts. `put()` and `put_writes()` capture tool calls after the checkpoint or writes are committed.
 
 ```python
 from collections.abc import AsyncIterator, Iterator, Sequence
 from typing import Any
-from langgraph.checkpoint.base import (
-    BaseCheckpointSaver,
-    Checkpoint,
-    CheckpointMetadata,
-    CheckpointTuple,
-    ChannelVersions,
-)
+from langgraph.checkpoint.base import (BaseCheckpointSaver, Checkpoint, CheckpointMetadata,
+                                       CheckpointTuple, ChannelVersions)
 from langchain_core.runnables import RunnableConfig
 
 class RelateSaver(BaseCheckpointSaver[str]):
@@ -278,7 +254,7 @@ class RelateSaver(BaseCheckpointSaver[str]):
         read_only: bool = False,   # see Read-only mode (ADR-0015)
     ) -> None: ...
 
-    # --- synchronous (unchanged signatures) ---
+    # --- synchronous ---
     def put(self, config: RunnableConfig, checkpoint: Checkpoint,
             metadata: CheckpointMetadata, new_versions: ChannelVersions) -> RunnableConfig:
         """Persist a checkpoint node, connect NEXT/FORKED_TO, then capture tool calls
@@ -291,12 +267,13 @@ class RelateSaver(BaseCheckpointSaver[str]):
     def list(self, config: RunnableConfig | None, *, filter: dict[str, Any] | None = None,
              before: RunnableConfig | None = None, limit: int | None = None
              ) -> Iterator[CheckpointTuple]: ...
-    def fork_in_memory(self, thread_id: str, checkpoint_id: str) -> "RelateSaver": ...
+    def fork_in_memory(self, thread_id: str, checkpoint_id: str, *,
+                       branch_thread_id: str | None = None) -> "RelateSaver": ...
     def detect_loops(self, thread_id: str, threshold: int = 2) -> list["LoopReport"]: ...
     def trace_root_cause(self, thread_id: str) -> "RootCauseReport": ...
     def close(self) -> None: ...
 
-    # --- async (new) ---
+    # --- async ---
     async def aget_tuple(self, config: RunnableConfig) -> CheckpointTuple | None: ...
     async def alist(self, config: RunnableConfig | None, *, filter: dict[str, Any] | None = None,
                     before: RunnableConfig | None = None, limit: int | None = None
@@ -317,21 +294,21 @@ class RelateSaver(BaseCheckpointSaver[str]):
 
 #### Tool call capture inside `put()` and `put_writes()`
 - `__init__` creates `self._applied_tool_calls = AppliedToolCalls()` on every construction path (own proxy, passed proxy, proxy as `db_path`). Two savers sharing one proxy each have their own record; that is safe because every statement is idempotent.
-- `put_writes()`: after its existing `execute_batch` succeeds, calls the private helper `_capture_tool_calls(values=[value for _, value in writes], thread_id=thread_id, checkpoint_id=checkpoint_id_str)`.
-- `put()`: after its existing `execute_write` succeeds, calls `_capture_tool_calls(values=checkpoint["channel_values"].values(), thread_id=thread_id, checkpoint_id=checkpoint_id)` when `channel_values` is a dict; otherwise does nothing.
+- `put_writes()`: after its `execute_batch` succeeds, calls the private helper `_capture_tool_calls(values=[value for _, value in writes], thread_id=thread_id, checkpoint_id=checkpoint_id_str)`.
+- `put()`: after its `execute_write` succeeds, calls `_capture_tool_calls(values=checkpoint["channel_values"].values(), thread_id=thread_id, checkpoint_id=checkpoint_id)` when `channel_values` is a dict; otherwise does nothing.
 - `_capture_tool_calls` runs on the calling thread, in this order ([ADR-0011](DECISIONS.md#adr-0011-send-only-new-tool-call-statements-tracked-per-saver)):
   1. `events = extract_tool_events(values)`.
   2. `plan = self._applied_tool_calls.plan(events, thread_id=thread_id)`.
   3. If `plan.events` has no invocations and no outcomes: return. Nothing is serialized and nothing is submitted to the proxy.
-  4. `statements = build_tool_call_statements(plan.events, ...)` with the same keyword arguments as before; if non-empty, `detached = detached_call_ids(self.proxy.execute_batch(statements, flush=False))` ([ADR-0014](DECISIONS.md#adr-0014-tool-call-capture-commits-without-its-own-flush)); otherwise `detached` is empty.
+  4. `statements = build_tool_call_statements(plan.events, thread_id=..., checkpoint_id=..., serde=..., created_at=...)`; if non-empty, `detached = detached_call_ids(self.proxy.execute_batch(statements, flush=False))` ([ADR-0014](DECISIONS.md#adr-0014-tool-call-capture-commits-without-its-own-flush)); otherwise `detached` is empty.
   5. `self._applied_tool_calls.mark_applied(plan, thread_id=thread_id, detached=detached)`, reached only when step 4's batch returned normally or had nothing to send (every entry failed serialization).
 - It catches every `Exception`, logs at WARNING with the checkpoint id and the exception class name only (never argument or result content), and returns normally. On any exception nothing is marked, so the next save that sees the same calls sends them again. Tool call capture can never make `put()` or `put_writes()` raise or roll back (AC-47).
 - No messages in the values means no statements, no `:ToolCall` nodes and no `[:INVOKED]` edges (AC-46).
-- Observable result: a save whose values contain only calls and outcomes this saver has already committed makes exactly one proxy submission (the checkpoint or write transaction). The graph after any sequence of saves is the same as with the earlier send-everything behavior, except for the cases under [Applied tool call record](#applied-tool-call-record).
+- Observable result: a save whose values contain only calls and outcomes this saver has already committed makes exactly one proxy submission (the checkpoint or write transaction). Sending only new statements leaves the stored graph the same as resending everything, except for the cases under [Applied tool call record](#applied-tool-call-record).
 
 #### Read-only mode
 
-`RelateSaver(path, read_only=True)` opens a file store for inspection and leaves it byte-identical, with no sidecar files ([ADR-0015](DECISIONS.md#adr-0015-read-only-opening-for-inspection-commands)). The default `read_only=False` is unchanged.
+`RelateSaver(path, read_only=True)` opens a file store for inspection and leaves it byte-identical, with no sidecar files ([ADR-0015](DECISIONS.md#adr-0015-read-only-opening-for-inspection-commands)). The default is `read_only=False`.
 
 - **Opening:** the saver builds its proxy with `RelateThreadProxy(path, read_only=True)`, which connects with `relate.connect(database=path, read_only=True)`, creates no directories, and runs no schema setup. `wal_enabled` is ignored.
 - **Reads that work:** `get_tuple`, `list`, `aget_tuple`, `alist`, `detect_loops`, `trace_root_cause`, `fork_in_memory`, and `DAGVisualizer` / `RelateForensics` built on the saver.
@@ -346,10 +323,10 @@ class RelateSaver(BaseCheckpointSaver[str]):
 
 `fork_in_memory(thread_id, checkpoint_id, *, branch_thread_id=None)` delegates to `TimeTravelEngine.fork_in_memory` in `time_travel.py` ([ADR-0004](DECISIONS.md#adr-0004-in-memory-graph-cloning-for-zero-side-effect-time-travel-sandboxing), amended by [ADR-0010](DECISIONS.md#adr-0010-in-memory-forks-copy-tool-call-data)).
 
-**Copied set.** The lineage is the target checkpoint plus every ancestor reached by following `parent_checkpoint_id` (unchanged). Into a new `RelateSaver(":memory:")` the fork copies:
-- the source `:Thread` node, every lineage `:Checkpoint` with its `[:HAS_CHECKPOINT]` edge, and the `[:NEXT]` / `[:FORKED_TO]` edges between lineage checkpoints (unchanged);
-- every `:Write` linked by `[:HAS_WRITE]` from a lineage checkpoint (unchanged);
-- **new:** every `:ToolCall` that has an `[:INVOKED]` edge from a lineage checkpoint, and each of those `(:Checkpoint)-[:INVOKED]->(:ToolCall)` edges whose checkpoint is in the lineage. Not copied: `:ToolCall` nodes reached only from checkpoints outside the lineage (later checkpoints, other branches, other threads), `[:INVOKED]` edges from checkpoints outside the lineage, and the reserved `(:Write)-[:INVOKED]->(:ToolCall)` edges.
+**Copied set.** The lineage is the target checkpoint plus every ancestor reached by following `parent_checkpoint_id`. Into a new `RelateSaver(":memory:")` the fork copies:
+- the source `:Thread` node, every lineage `:Checkpoint` with its `[:HAS_CHECKPOINT]` edge, and the `[:NEXT]` / `[:FORKED_TO]` edges between lineage checkpoints;
+- every `:Write` linked by `[:HAS_WRITE]` from a lineage checkpoint;
+- every `:ToolCall` that has an `[:INVOKED]` edge from a lineage checkpoint, and each of those `(:Checkpoint)-[:INVOKED]->(:ToolCall)` edges whose checkpoint is in the lineage. Not copied: `:ToolCall` nodes reached only from checkpoints outside the lineage (later checkpoints, other branches, other threads), `[:INVOKED]` edges from checkpoints outside the lineage, and the reserved `(:Write)-[:INVOKED]->(:ToolCall)` edges.
 
 **Tool call read.** One read on the source proxy, after the lineage ids are known:
 ```cypher
@@ -359,9 +336,9 @@ RETURN c.checkpoint_id AS checkpoint_id, tc.call_id AS call_id, tc.tool_name AS 
 ```
 One row per edge. A `RelateCheckpointError` from this read propagates to the caller; the fork is not returned without its tool calls, because forensics on such a fork would silently differ from the source.
 
-**Outcomes only up to the fork point.** Before building statements, the fork deserializes the fork-point checkpoint's `checkpoint_blob` (already read with the lineage) with `source_saver.serde.loads(_extract_bytes(...))` and, if its `channel_values` is a dict, runs `extract_tool_events(channel_values.values())` from `tool_calls.py`; no other parsing is added. The `call_id`s of the resulting outcomes form the *fork-point outcome set* (empty when `channel_values` is missing or not a dict). A copied node keeps the source's stored `result_blob` or `error` only if its `call_id` is in that set; otherwise it is copied without either property, so a replay in the fork records its own first outcome. Results that exist only in the fork point's pending writes, or only in later checkpoints, do not count. If the blob cannot be deserialized, the fork raises `RelateCheckpointError`.
+**Outcomes only up to the fork point.** Before building statements, the fork deserializes the fork-point checkpoint's `checkpoint_blob` (already read with the lineage) with `source_saver.serde.loads(_extract_bytes(...))` and, if its `channel_values` is a dict, runs `extract_tool_events(channel_values.values())` from `tool_calls.py`; no other parsing is done. The `call_id`s of the resulting outcomes form the *fork-point outcome set* (empty when `channel_values` is missing or not a dict). A copied node keeps the source's stored `result_blob` or `error` only if its `call_id` is in that set; otherwise it is copied without either property, so a replay in the fork records its own first outcome. Results that exist only in the fork point's pending writes, or only in later checkpoints, do not count. If the blob cannot be deserialized, the fork raises `RelateCheckpointError`.
 
-**Tool call writes**, appended to the existing single population batch after the `:Write` statements and before the optional branch `[:FORKED_TO]` statement:
+**Tool call writes**, appended to the single population batch after the `:Write` statements and before the optional branch `[:FORKED_TO]` statement:
 - One node statement per distinct `call_id`: `MERGE (tc:ToolCall {call_id: $call_id})` followed by `SET tc.<p> = $<p>` for each of `tool_name`, `args_blob`, `created_at` whose source value is not null, plus `result_blob` and `error` under the same condition only when the `call_id` is in the fork-point outcome set. Null properties are left absent, matching the [`:ToolCall` schema](#4-toolcall). The property names come from this fixed list, never from data. Blob values pass through `_extract_bytes`.
 - One edge statement per row: `MATCH (c:Checkpoint {checkpoint_id: $checkpoint_id}), (tc:ToolCall {call_id: $call_id}) MERGE (c)-[:INVOKED]->(tc)`.
 
@@ -373,7 +350,7 @@ One row per edge. A `RelateCheckpointError` from this read propagates to the cal
 
 ### 2. `RelateThreadProxy` Actor Protocol
 
-Embedded databases require strict thread affinity for file writing. The `RelateThreadProxy` encapsulates all direct database driver calls inside an isolated worker actor thread. Tool call capture and the async methods only add callers; the interface changes are the `flush` keyword on `execute_batch` ([ADR-0014](DECISIONS.md#adr-0014-tool-call-capture-commits-without-its-own-flush)) and the `read_only` constructor keyword ([ADR-0015](DECISIONS.md#adr-0015-read-only-opening-for-inspection-commands)).
+Embedded databases require strict thread affinity for file writing. `RelateThreadProxy` runs every driver call on one dedicated worker thread, the only thread that touches the driver; callers on any thread (LangGraph worker threads, `asyncio.to_thread` workers) block on the command future.
 
 ```python
 import concurrent.futures
@@ -401,15 +378,13 @@ class RelateThreadProxy:
     def close(self, timeout: float | None = 5.0) -> None: ...   # stop() is an alias
 ```
 
-Callers on any thread (LangGraph worker threads, `asyncio.to_thread` workers) block on the command future; the proxy's single worker thread is the only thread that touches the driver.
-
-**`flush` keyword ([ADR-0014](DECISIONS.md#adr-0014-tool-call-capture-commits-without-its-own-flush)).** `BatchCommand` gains `flush: bool = True`, and `_handle_batch_command` calls `conn.flush()` after the commit only when `self.wal_enabled and cmd.flush`. With `flush=False` the batch still commits (or rolls back) as one transaction before the future resolves; only the per-write flush is skipped. The default keeps every existing caller flushing: `execute_write`, `put()`, `put_writes()`, `transaction()`, the dict `transaction` message and the fork population batch do not pass the keyword. Only `RelateSaver._capture_tool_calls` passes `flush=False`. `close()` flushes explicitly: on shutdown the worker calls `conn.flush()` (when `wal_enabled` and the connection has `flush`) before `conn.close()`; a flush error is logged at WARNING and the connection is still closed. `abort()` does not flush. With `wal_enabled=False` the keyword changes nothing.
+**`flush` keyword ([ADR-0014](DECISIONS.md#adr-0014-tool-call-capture-commits-without-its-own-flush)).** `BatchCommand` has `flush: bool = True`, and `_handle_batch_command` calls `conn.flush()` after the commit only when `self.wal_enabled and cmd.flush`. With `flush=False` the batch still commits (or rolls back) as one transaction before the future resolves; only the per-write flush is skipped. The default keeps every other caller flushing: `execute_write`, `put()`, `put_writes()`, `transaction()`, the dict `transaction` message and the fork population batch do not pass the keyword. Only `RelateSaver._capture_tool_calls` passes `flush=False`. `close()` flushes explicitly: on shutdown the worker calls `conn.flush()` (when `wal_enabled` and the connection has `flush`) before `conn.close()`; a flush error is logged at WARNING and the connection is still closed. `abort()` does not flush. With `wal_enabled=False` the keyword changes nothing.
 
 **`read_only` keyword ([ADR-0015](DECISIONS.md#adr-0015-read-only-opening-for-inspection-commands)).** With `read_only=True`, still on the single worker thread:
-- `_open_connection` skips `os.makedirs` and calls `relate.connect(database=db_path, read_only=True)`; a custom `connection_factory` is called unchanged as `factory(db_path)`. `":memory:"` with `read_only=True` raises `ValueError` in the constructor.
+- `_open_connection` skips `os.makedirs` and calls `relate.connect(database=db_path, read_only=True)`; a custom `connection_factory` is still called as `factory(db_path)`. `":memory:"` with `read_only=True` raises `ValueError` in the constructor.
 - `_worker_loop` skips `initialize_schema` regardless of `auto_init_schema`.
 - No flush ever runs: not in the command handlers, not in `flush()` (which returns immediately), and not in `_cleanup_connection`, which only closes the connection.
-- `execute_write`, `execute`, `execute_batch` and `transaction` raise `RelateReadOnlyError` in the caller's thread before queuing. The worker fails any write-flagged item that still arrives (`DbCommand` with `is_write=True`, `BatchCommand`, the 4-tuple form, dict `execute` with `is_write` true, dict `transaction`) with `RelateReadOnlyError` without touching the driver. `execute_read` is unchanged.
+- `execute_write`, `execute`, `execute_batch` and `transaction` raise `RelateReadOnlyError` in the caller's thread before queuing. The worker fails any write-flagged item that still arrives (`DbCommand` with `is_write=True`, `BatchCommand`, the 4-tuple form, dict `execute` with `is_write` true, dict `transaction`) with `RelateReadOnlyError` without touching the driver. `execute_read` behaves as in writable mode.
 
 ### 3. Forensic Data Models
 
@@ -432,31 +407,25 @@ class RootCauseReport:
     root_channel_write: str | None = None
     causal_path_length: int = 0
     diagnostic_summary: str = ""
-    root_tool_name: str | None = None   # new, last field, default None
+    root_tool_name: str | None = None   # last field, default None
 ```
 
-`root_tool_name` is added so the report can name the failing tool by `tool_name` and `call_id` (AC-45). It is the last field with a default, so existing positional and keyword construction keeps working. `trace_root_cause()` sets it from the `tool_name` column of the same causal-query row that supplies `root_tool_call_id`, in every priority branch that sets `root_tool_call_id`. When it is set, the diagnostic summary appends one sentence, `Failing tool: '<tool_name>'.`, after the existing `Root tool invocation: '<call_id>'.` sentence; all existing sentences are unchanged.
+`root_tool_name` lets the report name the failing tool by `tool_name` and `call_id` (AC-45). It is the last field with a default, so positional and keyword construction without it keeps working. `trace_root_cause()` sets it from the `tool_name` column of the same causal-query row that supplies `root_tool_call_id`, in every priority branch that sets `root_tool_call_id`. When it is set, the diagnostic summary appends one sentence, `Failing tool: '<tool_name>'.`, after the `Root tool invocation: '<call_id>'.` sentence.
 
 ### 4. CLI Command Interface (`relate-dag`)
 
-The CLI provides an interactive terminal interface for workflow exploration:
-
-- **`relate-dag tree <thread_id> [--file <path>]`**
-  Renders a Unicode DAG tree of checkpoints, branching points, and status tags (`[PENDING]`, `[ERROR]`, `[OK]`).
-- **`relate-dag replay <thread_id> --checkpoint <id> [--edit <json>]`**
-  Spawns an interactive in-memory replay session starting from the specified checkpoint.
-- **`relate-dag forensics loops <thread_id> [--threshold <int>]`**
-  Queries the Cypher graph for repeating state transitions and displays cycle tables.
-- **`relate-dag forensics trace-error <thread_id>`**
-  Traverses backward causal paths to print root-cause analysis for failed threads. The report panel gains a `Root Tool Name:` line (shows `None` when unknown) next to `Root Tool Call ID:`.
+- **`relate-dag tree <thread_id> [--file <path>]`:** renders a Unicode DAG tree of checkpoints, branching points, and status tags (`[PENDING]`, `[ERROR]`, `[OK]`).
+- **`relate-dag replay <thread_id> --checkpoint <id> [--edit <json>]`:** spawns an interactive in-memory replay session starting from the specified checkpoint.
+- **`relate-dag forensics loops <thread_id> [--threshold <int>]`:** queries the Cypher graph for repeating state transitions and displays cycle tables.
+- **`relate-dag forensics trace-error <thread_id>`:** traverses backward causal paths to print root-cause analysis for failed threads. The report panel has a `Root Tool Name:` line (`None` when unknown) next to `Root Tool Call ID:`.
 
 `relate-dag --help` must work in a fresh environment with only the declared dependencies installed (AC-33).
 
-**Read-only store access ([ADR-0015](DECISIONS.md#adr-0015-read-only-opening-for-inspection-commands)).** `tree`, `forensics` (the combined summary), `forensics loops`, `forensics trace-error` and the source side of `replay` open the store with `RelateSaver(db, read_only=True)`. They pass that saver to `DAGVisualizer`, `RelateForensics` or `TimeTravelEngine.fork_in_memory` and close it in a `finally` or `with` block. The `DAGVisualizer` and `RelateForensics` constructors are unchanged; given a saver, they do not own or close it. The existing "Database file not found" check runs before opening, so a missing path still exits 1 with that message and is not created. `RelateReadOnlyError` is a `RelateCheckpointError`, so it is reported by the existing "Database error" handler. When `--db` is `:memory:`, the commands keep a writable saver, because an empty in-memory store has nothing to protect. After any of these commands, a closed file store is byte-identical and has no sidecar files.
+**Read-only store access ([ADR-0015](DECISIONS.md#adr-0015-read-only-opening-for-inspection-commands)).** `tree`, `forensics` (the combined summary), `forensics loops`, `forensics trace-error` and the source side of `replay` open the store with `RelateSaver(db, read_only=True)`. They pass that saver to `DAGVisualizer`, `RelateForensics` or `TimeTravelEngine.fork_in_memory` and close it in a `finally` or `with` block. Given a saver, the `DAGVisualizer` and `RelateForensics` constructors do not own or close it. The "Database file not found" check runs before opening, so a missing path still exits 1 with that message and is not created. `RelateReadOnlyError` is a `RelateCheckpointError`, so it is reported by the "Database error" handler. When `--db` is `:memory:`, the commands keep a writable saver, because an empty in-memory store has nothing to protect. After any of these commands, a closed file store is byte-identical and has no sidecar files.
 
 ### 5. In-Memory Fakes for Testing
 
-To ensure ultra-fast unit testing without disk I/O, the suite includes an in-memory seam fake:
+For fast unit tests without disk I/O, the suite includes an in-memory seam fake:
 
 ```python
 class InMemoryRelateDriver:
@@ -469,7 +438,7 @@ class InMemoryRelateDriver:
         ...
 ```
 
-The fake's pattern matching does not cover the tool call Cypher. Tool call extraction is tested as pure functions; tool call persistence, forensics and async tests run against real `relate-db` `:memory:` databases, like the existing integration tests.
+The fake's pattern matching does not cover the tool call Cypher. Tool call extraction is tested as pure functions; tool call persistence, forensics and async tests run against real `relate-db` `:memory:` databases, like the other integration tests.
 
 ### 6. Tool call capture (`tool_calls.py`)
 
@@ -575,7 +544,7 @@ class AppliedToolCalls:
 - **Key:** `(thread_id, call_id)`. `thread_id` is part of the key because the `[:INVOKED]` edge condition is per thread; `checkpoint_ns` is not, matching the Cypher. State: two sets of keys, `invoked` (invocation statement committed) and `resolved` (outcome statement committed).
 - **`plan`:** keeps an invocation only if its key is not in `invoked`, and an outcome only if its key is not in `resolved`, preserving the input order. A kept outcome is *confirmable* only if, at the moment `plan` runs, its key is already in `invoked` or its `call_id` is among the kept invocations of the same plan. `plan` never modifies the record.
 - **`mark_applied`:** adds the key of every invocation in `plan.events` whose `call_id` is not in `detached` to `invoked`, and the key of every `call_id` in `plan.confirmable_outcomes` to `resolved`. The saver calls it only after the capture transaction has committed (or when there was nothing to send), never before.
-- **Why invocations need an edge:** under concurrent `ainvoke`, LangGraph can commit a task's `put_writes()`, carrying the AI tool call, before the `put()` of the checkpoint it names. The invocation statement then creates the node without an `[:INVOKED]` edge and returns `attached = false`. Such an invocation is not recorded, so the next save that carries the call resends the idempotent statement and attaches the edge to that save's checkpoint. Its outcome, if confirmable, is still recorded, because the node exists.
+- **Why invocations need an edge:** under concurrent `ainvoke`, LangGraph can commit a task's `put_writes()`, carrying the AI tool call, before the `put()` of the checkpoint it names. The invocation statement's `OPTIONAL MATCH` then finds no checkpoint, creates the node without an `[:INVOKED]` edge and returns `attached = false`. Such an invocation is not recorded, so the next save that carries the call resends the idempotent statement and attaches the edge to that save's checkpoint. Its outcome, if confirmable, is still recorded, because the node exists.
 - **Why outcomes need confirmation:** the outcome statement uses `MATCH`, so it changes nothing if the `:ToolCall` node does not exist yet. An outcome whose invocation has not been committed is sent but not marked, and is sent again by later saves that see it until it can be confirmed. Without this rule an outcome racing ahead of its invocation could be marked applied after matching nothing, and would be lost.
 - **Thread safety:** one `threading.Lock` inside `AppliedToolCalls` guards `plan` and `mark_applied`. It is held only for set lookups and inserts, never while serializing or while waiting on the proxy. Two callers can plan the same new call concurrently; both send it, which is harmless because the statements are idempotent.
 - **Lifetime and memory:** the record is never pruned. It grows by one entry per distinct (thread, call) the saver sees, roughly a few hundred bytes each, for the lifetime of the `RelateSaver` object. A new saver, including one created after a restart and every fork, starts empty; its first save in each thread re-sends what it finds, and `MERGE` keeps that idempotent.
@@ -587,13 +556,11 @@ class AppliedToolCalls:
 
 ### 7. Tool-calling demo (`examples/tool_agent.py`)
 
-The existing `examples/research_agent.py` has no messages or tools and stays unchanged. AC-45 runs against a separate, key-free demo:
+`examples/research_agent.py` has no messages or tools; AC-45 runs against this separate, key-free demo:
 - `create_tool_agent_graph(checkpointer: BaseCheckpointSaver | None = None) -> CompiledStateGraph` on `MessagesState`: `START -> agent`, `agent -> tools` when the last AI message has tool calls (else `END`), `tools -> agent`.
 - `agent` is a deterministic function, not an LLM: on the first turn it returns an `AIMessage` with one tool call `{"name": "fetch_source", "args": {"url": ...}, "id": "call_<uuid4 hex>"}`; after a `ToolMessage` it returns a final `AIMessage` without tool calls.
 - `tools` is `langgraph.prebuilt.ToolNode([fetch_source], handle_tool_errors=True)`. `fetch_source` raises `RuntimeError` when the demo runs in failing mode (default), so `ToolNode` emits a `ToolMessage` with `status="error"` and `graph.invoke` completes normally.
 - `run_tool_agent(saver: RelateSaver, thread_id: str, *, fail: bool = True) -> dict[str, Any]` runs `graph.invoke` and returns the final state. A `main()` with `--db` and `--thread-id` mirrors `research_agent.py`.
-
----
 
 ## Concurrency and crash safety model
 
@@ -621,12 +588,12 @@ sequenceDiagram
 ```
 
 1. **Serialized Writes:** All mutating operations (`put`, `put_writes`, tool call capture, `fork`) pass through the `RelateThreadProxy` command queue. The proxy executes strictly on a single dedicated background thread, eliminating DB-API thread-affinity violations and file-lock collisions.
-2. **Crash Resilience:** Every commit flushes through the Write-Ahead Log before acknowledging caller futures, except the tool call capture transaction, which commits without its own flush and becomes durable with the next flushed write or `close()` ([ADR-0014](DECISIONS.md#adr-0014-tool-call-capture-commits-without-its-own-flush)). If the host process crashes mid-step, uncommitted transactions are rolled back during WAL recovery on restart, guaranteeing zero orphaned nodes or dangling edges. Measured cost: in relate-db 1.0 each flush takes time proportional to the database file size, so with the default `wal_enabled=True` save latency grows as a thread's history grows (about 25 ms per save early and about 110 ms after 1,000 checkpoints in our benchmark). `wal_enabled=False` skips only the per-write flush and keeps saves flat (about 3 ms); a process kill still kept committed checkpoints in our tests, but durability across power loss without the flush is not verified, and the file grows larger. We keep the flush as the default.
+2. **Crash Resilience:** Every commit flushes through the Write-Ahead Log before acknowledging caller futures, except the tool call capture transaction (see [Tool call capture ordering](#tool-call-capture-ordering)). If the host process crashes mid-step, uncommitted transactions are rolled back during WAL recovery on restart, guaranteeing zero orphaned nodes or dangling edges. Measured cost: in relate-db 1.0 each flush takes time proportional to the database file size, so with the default `wal_enabled=True` save latency grows as a thread's history grows (about 25 ms per save early and about 110 ms after 1,000 checkpoints in our benchmark). `wal_enabled=False` skips only the per-write flush and keeps saves flat (about 3 ms); a process kill still kept committed checkpoints in our tests, but durability across power loss without the flush is not verified, and the file grows larger. We keep the flush as the default.
 3. **Deadlock Prevention:** Calling threads wait synchronously on lightweight `concurrent.futures.Future` objects with configurable timeout guards. Reads and writes cannot interleave within an active atomic transaction.
 
 ### Tool call capture ordering
 
-`put()` and `put_writes()` make at most two proxy submissions: first the existing checkpoint or write transaction, then, only if it committed and the [applied tool call record](#applied-tool-call-record) shows something new, one transaction with the new tool call statements. Another thread's command may run between the two, and the order of saves across tasks is not guaranteed: under concurrent `ainvoke`, LangGraph can commit a task's `put_writes()`, carrying the AI tool call, before the `put()` of the checkpoint it names. The invocation statement's `OPTIONAL MATCH` then finds no checkpoint, so the `:ToolCall` node is created without an `[:INVOKED]` edge. The statement returns `attached = false`, the saver does not record that invocation as applied, and the next save that carries the call resends the idempotent statement, which attaches the edge to that later checkpoint (see [Applied tool call record](#applied-tool-call-record)). The record is updated only after the capture transaction commits, so a capture failure inside a running process is retried by the next save that sees the same calls. The capture transaction commits without its own flush ([ADR-0014](DECISIONS.md#adr-0014-tool-call-capture-commits-without-its-own-flush)): it is durable once the next checkpoint or writes save flushes, or `close()` runs. A process kill kept such commits in our tests; a power loss before that flush is not verified and is repaired, if at all, like the crash below. Tests: a spy on the connection shows the capture batch commits without `flush()` while checkpoint and writes saves still flush; tool call nodes, outcomes and edges are present after `close()` and reopening the file.
+`put()` and `put_writes()` make at most two proxy submissions: first the checkpoint or write transaction, then, only if it committed and the [applied tool call record](#applied-tool-call-record) shows something new, one transaction with the new tool call statements. Another thread's command may run between the two, and the order of saves across tasks is not guaranteed; a call saved before the checkpoint it names is stored is handled as described under [Applied tool call record](#applied-tool-call-record). The record is updated only after the capture transaction commits, so a capture failure inside a running process is retried by the next save that sees the same calls. The capture transaction commits without its own flush ([ADR-0014](DECISIONS.md#adr-0014-tool-call-capture-commits-without-its-own-flush)): it is durable once the next checkpoint or writes save flushes, or `close()` runs. A process kill kept such commits in our tests; a power loss before that flush is not verified and is repaired, if at all, like the crash below. Tests: a spy on the connection shows the capture batch commits without `flush()` while checkpoint and writes saves still flush; tool call nodes, outcomes and edges are present after `close()` and reopening the file.
 
 **Known limitation: crash between the two transactions.** If the process dies after a thread's checkpoint or writes have committed and before that step's capture transaction has committed, the step's `:ToolCall` nodes, outcomes and `[:INVOKED]` edges are not in the file. Nothing repairs them in the background. They are recorded only when a later `put()` runs on the same thread, in any process: a saver created after the restart has an empty record, so its first `put()` on that thread rescans the whole message history in `channel_values` and records the missing calls, attaching `[:INVOKED]` to that later checkpoint rather than the original one. `put_writes()` never repairs them, because it only sees its own writes. If no later `put()` happens on that thread, for example because the crashed step was its last, those rows stay missing, and `trace_root_cause()` on that thread cannot name the tool.
 
@@ -649,21 +616,19 @@ sequenceDiagram
 
 - The event loop never blocks on database work. Concurrent `asyncio.gather` runs on distinct thread_ids (AC-53) occupy at most the default executor's worker count (`min(32, cpu_count + 4)`); beyond that, calls queue in the executor.
 - The proxy remains the single writer, so async and sync callers can share one `RelateSaver` safely.
-- `RELATE_PROXY_TIMEOUT_SEC` applies unchanged; a timeout surfaces as `RelateConcurrencyError` from the `await`.
-
----
+- `RELATE_PROXY_TIMEOUT_SEC` applies as for synchronous calls; a timeout surfaces as `RelateConcurrencyError` from the `await`.
 
 ## Benchmark
 
 `benchmarks/bench_checkpointers.py` compares `RelateSaver` with `SqliteSaver` on the same workload ([ADR-0008](DECISIONS.md#adr-0008-standalone-benchmark-script-against-sqlitesaver), amended by [ADR-0012](DECISIONS.md#adr-0012-fair-ancestry-query-and-exact-file-cleanup-in-the-benchmark)). It is a standalone script, not part of either pytest suite, and the README publishes its output as measured (AC-58), whichever saver is faster.
 
-**Fairness rule:** each saver's queries are written in their best known form for that engine. The README states a saver is faster on a metric only when the published table, produced by this script in that form, shows it; it never carries a claim from an earlier, unfair measurement.
+**Fairness rule:** each saver's queries are written in their best known form for that engine. The README states a saver is faster on a metric only when the published table, produced by this script, shows it.
 
 **Invocation:** `python benchmarks/bench_checkpointers.py [--checkpoints N] [--payload-bytes B] [--seed S] [--workdir DIR]`. Defaults: `N=200`, `B=256`, `S=0`, `DIR` = a temporary directory created by the script and deleted at exit. Exit codes: `0` success; `1` if the savers return different ancestry counts; `2` if `langgraph-checkpoint-sqlite` is not installed (the message says to install the `dev` extra).
 
-**Files and cleanup:** the script owns exactly three database names, `relate.rl`, `relate-noflush.rl` and `sqlite.db`, and for each the sidecars `<name>-wal`, `<name>-shm` and `<name>-journal`: twelve paths in total. Before the run it deletes whichever of those twelve paths exist in `DIR`, and nothing else; other files and subdirectories in a user-supplied `--workdir` are never read, renamed or deleted, even if their names start with the same text. With `--workdir` the files are left in place after the run for inspection. On-disk size counts the same exact paths (database file plus its three sidecars), not a name-prefix match. If relate-db turns out to create sidecar files with any other name, the pattern is not widened: the developer stops and reports the names so the list is changed deliberately.
+**Files and cleanup:** the script owns exactly three file-backed databases in `DIR`, `relate.rl`, `relate-noflush.rl` and `sqlite.db`, and for each the sidecars `<name>-wal`, `<name>-shm` and `<name>-journal`: twelve paths in total. Before the run it deletes whichever of those twelve paths exist in `DIR`, and nothing else; other files and subdirectories in a user-supplied `--workdir` are never read, renamed or deleted, even if their names start with the same text. With `--workdir` the files are left in place after the run for inspection. On-disk size counts the same exact paths (database file plus its three sidecars), not a name-prefix match. If relate-db creates sidecar files with any other name, the list is changed deliberately, never widened to a pattern.
 
-**Workload (identical for every run):** file-backed databases in `DIR` (`relate.rl`, `relate-noflush.rl`, `sqlite.db`). RelateSaver runs twice, with the default per-write flush and with `wal_enabled=False`, reported as separate columns. One thread_id; a main chain of N checkpoints where each `put()` receives the config returned by the previous one; channel values `{"step": i, "payload": "x" * B}` with no LangChain messages (so tool call capture adds only its scan); checkpoint ids from `langgraph.checkpoint.base.id.uuid6()`, as LangGraph itself uses. After the timed chain, an untimed branch of `max(1, N // 10)` checkpoints is written from the checkpoint at index `N // 2`. `SqliteSaver` is built as `SqliteSaver(sqlite3.connect(path, check_same_thread=False))` followed by `setup()`.
+**Workload (identical for every run):** RelateSaver runs twice, with the default per-write flush and with `wal_enabled=False`, reported as separate columns. One thread_id; a main chain of N checkpoints where each `put()` receives the config returned by the previous one; channel values `{"step": i, "payload": "x" * B}` with no LangChain messages (so tool call capture adds only its scan); checkpoint ids from `langgraph.checkpoint.base.id.uuid6()`, as LangGraph itself uses. After the timed chain, an untimed branch of `max(1, N // 10)` checkpoints is written from the checkpoint at index `N // 2`. `SqliteSaver` is built as `SqliteSaver(sqlite3.connect(path, check_same_thread=False))` followed by `setup()`.
 
 | Metric | Unit | How it is measured |
 | :--- | :--- | :--- |
@@ -685,21 +650,17 @@ WITH RECURSIVE ancestry(checkpoint_id) AS (
    WHERE c.thread_id = ? AND c.checkpoint_ns = '' AND c.parent_checkpoint_id IS NOT NULL
 ) SELECT count(*) FROM ancestry
 ```
-The recursive member must start `FROM ancestry a CROSS JOIN checkpoints c`. In SQLite, `CROSS JOIN` fixes the left table as the outer loop, so each step looks up one row through the `checkpoints` primary key. The earlier form, `FROM checkpoints c JOIN ancestry a`, let the planner scan `checkpoints` at every step: about 170 ms against about 0.93 ms at N=1000, with the same count.
+The recursive member must start `FROM ancestry a CROSS JOIN checkpoints c`. In SQLite, `CROSS JOIN` fixes the left table as the outer loop, so each step looks up one row through the `checkpoints` primary key instead of scanning `checkpoints` (about 0.93 ms against about 170 ms at N=1000, [ADR-0012](DECISIONS.md#adr-0012-fair-ancestry-query-and-exact-file-cleanup-in-the-benchmark)).
 
 **Output:** stdout carries only Markdown: an environment block (N, B, OS, CPU from `platform.processor()`, Python version, and the installed versions of `relate-db`, `langgraph-checkpoint`, `langgraph-checkpoint-sqlite` and SQLite) followed by one table with four columns, `Metric | RelateSaver (flush per write, default) | RelateSaver (wal_enabled=False) | SqliteSaver`, and one row per figure (put throughput, get p50, get p95, on-disk size, ancestry query). Progress goes to stderr.
-
----
 
 ## Clean-install test (`tests/integration/test_clean_install.py`)
 
 The slow test proving AC-33 ([ADR-0009](DECISIONS.md#adr-0009-declare-every-directly-imported-runtime-dependency-and-prove-it-with-a-clean-install), amended by [ADR-0013](DECISIONS.md#adr-0013-clean-install-test-skips-only-when-the-package-index-is-unreachable)) creates a fresh virtual environment, runs `pip install <repository root>` with no extras, then runs that environment's `relate-dag --help`.
 
-- **Skip rule:** if `pip install` exits non-zero and its combined stdout and stderr contain at least one marker from `_INDEX_UNREACHABLE_MARKERS`, the test calls `pytest.skip("package index unreachable, clean install not verified: <first matching output line>")`. In every other case a non-zero exit fails the test with pip's full output, as today.
+- **Skip rule:** if `pip install` exits non-zero and its combined stdout and stderr contain at least one marker from `_INDEX_UNREACHABLE_MARKERS`, the test calls `pytest.skip("package index unreachable, clean install not verified: <first matching output line>")`. In every other case a non-zero exit fails the test with pip's full output.
 - **Markers** (a module-level tuple, matched as case-sensitive substrings): `Failed to establish a new connection`, `NewConnectionError`, `ConnectTimeoutError`, `Max retries exceeded with url`, `Temporary failure in name resolution`, `getaddrinfo failed`, `Name or service not known`, `nodename nor servname provided`, `Network is unreachable`, `No route to host`, `ProxyError`.
 - **Never a skip on its own:** `No matching distribution found`, `Could not find a version that satisfies the requirement`, build or metadata errors, SSL certificate errors, `subprocess.TimeoutExpired`, a missing `relate-dag` executable, and any failure of the `relate-dag --help` step. A resolver message without a connection marker means a real dependency problem. The decision lives in a pure helper, `_index_unreachable(output: str) -> str | None` (returns the first matching line, or `None`), covered by a fast, unmarked test in the same file with canned pip output: an offline output returns a line; `No matching distribution found` alone returns `None`.
-
----
 
 ## Directory layout
 
@@ -725,48 +686,53 @@ RelateGraphSaver/
 │       ├── schema.py           # Cypher constraints and schema migrations
 │       ├── serde.py            # JsonPlusSerializer wrapper & error mapper
 │       ├── time_travel.py      # TimeTravelEngine in-memory sandbox
-│       ├── tool_calls.py       # NEW: tool call extractor and ToolCall statements
+│       ├── tool_calls.py       # Tool call extractor and ToolCall statements
 │       └── visualizer.py       # Rich/Unicode tree terminal renderer
 ├── tests/                      # no __init__.py here (see ADR-0007)
 │   ├── conftest.py             # Shared fixtures and in-memory fakes
 │   ├── unit/
 │   │   ├── test_errors.py
 │   │   ├── test_models.py
-│   │   ├── test_packaging.py   # + declared-dependency checks (AC-34, AC-57)
+│   │   ├── test_packaging.py   # declared-dependency checks (AC-34, AC-57)
 │   │   ├── test_proxy.py
+│   │   ├── test_readme.py      # README content checks (AC-39, AC-40, AC-58)
 │   │   ├── test_saver.py
 │   │   ├── test_serde.py
-│   │   ├── test_tool_calls.py  # NEW: extractor and statement builder (AC-46, AC-47)
+│   │   ├── test_tool_calls.py  # extractor and statement builder (AC-46, AC-47)
 │   │   └── test_visualizer.py
 │   ├── integration/
-│   │   ├── test_async_saver.py         # NEW: AC-50..AC-55
-│   │   ├── test_clean_install.py       # NEW, slow: AC-33
+│   │   ├── test_async_saver.py                 # AC-50..AC-55
+│   │   ├── test_checkpointing_end_to_end.py
+│   │   ├── test_clean_install.py               # slow: AC-33
 │   │   ├── test_cli.py
 │   │   ├── test_concurrency.py
 │   │   ├── test_crash_recovery.py
+│   │   ├── test_demo_store.py                  # committed demo store (AC-69..AC-75)
 │   │   ├── test_forensics.py
+│   │   ├── test_forensics_end_to_end.py
 │   │   ├── test_langgraph_workflow.py
-│   │   ├── test_m1_milestone.py
-│   │   ├── test_m2_milestone.py
-│   │   ├── test_m3_milestone.py
+│   │   ├── test_read_only.py                   # read-only opening (AC-81..AC-87, ADR-0015)
 │   │   ├── test_time_travel.py
-│   │   ├── test_tool_call_capture.py   # NEW: AC-41..AC-44, AC-46..AC-49
-│   │   └── test_tool_forensics_demo.py # NEW: AC-45 via examples/tool_agent.py
+│   │   ├── test_time_travel_end_to_end.py
+│   │   ├── test_tool_call_capture.py           # AC-41..AC-44, AC-46..AC-49
+│   │   ├── test_tool_calls_end_to_end.py
+│   │   └── test_tool_forensics_demo.py         # AC-45 via examples/tool_agent.py
 │   └── fakes/
 │       ├── __init__.py
 │       └── fake_relate_driver.py
 ├── benchmarks/
-│   └── bench_checkpointers.py  # NEW: RelateSaver vs SqliteSaver (not a test)
+│   └── bench_checkpointers.py  # RelateSaver vs SqliteSaver (not a test)
 └── examples/
-    ├── research_agent.py       # Multi-agent demo workflow (unchanged)
-    └── tool_agent.py           # NEW: key-free tool-calling demo for forensics
+    ├── build_demo_store.py     # Regenerates the committed demo store
+    ├── data/
+    │   └── demo.rl             # Committed demo store, inspected read-only
+    ├── research_agent.py       # Multi-agent demo workflow
+    └── tool_agent.py           # Key-free tool-calling demo for forensics
 ```
-
----
 
 ## Configuration
 
-Configuration parameters can be supplied directly to `RelateSaver` or read from environment variables. No new variables are added; the benchmark takes command-line arguments only.
+Configuration parameters can be supplied directly to `RelateSaver` or read from environment variables. The benchmark takes command-line arguments only.
 
 | Environment Variable | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
@@ -774,8 +740,6 @@ Configuration parameters can be supplied directly to `RelateSaver` or read from 
 | `RELATE_WAL_ENABLED` | boolean | `true` | Enables the per-write WAL flush for crash safety; tool call capture never flushes on its own ([ADR-0014](DECISIONS.md#adr-0014-tool-call-capture-commits-without-its-own-flush)). Measured cost under the concurrency and crash safety model |
 | `RELATE_PROXY_TIMEOUT_SEC` | float | `30.0` | Maximum wait time for actor queue transactions before raising timeout |
 | `RELATE_LOG_LEVEL` | string | `"INFO"` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
-
----
 
 ## Setup requirements
 
@@ -793,8 +757,6 @@ None. The RelateGraphSaver engine operates completely in-process as an embedded 
 ### Local services
 None. All graph storage is managed in-process via single-file `.rl` databases or `:memory:` targets. No Docker containers, PostgreSQL servers, or background daemon services are required. Network access to the package index is needed only for the slow clean-install test.
 
----
-
 ## Expensive to change
 
 1. **Graph Schema and Relationship Taxonomy:**
@@ -811,7 +773,7 @@ None. All graph storage is managed in-process via single-file `.rl` databases or
    - *Why expensive:* Direct contract adherence to LangGraph's runtime is necessary for plug-and-play compatibility across all LangGraph graphs, subgraphs, and human-in-the-loop constructs, synchronous or async.
 5. **Persisted `:ToolCall` property names and meaning:**
    - *Components:* `call_id`, `tool_name`, `args_blob`, `result_blob`, `error`, `created_at`, written by real runs ([ADR-0005](DECISIONS.md#adr-0005-capture-tool-calls-from-persisted-langchain-messages)).
-   - *Why expensive:* Until now only tests created these nodes; from this release users' `.rl` files contain them and `forensics.py` reads them by name. Renaming a property, storing `error` as a blob, or adding a second outcome field needs a data migration and a forensics change together.
+   - *Why expensive:* Users' `.rl` files contain these nodes and `forensics.py` reads them by name. Renaming a property, storing `error` as a blob, or adding a second outcome field needs a data migration and a forensics change together.
 6. **`call_id` is the provider's tool call id, verbatim and globally unique:**
    - *Components:* `tool_call_id_unique` constraint, `MERGE` on `call_id`, `ToolMessage.tool_call_id` matching.
    - *Why expensive:* Moving to thread-scoped keys later (for example `{thread_id}:{call_id}`) would change the constraint, every stored node, and what `root_tool_call_id` reports to users.
