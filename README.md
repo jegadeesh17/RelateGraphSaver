@@ -263,13 +263,13 @@ Run the automated test suite using `pytest`:
 
 ```bash
 # Run the complete test suite (unit and integration tests)
-python -m pytest -q
+python -m pytest
 
 # Run fast test suite
-python -m pytest -q -m "not slow"
+python -m pytest -m "not slow"
 
 # Run a specific test file
-python -m pytest -q tests/unit/test_saver.py
+python -m pytest tests/unit/test_saver.py
 ```
 
 ## Project structure
@@ -288,6 +288,7 @@ RelateGraphSaver/
 │       ├── schema.py           # Cypher DDL schema constraints and indexes
 │       ├── serde.py            # Typed state serialization and hashing
 │       ├── time_travel.py      # TimeTravelEngine in-memory sandbox
+│       ├── tool_calls.py       # Tool call extraction and ToolCall statements
 │       └── visualizer.py       # DAGVisualizer terminal tree renderer
 ├── tests/
 │   ├── conftest.py             # Shared pytest fixtures and configurations
@@ -297,6 +298,9 @@ RelateGraphSaver/
 ├── benchmarks/
 │   └── bench_checkpointers.py  # RelateSaver vs SqliteSaver benchmark
 ├── examples/
+│   ├── data/
+│   │   └── demo.rl             # Committed demo Relate store with three threads
+│   ├── build_demo_store.py     # Rebuilds the committed demo store offline
 │   ├── research_agent.py       # Multi-agent research pipeline demo
 │   └── tool_agent.py           # Key-free tool-calling demo with a failing tool
 ├── docs/                       # Living architectural documentation
