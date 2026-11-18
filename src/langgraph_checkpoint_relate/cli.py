@@ -6,22 +6,29 @@ and forensic diagnostics.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
-from typing import Any
+from typing import Annotated, Any
 
 import typer
+from langgraph.errors import InvalidUpdateError
+from rich import box
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from typer.core import TyperGroup
 
 from langgraph_checkpoint_relate.errors import (
     CheckpointNotFoundError,
+    GraphSpecError,
     RelateCheckpointError,
 )
 from langgraph_checkpoint_relate.forensics import RelateForensics
+from langgraph_checkpoint_relate.models import ChannelChange, RunDiff, ToolCallChange
+from langgraph_checkpoint_relate.replay import load_graph_factory, replay_from_checkpoint
 from langgraph_checkpoint_relate.saver import RelateSaver
 from langgraph_checkpoint_relate.time_travel import TimeTravelEngine
 from langgraph_checkpoint_relate.visualizer import DAGVisualizer
@@ -67,6 +74,178 @@ def _open_inspection_saver(db: str) -> RelateSaver:
     An in-memory store starts empty, so there is nothing to protect and it stays writable.
     """
     return RelateSaver(db_path=db, read_only=db != ":memory:")
+
+
+def _fail(message: str) -> typer.Exit:
+    """Print an error line and return the exit to raise."""
+    err_console.print(f"[bold red]Error:[/bold red] {escape(message)}")
+    return typer.Exit(code=1)
+
+
+def _parse_update(raw: str) -> dict[str, Any]:
+    """Parse the ``--update`` value, which must be a JSON object (AC-113)."""
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise _fail(f"--update must be valid JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise _fail('--update must be a JSON object, for example \'{"key": "value"}\'.')
+    return value
+
+
+def _parse_set_messages(raw_items: list[str]) -> dict[int, str]:
+    """Parse repeated ``--set-message INDEX=TEXT`` values (AC-114)."""
+    parsed: dict[int, str] = {}
+    for item in raw_items:
+        index_text, separator, text = item.partition("=")
+        if not separator:
+            raise _fail(f"--set-message must look like INDEX=TEXT, got: {item!r}")
+        try:
+            index = int(index_text.strip())
+        except ValueError as exc:
+            raise _fail(f"--set-message index must be an integer, got: {index_text!r}") from exc
+        if index < 0:
+            raise _fail(f"--set-message index must not be negative, got: {index}")
+        parsed[index] = text
+    return parsed
+
+
+def _print_wide(table: Table) -> None:
+    """Print a table at its natural width so cell text such as ``error -> ok`` never wraps."""
+    natural_width = console.measure(table, options=console.options.update_width(10_000)).maximum
+    available_width = console.width
+    console.width = max(natural_width, available_width)
+    try:
+        console.print(table)
+    finally:
+        console.width = available_width
+
+
+def _argument_changes(change: ToolCallChange) -> str:
+    """Describe the arguments of a tool call change, one ``name: before -> after`` per line."""
+    before = change.before.args if change.before is not None else None
+    after = change.after.args if change.after is not None else None
+    if isinstance(before, dict) and isinstance(after, dict):
+        keys = [*before, *(key for key in after if key not in before)]
+        lines = [
+            f"{key}: {before.get(key, '-')} -> {after.get(key, '-')}"
+            for key in keys
+            if (key in before) != (key in after) or before[key] != after[key]
+        ]
+        return "\n".join(lines) if lines else "-"
+    if change.kind == "added":
+        return f"{after}"
+    if change.kind == "removed":
+        return f"{before}"
+    return f"{before} -> {after}"
+
+
+def _tool_call_result(change: ToolCallChange) -> str:
+    """Describe the status of a tool call change, as ``before -> after`` when it moved."""
+    before = change.before.status if change.before is not None else None
+    after = change.after.status if change.after is not None else None
+    if change.kind == "added":
+        return f"{after}"
+    if change.kind == "removed":
+        return f"{before}"
+    return f"{before} -> {after}" if before != after else f"{after}"
+
+
+def _print_diff(diff: RunDiff) -> None:
+    """Print the tool-call and final-state tables of a replay diff (AC-110, AC-111)."""
+    if diff.is_empty:
+        console.print("No tool calls or state changed.")
+        return
+
+    if diff.tool_calls:
+        calls = Table(title="Tool calls", box=box.ASCII)
+        calls.add_column("Tool call", style="cyan", no_wrap=True)
+        calls.add_column("Change", no_wrap=True)
+        calls.add_column("Result", style="magenta", no_wrap=True)
+        calls.add_column("Arguments", no_wrap=True)
+        for call in diff.tool_calls:
+            calls.add_row(
+                escape(f"{call.tool_name} #{call.ordinal}"),
+                call.kind,
+                escape(_tool_call_result(call)),
+                escape(_argument_changes(call)),
+            )
+        _print_wide(calls)
+
+    state_changes: list[ChannelChange] = [*diff.messages, *diff.channels]
+    if state_changes:
+        states = Table(title="Final state changes", box=box.ASCII)
+        states.add_column("Channel", style="cyan", no_wrap=True)
+        states.add_column("Change", no_wrap=True)
+        states.add_column("Before", overflow="fold")
+        states.add_column("After", overflow="fold")
+        for state in state_changes:
+            states.add_row(
+                escape(state.channel),
+                state.kind,
+                escape(state.before if state.before is not None else "-"),
+                escape(state.after if state.after is not None else "-"),
+            )
+        console.print(states)
+
+
+def _replay_with_graph(
+    db: str,
+    thread_id: str,
+    checkpoint_id: str,
+    spec: str,
+    update: dict[str, Any] | None,
+    set_messages: dict[int, str] | None,
+    as_node: str | None,
+) -> None:
+    """Re-run the user's graph from a checkpoint in a sandbox and print the diff (AC-110)."""
+    source_saver: RelateSaver | None = None
+    try:
+        source_saver = _open_inspection_saver(db)
+        factory = load_graph_factory(spec)
+        result = replay_from_checkpoint(
+            source_saver,
+            thread_id,
+            checkpoint_id,
+            factory,
+            update=update,
+            as_node=as_node,
+            set_messages=set_messages,
+        )
+        console.print("[bold green]Graph replay completed in an isolated sandbox.[/bold green]")
+        console.print("[bold cyan]Replay result[/bold cyan]")
+        console.print(f"  Source Thread:        [cyan]{escape(thread_id)}[/cyan]")
+        console.print(f"  Fork checkpoint:      [cyan]{result.fork_checkpoint_id}[/cyan]")
+        console.print(f"  Updated checkpoint:   [cyan]{result.updated_checkpoint_id}[/cyan]")
+        console.print(f"  New final:            [cyan]{result.final_checkpoint_id}[/cyan]")
+        console.print(f"  Recorded final:       [cyan]{result.recorded_checkpoint_id}[/cyan]")
+        stopped = "yes" if result.interrupted else "no"
+        console.print(f"  Stopped at interrupt: [bold yellow]{stopped}[/bold yellow]")
+        console.print(
+            "  Isolation:            Isolated :memory: sandbox (source database unchanged)"
+        )
+        _print_diff(result.diff)
+    except typer.Exit:
+        raise
+    except GraphSpecError as exc:
+        raise _fail(str(exc)) from exc
+    except ValueError as exc:
+        raise _fail(str(exc)) from exc
+    except CheckpointNotFoundError as exc:
+        raise _fail(str(exc)) from exc
+    except RelateCheckpointError as exc:
+        raise _fail(f"Database error: {exc}") from exc
+    except InvalidUpdateError as exc:
+        err_console.print(f"[bold red]Error:[/bold red] {escape(str(exc))}")
+        err_console.print(
+            "Hint: pass --as-node with the node that should be treated as the writer."
+        )
+        raise typer.Exit(code=1) from exc
+    except Exception as exc:
+        raise _fail(f"replay failed: {type(exc).__name__}: {exc}") from exc
+    finally:
+        if source_saver is not None:
+            source_saver.close()
 
 
 @app.command(name="tree", help="Visualize execution DAG for a thread.")
@@ -143,6 +322,29 @@ def replay(
         "-b",
         help="Optional new branch thread identifier for the replay lineage.",
     ),
+    graph: str | None = typer.Option(
+        None,
+        "--graph",
+        "-g",
+        help="Graph to re-run from the checkpoint, as path/to/file.py:factory or module:factory.",
+    ),
+    update: str | None = typer.Option(
+        None,
+        "--update",
+        help="JSON object of channel values to write before re-running (needs --graph).",
+    ),
+    set_message: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--set-message",
+            help="Replace message INDEX with TEXT, as INDEX=TEXT; repeatable (needs --graph).",
+        ),
+    ] = None,
+    as_node: str | None = typer.Option(
+        None,
+        "--as-node",
+        help="Node to treat as the writer of the update (needs --graph).",
+    ),
 ) -> None:
     """Fork an execution thread at a target checkpoint into an isolated in-memory database."""
     if not thread_id.strip():
@@ -159,6 +361,28 @@ def replay(
     if db != ":memory:" and not os.path.exists(db):
         err_console.print(f"[bold red]Error:[/bold red] Database file not found: {db}")
         raise typer.Exit(code=1)
+
+    if graph is None:
+        edit_flags = [
+            flag
+            for flag, given in (
+                ("--update", update is not None),
+                ("--set-message", bool(set_message)),
+                ("--as-node", as_node is not None),
+            )
+            if given
+        ]
+        if edit_flags:
+            raise _fail(f"{' and '.join(edit_flags)} need --graph to say which graph to re-run.")
+    else:
+        if branch:
+            raise _fail("--branch cannot be combined with --graph.")
+        update_value = _parse_update(update) if update is not None else None
+        set_messages = _parse_set_messages(set_message) if set_message else None
+        _replay_with_graph(
+            db, thread_id, effective_checkpoint_id, graph, update_value, set_messages, as_node
+        )
+        return
 
     source_saver: RelateSaver | None = None
     sandboxed_saver: RelateSaver | None = None
@@ -184,6 +408,9 @@ def replay(
         console.print(f"  Checkpoint ID:    [cyan]{effective_checkpoint_id}[/cyan]")
         console.print(f"  Replay Step:      [bold yellow]{step}[/bold yellow]")
         console.print("  Isolation:        Isolated :memory: sandbox (source database unchanged)")
+        console.print(
+            "Hint: add --graph path/to/file.py:factory to re-run the graph from this checkpoint."
+        )
     except typer.Exit:
         raise
     except CheckpointNotFoundError as exc:

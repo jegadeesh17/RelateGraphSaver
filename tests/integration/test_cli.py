@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -24,6 +25,13 @@ from typer.testing import CliRunner
 
 from langgraph_checkpoint_relate.cli import app
 from langgraph_checkpoint_relate.saver import RelateSaver
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEMO_STORE = REPO_ROOT / "examples" / "data" / "demo.rl"
+DEMO_THREAD = "demo-tool-fail"
+GRAPH_SPEC = "examples/tool_agent.py:create_tool_agent_graph"
+OK_URL = "https://example.org/report"
+UNREACHABLE_URL = "https://unreachable.invalid/report"
 
 
 @pytest.fixture
@@ -734,7 +742,7 @@ def _console_script() -> str | None:
     return shutil.which("relate-dag", path=scripts_dir) or shutil.which("relate-dag")
 
 
-def _run_cli_cp1252(args: list[str]) -> subprocess.CompletedProcess[bytes]:
+def _run_cli_cp1252(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[bytes]:
     """Run relate-dag in a subprocess whose stdout and stderr are cp1252 pipes.
 
     Uses the installed console script, which calls the Typer app directly; falls back to
@@ -748,7 +756,7 @@ def _run_cli_cp1252(args: list[str]) -> subprocess.CompletedProcess[bytes]:
         if script
         else [sys.executable, "-m", "langgraph_checkpoint_relate.cli", *args]
     )
-    return subprocess.run(command, capture_output=True, env=env, timeout=120, check=False)
+    return subprocess.run(command, capture_output=True, env=env, timeout=120, check=False, cwd=cwd)
 
 
 class TestCliCp1252Output:
@@ -844,3 +852,332 @@ class TestCliCp1252Output:
             replay_result = runner.invoke(app, ["replay", thread_id, cid, "--db", db_file])
             assert replay_result.exit_code == 0
             assert cid in replay_result.output
+
+
+_STEP_ID = re.compile(r"Step (-?\d+): [^()]*\(id:\s*([0-9a-f-]{36})\)")
+
+
+@pytest.fixture
+def demo_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[str, dict[int, str]]:
+    """A copy of the committed demo store, plus its step -> checkpoint id map from ``tree``.
+
+    Runs from the repository root so the relative graph spec resolves. Ids come from the
+    ``tree`` output, not from constants, because the committed store is rebuilt from time to time.
+    """
+    monkeypatch.chdir(REPO_ROOT)
+    db_file = str(tmp_path / "demo_copy.rl")
+    shutil.copy(DEMO_STORE, db_file)
+    result = CliRunner().invoke(app, ["tree", DEMO_THREAD, "--db", db_file])
+    assert result.exit_code == 0, result.output
+    steps = {int(step): cid for step, cid in _STEP_ID.findall(result.output)}
+    assert {-1, 0} <= steps.keys()
+    return db_file, steps
+
+
+def _replay_args(db_file: str, checkpoint_id: str, *extra: str) -> list[str]:
+    return ["replay", DEMO_THREAD, checkpoint_id, *extra, "--db", db_file]
+
+
+def _squash(text: str) -> str:
+    """Collapse whitespace so assertions do not depend on terminal line wrapping."""
+    return " ".join(text.split())
+
+
+_EDIT_ARGS = ["--graph", GRAPH_SPEC, "--set-message", f"0={OK_URL}"]
+
+
+class TestCliReplayGraph:
+    """``replay --graph`` re-runs the user's graph in a sandbox and prints the diff."""
+
+    def test_without_graph_keeps_summary_and_adds_hint_ac_109(
+        self, runner: CliRunner, seeded_db: tuple[str, str, list[str]]
+    ) -> None:
+        """AC-109: the six summary lines stay and one hint line names --graph."""
+        db_file, thread_id, checkpoint_ids = seeded_db
+        result = runner.invoke(app, ["replay", thread_id, checkpoint_ids[1], "--db", db_file])
+        assert result.exit_code == 0
+        # Compare whitespace-squashed text: the Isolation line wraps on an 80-column terminal.
+        text = _squash(result.output)
+        expected_start = _squash(
+            "Sandboxed replay initialized successfully. "
+            f"Source Thread: {thread_id} Replay Thread: {thread_id} "
+            f"Checkpoint ID: {checkpoint_ids[1]} Replay Step: 2 "
+            "Isolation: Isolated :memory: sandbox (source database unchanged) "
+        )
+        assert text.startswith(expected_start)
+        hint = text[len(expected_start) :].strip()
+        assert hint.startswith("Hint:")
+        assert "--graph" in hint
+        assert text.count("Hint:") == 1
+
+    def test_edited_replay_prints_result_and_tables_ac_110(
+        self, runner: CliRunner, demo_copy: tuple[str, dict[int, str]]
+    ) -> None:
+        """AC-110: the edited replay shows the result, the fixed tool call and the state diff."""
+        db_file, steps = demo_copy
+        result = runner.invoke(app, _replay_args(db_file, steps[0], *_EDIT_ARGS))
+        assert result.exit_code == 0, result.output
+        output = result.output
+        assert "Graph replay completed" in output
+        assert "Replay result" in output
+        assert steps[0] in output
+        assert "New final:" in output
+        assert "Recorded final:" in output
+        assert "Stopped at interrupt: no" in output
+        assert "Tool calls" in output
+        assert "fetch_source #1" in output
+        assert "error -> ok" in output
+        assert f"url: {UNREACHABLE_URL} -> {OK_URL}" in output
+        assert "Final state changes" in output
+        assert "messages[0]" in output
+        assert "No tool calls or state changed." not in output
+        assert output.isascii()
+
+    def test_committed_demo_store_command_leaves_it_untouched_ac_110(
+        self, runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-110: the documented command works on the committed store without changing it."""
+        monkeypatch.chdir(REPO_ROOT)
+        db_arg = "examples/data/demo.rl"
+        before = _file_state(str(DEMO_STORE))
+        tree = runner.invoke(app, ["tree", DEMO_THREAD, "--db", db_arg])
+        step0 = {int(step): cid for step, cid in _STEP_ID.findall(tree.output)}[0]
+
+        result = runner.invoke(
+            app,
+            ["replay", DEMO_THREAD, step0, "--graph", GRAPH_SPEC]
+            + ["--set-message", f"0={OK_URL}", "--db", db_arg],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "fetch_source #1" in result.output
+        assert "error -> ok" in result.output
+        assert _file_state(str(DEMO_STORE)) == before
+
+    def test_set_message_repeats_and_short_graph_flag_works_ac_110(
+        self, runner: CliRunner, demo_copy: tuple[str, dict[int, str]]
+    ) -> None:
+        """AC-110, AC-114: --set-message may repeat and -g is accepted before --db."""
+        db_file, steps = demo_copy
+        result = runner.invoke(
+            app,
+            _replay_args(
+                db_file,
+                steps[0],
+                "-g",
+                GRAPH_SPEC,
+                "--set-message",
+                f"0={OK_URL}",
+                "--set-message",
+                f"0={OK_URL}",
+            ),
+        )
+        assert result.exit_code == 0, result.output
+        assert "error -> ok" in result.output
+
+    def test_unedited_replay_reports_no_changes_ac_111(
+        self, runner: CliRunner, demo_copy: tuple[str, dict[int, str]]
+    ) -> None:
+        """AC-111: an unchanged graph and no edits give an empty diff."""
+        db_file, steps = demo_copy
+        result = runner.invoke(app, _replay_args(db_file, steps[0], "--graph", GRAPH_SPEC))
+        assert result.exit_code == 0, result.output
+        assert "Replay result" in result.output
+        assert "No tool calls or state changed." in result.output
+        assert "Tool calls" not in result.output
+
+    @pytest.mark.parametrize(
+        ("flag", "value"),
+        [("--update", '{"a": 1}'), ("--set-message", "0=x"), ("--as-node", "agent")],
+    )
+    def test_edit_flag_without_graph_is_rejected_ac_112(
+        self, runner: CliRunner, demo_copy: tuple[str, dict[int, str]], flag: str, value: str
+    ) -> None:
+        """AC-112: an edit flag without --graph exits 1 with an Error line naming --graph."""
+        db_file, steps = demo_copy
+        result = runner.invoke(app, _replay_args(db_file, steps[0], flag, value))
+        assert result.exit_code == 1
+        assert "Error:" in result.output
+        assert "--graph" in result.output
+        assert flag in result.output
+        assert "Sandboxed replay initialized" not in result.output
+
+    @pytest.mark.parametrize("bad_update", ["{not json", "[1, 2]", '"text"', "42", ""])
+    def test_update_must_be_a_json_object_ac_113(
+        self, runner: CliRunner, demo_copy: tuple[str, dict[int, str]], bad_update: str
+    ) -> None:
+        """AC-113: invalid JSON or a non-object value exits 1 with an Error line."""
+        db_file, steps = demo_copy
+        result = runner.invoke(
+            app,
+            _replay_args(db_file, steps[0], "--graph", GRAPH_SPEC, "--update", bad_update),
+        )
+        assert result.exit_code == 1
+        assert "Error:" in result.output
+        assert "--update" in result.output
+        assert "Traceback" not in result.output
+
+    @pytest.mark.parametrize(
+        "bad_value",
+        ["no-equals-sign", "first=x", "-1=x", "1.5=x", "=x", "99=out of range"],
+    )
+    def test_set_message_forms_and_index_are_validated_ac_114(
+        self, runner: CliRunner, demo_copy: tuple[str, dict[int, str]], bad_value: str
+    ) -> None:
+        """AC-114: a malformed or out-of-range --set-message exits 1 with an Error line."""
+        db_file, steps = demo_copy
+        result = runner.invoke(
+            app,
+            _replay_args(db_file, steps[0], "--graph", GRAPH_SPEC, "--set-message", bad_value),
+        )
+        assert result.exit_code == 1
+        assert "Error:" in result.output
+        assert "Traceback" not in result.output
+
+    def test_set_message_splits_on_first_equals_ac_114(
+        self, runner: CliRunner, demo_copy: tuple[str, dict[int, str]]
+    ) -> None:
+        """AC-114: only the first '=' separates the index, so the text may contain '='."""
+        db_file, steps = demo_copy
+        text = "https://example.org/report?a=b"
+        result = runner.invoke(
+            app,
+            _replay_args(db_file, steps[0], "--graph", GRAPH_SPEC, "--set-message", f"0={text}"),
+        )
+        assert result.exit_code == 0, result.output
+        assert text in _squash(result.output)
+
+    @pytest.mark.parametrize(
+        "spec", ["nope.py:missing", "no-colon-spec", "examples/tool_agent.py:not_there"]
+    )
+    def test_bad_graph_spec_names_the_spec_without_traceback_ac_115(
+        self, runner: CliRunner, demo_copy: tuple[str, dict[int, str]], spec: str
+    ) -> None:
+        """AC-115: a spec that fails to load exits 1, repeats the spec and prints no traceback."""
+        db_file, steps = demo_copy
+        result = runner.invoke(app, _replay_args(db_file, steps[0], "--graph", spec))
+        assert result.exit_code == 1
+        assert "Error:" in result.output
+        assert spec in _squash(result.output)
+        assert "Traceback" not in result.output
+
+    def test_as_node_rejected_by_the_graph_prints_hint_ac_116(
+        self, runner: CliRunner, demo_copy: tuple[str, dict[int, str]]
+    ) -> None:
+        """AC-116: an --as-node the graph rejects exits 1 with the --as-node hint."""
+        db_file, steps = demo_copy
+        result = runner.invoke(
+            app,
+            _replay_args(db_file, steps[0], *_EDIT_ARGS, "--as-node", "no_such_node"),
+        )
+        assert result.exit_code == 1
+        assert "Error:" in result.output
+        assert "Hint: pass --as-node with the node that should be treated as the writer." in (
+            _squash(result.output)
+        )
+        assert "Traceback" not in result.output
+
+    def test_graph_code_failure_is_reported_without_traceback(
+        self, runner: CliRunner, demo_copy: tuple[str, dict[int, str]], tmp_path: Path
+    ) -> None:
+        """Any other exception from user graph code is reported as 'replay failed: <type>: <msg>'."""
+        db_file, steps = demo_copy
+        graph_file = tmp_path / "broken_graph.py"
+        graph_file.write_text(
+            "def make(checkpointer=None):\n    raise RuntimeError('factory exploded')\n",
+            encoding="utf-8",
+        )
+        spec = f"{graph_file}:make"
+        result = runner.invoke(app, _replay_args(db_file, steps[0], "--graph", spec))
+        assert result.exit_code == 1
+        assert "Error: replay failed: RuntimeError: factory exploded" in _squash(result.output)
+        assert "Traceback" not in result.output
+
+    def test_branch_with_graph_is_rejected(
+        self, runner: CliRunner, demo_copy: tuple[str, dict[int, str]]
+    ) -> None:
+        """--branch cannot be combined with --graph."""
+        db_file, steps = demo_copy
+        result = runner.invoke(
+            app, _replay_args(db_file, steps[0], "--graph", GRAPH_SPEC, "--branch", "what-if")
+        )
+        assert result.exit_code == 1
+        assert "Error:" in result.output
+        assert "--branch" in result.output
+
+    def test_unknown_checkpoint_lists_candidates_with_graph(
+        self, runner: CliRunner, demo_copy: tuple[str, dict[int, str]]
+    ) -> None:
+        """An unknown checkpoint keeps the existing error text when --graph is given."""
+        db_file, _ = demo_copy
+        result = runner.invoke(app, _replay_args(db_file, "no-such-checkpoint", *_EDIT_ARGS))
+        assert result.exit_code == 1
+        assert "Error:" in result.output
+        assert "Available checkpoints:" in result.output
+
+    def test_step_without_messages_suggests_next_checkpoint_ac_151(
+        self, runner: CliRunner, demo_copy: tuple[str, dict[int, str]]
+    ) -> None:
+        """AC-151: editing a message at the input checkpoint points at the step 0 checkpoint."""
+        db_file, steps = demo_copy
+        before = _file_state(db_file)
+        result = runner.invoke(app, _replay_args(db_file, steps[-1], *_EDIT_ARGS))
+        assert result.exit_code == 1
+        squashed = _squash(result.output)
+        assert "Error:" in squashed
+        assert "no messages yet" in squashed
+        assert "next (step 0) checkpoint" in squashed
+        assert steps[0] in squashed
+        assert _file_state(db_file) == before
+
+    @pytest.mark.parametrize(
+        ("variant", "expected_exit"),
+        [
+            ("summary", 0),
+            ("graph_edit", 0),
+            ("graph_unedited", 0),
+            ("bad_spec", 1),
+            ("bad_as_node", 1),
+            ("bad_update", 1),
+            ("step_without_messages", 1),
+            ("unknown_checkpoint", 1),
+        ],
+    )
+    def test_store_and_directory_are_unchanged_ac_117(
+        self,
+        runner: CliRunner,
+        demo_copy: tuple[str, dict[int, str]],
+        variant: str,
+        expected_exit: int,
+    ) -> None:
+        """AC-117: sha256 and directory listing are unchanged, succeeding or failing."""
+        db_file, steps = demo_copy
+        variants: dict[str, list[str]] = {
+            "summary": _replay_args(db_file, steps[0]),
+            "graph_edit": _replay_args(db_file, steps[0], *_EDIT_ARGS),
+            "graph_unedited": _replay_args(db_file, steps[0], "--graph", GRAPH_SPEC),
+            "bad_spec": _replay_args(db_file, steps[0], "--graph", "nope.py:missing"),
+            "bad_as_node": _replay_args(
+                db_file, steps[0], *_EDIT_ARGS, "--as-node", "no_such_node"
+            ),
+            "bad_update": _replay_args(db_file, steps[0], "-g", GRAPH_SPEC, "--update", "[1]"),
+            "step_without_messages": _replay_args(db_file, steps[-1], *_EDIT_ARGS),
+            "unknown_checkpoint": _replay_args(db_file, "no-such-checkpoint", *_EDIT_ARGS),
+        }
+        before = _file_state(db_file)
+        result = runner.invoke(app, variants[variant])
+        assert result.exit_code == expected_exit, result.output
+        assert _file_state(db_file) == before
+
+    def test_edited_replay_on_cp1252_stdout_ac_118(
+        self, demo_copy: tuple[str, dict[int, str]]
+    ) -> None:
+        """AC-118: the AC-110 command exits 0 on a cp1252 pipe and prints 'error -> ok'."""
+        db_file, steps = demo_copy
+        proc = _run_cli_cp1252(_replay_args(db_file, steps[0], *_EDIT_ARGS), cwd=REPO_ROOT)
+        stderr = proc.stderr.decode("cp1252")
+        assert proc.returncode == 0, stderr
+        assert "UnicodeEncodeError" not in stderr
+        stdout = proc.stdout.decode("cp1252")
+        assert "error -> ok" in stdout
+        assert "fetch_source #1" in stdout
