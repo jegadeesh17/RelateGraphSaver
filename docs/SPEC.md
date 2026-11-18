@@ -349,7 +349,7 @@ AC-95: Given a graph spec `package.module:attr` for an importable module, When `
 AC-96: Given an attribute that is either a factory accepting `checkpointer=` or an uncompiled `StateGraph`, When it is passed to `replay_from_checkpoint`, Then the replay compiles it against the sandbox saver and completes in both cases.
 AC-97: Given a spec with no `:`, a missing file or module, a missing attribute, or an attribute that is neither callable nor a `StateGraph`, When `load_graph_factory(spec)` is called, Then a `ValueError` (or subclass) is raised whose message contains the spec.
 AC-98: Given the recorded failing tool-agent thread, When `replay_from_checkpoint` runs from its first checkpoint with no update and no message edit, Then the returned `ReplayResult.diff` has no tool-call changes, no message changes and no channel changes.
-AC-99: Given the recorded failing tool-agent thread, When `replay_from_checkpoint` runs from its first checkpoint with `set_messages={0: <working URL>}`, Then the diff reports `fetch_source` call 1 changing from error to ok with its `url` argument before and after, and the final answer message differs from the recorded one.
+AC-99: Given the recorded failing tool-agent thread, When `replay_from_checkpoint` runs from its step 0 checkpoint (the first checkpoint whose state holds the human message) with `set_messages={0: <working URL>}`, Then the diff reports `fetch_source` call 1 changing from error to ok with its `url` argument before and after, and the final answer message differs from the recorded one.
 AC-100: Given a replay with `set_messages={0: <text>}`, When the replayed run finishes, Then its message list holds exactly one human message at index 0, with the new text, and no copy of the original human message.
 AC-101: Given `update=<dict>` and `as_node=<node>`, When `replay_from_checkpoint` runs, Then `updated_checkpoint_id` differs from `fork_checkpoint_id` and the replayed run continues from the updated checkpoint.
 AC-102: Given a research-agent thread and a checkpoint before its human-review interrupt, When `replay_from_checkpoint` runs, Then it returns normally with `interrupted=True` and a diff covering the steps that ran.
@@ -362,7 +362,7 @@ AC-108: Given the package, When `replay_from_checkpoint`, `diff_runs`, `ReplayRe
 
 #### Replay CLI
 AC-109: Given a stored thread, When `relate-dag replay <thread> <checkpoint_id>` is run without `--graph`, Then it exits with code 0, prints the same six summary lines as before, and prints one further line that mentions `--graph`.
-AC-110: Given the committed store, When `relate-dag replay demo-tool-fail <first checkpoint id> --graph examples/tool_agent.py:create_tool_agent_graph --set-message 0=https://example.org/report --db examples/data/demo.rl` is run, Then it exits with code 0 and prints a success line, a "Replay result" section with the new and recorded final checkpoints, a tool-call table containing `fetch_source #1` and `error -> ok` with the argument before and after, and a final state changes table.
+AC-110: Given the committed store, When `relate-dag replay demo-tool-fail <step 0 checkpoint id> --graph examples/tool_agent.py:create_tool_agent_graph --set-message 0=https://example.org/report --db examples/data/demo.rl` is run, Then it exits with code 0 and prints a success line, a "Replay result" section with the new and recorded final checkpoints, a tool-call table containing `fetch_source #1` and `error -> ok` with the argument before and after, and a final state changes table.
 AC-111: Given `--graph` and no edit flags, When `relate-dag replay` is run on an unchanged graph, Then it exits with code 0 and states that no tool calls or state changed.
 AC-112: Given any of `--update`, `--set-message` or `--as-node` without `--graph`, When `relate-dag replay` is run, Then it exits with code 1 and prints an `Error:` line naming `--graph`.
 AC-113: Given `--update` whose value is not valid JSON or not a JSON object, When `relate-dag replay --graph ...` is run, Then it exits with code 1 and prints an `Error:` line.
@@ -415,10 +415,11 @@ AC-143: Given `pyproject.toml`, When the `relate-db` requirement is read, Then i
 AC-144: Given `README.md`, When it is read, Then it contains no `pip install langgraph-checkpoint-relate` line and contains a source install line `pip install -e ".[dev]"`.
 AC-145: Given `README.md`, When the tagline under the title is read, Then it names a failing agent step and finding its cause from one file offline, and contains none of "WAL", "DAG" or "graph-native".
 AC-146: Given `README.md`, When the "Why not X?" section is read, Then its table has rows for Neo4jSaver, SqliteSaver, LangGraph built-in time travel and tracing tools, and the Neo4jSaver row states that it needs a Neo4j server.
-AC-147: Given `README.md`, When its explore section is read, Then it holds exactly four `relate-dag` commands: `tree demo-real-api`, `forensics trace-error demo-real-api`, `forensics failures`, and `replay demo-tool-fail <id> --graph examples/tool_agent.py:create_tool_agent_graph --set-message 0=https://example.org/report --db examples/data/demo.rl`, with every flag before `--db`.
+AC-147: Given `README.md`, When its explore section is read, Then it holds exactly four `relate-dag` commands: `tree demo-real-api`, `forensics trace-error demo-real-api`, `forensics failures`, and `replay demo-tool-fail <step 0 checkpoint id> --graph examples/tool_agent.py:create_tool_agent_graph --set-message 0=https://example.org/report --db examples/data/demo.rl`, with every flag before `--db`.
 AC-148: Given a fresh clone after a source install, When the four explore commands are run in order, Then each exits with code 0, the replay prints `fetch_source #1` and `error -> ok`, and `git status` shows no change.
-AC-149: Given the README replay command, When its checkpoint id is compared with `relate-dag tree demo-tool-fail` on the committed store, Then it is the id of that thread's first checkpoint.
+AC-149: Given the README replay command, When its checkpoint id is compared with `relate-dag tree demo-tool-fail` on the committed store, Then it is the id of that thread's step 0 checkpoint (the second checkpoint in the tree, the first whose state holds the human message), not the step -1 input checkpoint.
 AC-150: Given `README.md`, When "Where the data lives" is read, Then it names all four thread ids of the committed store.
+AC-151: Given a checkpoint whose state holds no messages yet (such as the step -1 input checkpoint), When `relate-dag replay <thread> <checkpoint id> --graph SPEC --set-message 0=TEXT` is run, or `replay_from_checkpoint(..., set_messages={0: TEXT})` is called, Then the CLI exits with code 1 and prints an `Error:` line (the API raises `ValueError` with the same message) saying the checkpoint holds no messages yet and suggesting the next (step 0) checkpoint, and the source store is unchanged.
 
 ### 3.7 Regression Criteria
 
@@ -518,7 +519,7 @@ Judge impact non-goals:
 
 12. **Judge impact: Editing the first human message:**
     - *Question:* Can a sandbox fork replace the first human message through `update_state` with `as_node="__start__"`?
-    - *Assumption:* Yes, when the new message reuses the original message id (messages are replaced by id; a new id would append a duplicate, AC-100). If that fails, the edit is applied at the step after the first and the README command is adjusted; AC-110 and AC-147 change with it.
+    - *Answer (verified):* Yes, at the step 0 checkpoint, when the new message reuses the original message id (messages are replaced by id; a new id would append a duplicate, AC-100). The step -1 checkpoint holds no messages yet, so the set-message path forks at step 0 (AC-99, AC-110, AC-147, AC-149) and step -1 is an input error (AC-151).
 
 13. **Judge impact: Graph spec errors:**
     - *Question:* Which exception does `load_graph_factory` raise for a bad spec?
