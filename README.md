@@ -2,6 +2,17 @@
 
 Embedded graph-native checkpoint and time-travel persistence engine for LangGraph, powered by Relate by Neo4j.
 
+## Use case
+
+An agent fails in the middle of a run, and you need to know which step or tool call caused it. A plain message log shows what the agent said, not how its state moved from one step to the next. RelateGraphSaver stores every LangGraph checkpoint as a node in a graph, so the question becomes a path query.
+
+It is for engineers building LangGraph agents who want durable checkpoints, a readable execution history and a way to replay a past step without touching the real run. The relationships that matter:
+
+- `NEXT` links each checkpoint to the one that followed it, so the lineage of a run can be walked backwards from a failure.
+- `HAS_WRITE` links a checkpoint to the writes (channel updates and pending writes) made at that step.
+- `INVOKED` links a checkpoint to the tool calls made there, so a failure traces to a named tool.
+- `FORKED_TO` marks a branch created by a replay or a fork, so alternative histories stay separate from the original.
+
 ## Features
 
 - **Embedded Single-File WAL Persistence:** Persists checkpoints, intermediate channel updates, and execution metadata into a zero-configuration `.rl` database file with atomic Write-Ahead Logging.
@@ -25,14 +36,63 @@ Install from source:
 ```bash
 git clone https://github.com/jegadeesh17/RelateGraphSaver.git
 cd RelateGraphSaver
+python -m venv .venv
+source .venv/bin/activate        # Windows PowerShell: .venv\Scripts\Activate.ps1
+                                 # Windows Git Bash:   source .venv/Scripts/activate
 pip install -e ".[dev]"
 ```
+
+This installs the `relate-dag` command and the example agents' dependencies. No API key, server or container is needed.
 
 Or install via `pip`:
 
 ```bash
 pip install langgraph-checkpoint-relate
 ```
+
+### Explore the demo store
+
+The repository commits a populated store, `examples/data/demo.rl`, so you can see the graph before running any agent. These commands only read it:
+
+```bash
+# The multi-agent run as a tree: steps, pending writes and the human-review pause
+relate-dag tree demo-research --db examples/data/demo.rl
+
+# Trace the failed tool call back to its root cause
+relate-dag forensics trace-error demo-tool-fail --db examples/data/demo.rl
+
+# The same agent, succeeding: no error to trace
+relate-dag forensics trace-error demo-tool-ok --db examples/data/demo.rl
+
+# Fork the history at the human-review pause (step 2) into an in-memory sandbox
+relate-dag replay demo-research 1f1e336a-4009-673d-8002-559ce0d73f21 --db examples/data/demo.rl
+```
+
+`trace-error` on `demo-tool-fail` ends in the tool that failed:
+
+```text
++-------------------- Root Cause Analysis: demo-tool-fail --------------------+
+| Error Checkpoint ID: 1f1e336a-3b1c-6df0-8000-029fd4dcbd05                   |
+| Error Message:       Error: RuntimeError('upstream unreachable: could not   |
+| fetch https://unreachable.invalid/report')                                  |
+| Root Tool Call ID:   call_57c75bb4c00a464faa16d9aca2bd58ff                  |
+| Root Tool Name:      fetch_source                                           |
+| ...                                                                         |
+| Causal Path Length:  1                                                      |
+```
+
+`replay` forks the history up to the chosen checkpoint:
+
+```text
+Sandboxed replay initialized successfully.
+  Source Thread:    demo-research
+  Replay Thread:    demo-research
+  Checkpoint ID:    1f1e336a-4009-673d-8002-559ce0d73f21
+  Replay Step:      2
+  Isolation:        Isolated :memory: sandbox (source database unchanged)
+```
+
+The tree output also shows the checkpoint ids on that thread, so you can replay any other step by passing its id.
 
 ## Usage
 
@@ -119,6 +179,15 @@ Pass `--no-fail` to let the tool succeed.
 
 ## How we use Relate, and why
 
+Mode: single file
+
+Relate can run in memory, as a directory, or as a single file. We chose a single file because the whole execution history of one agent is then one portable `.rl` file: there is no server to run, and you can attach the file to a bug report and have someone else inspect it with `relate-dag`. In memory would lose the history when the process stops, and a directory would be several files to copy and keep together.
+
+What the graph models:
+
+- Nodes: `:Thread` (one agent conversation), `:Checkpoint` (one saved step of the graph state), `:Write` (a pending or channel write made at a step) and `:ToolCall` (a tool invocation and its outcome).
+- Relationships: `NEXT` (a checkpoint to its successor), `HAS_WRITE` (a checkpoint to its writes), `INVOKED` (a checkpoint to its tool calls) and `FORKED_TO` (a checkpoint to the checkpoint a replay or fork branched into).
+
 Relate is an embedded graph database from Neo4j. We use these capabilities, and nothing beyond them:
 
 - **Embedded single-file database.** Each saver opens one `.rl` file in-process. Checkpoints need no server, container or credentials, and the whole execution history of an agent is one file you can copy, attach to a bug report or delete (ADR-0001).
@@ -127,10 +196,27 @@ Relate is an embedded graph database from Neo4j. We use these capabilities, and 
 - **Connected schema.** `:Thread`, `:Checkpoint`, `:Write` and `:ToolCall` nodes are linked by `NEXT` (the causal order), `FORKED_TO` (a branch created by replay or a fork), `HAS_WRITE` (pending and channel writes) and `INVOKED` (a tool call made at a checkpoint). Forks and tool calls are edges in the data, so the terminal tree and the forensics reports read them directly instead of reconstructing them.
 - **Uniqueness constraints and indexes.** Constraints on thread, checkpoint, write and tool-call identifiers make writes idempotent and reject duplicates; indexes on thread, namespace, step and state hash keep lookups by thread and by checkpoint from scanning the graph.
 - **`:memory:` databases.** `fork_in_memory()` copies the history up to a chosen checkpoint into a throwaway `:memory:` database, so you can replay and experiment without touching the production file and without cleanup afterwards (ADR-0004).
+- **Read-only opening.** `relate-dag tree`, `forensics` and `replay` open the file read-only, so inspecting a store never changes it. The committed demo store stays byte-identical however often you explore it (ADR-0015).
 
 ### Limits
 
 RelateSaver is a single-process engine. Use one `RelateSaver` per process and per database file. Inside that process it is safe to share across threads and async tasks, because all writes are serialized through one writer thread (ADR-0002), but a second process opening the same file is not supported. For multi-worker or multi-pod deployments, use PostgresSaver (`langgraph-checkpoint-postgres`) instead.
+
+## Where the data lives
+
+The persistent store in this repository is `examples/data/demo.rl`, a single Relate file with three threads:
+
+- `demo-tool-fail`: a tool agent whose `fetch_source` call fails.
+- `demo-tool-ok`: the same agent, succeeding.
+- `demo-research`: a multi-agent research run (Planner, Researcher, Human Review, Critic) with a human review pause.
+
+Rebuild it, offline and without an API key, with:
+
+```bash
+python examples/build_demo_store.py
+```
+
+The demo agents write to `checkpoints.rl` (`examples/research_agent.py`) or `tool_agent.rl` (`examples/tool_agent.py`) unless you pass `--db`; those files are not committed. Only `examples/data/demo.rl` is.
 
 ## Benchmark
 
