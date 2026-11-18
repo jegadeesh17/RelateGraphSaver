@@ -126,7 +126,7 @@ class TestCheckpointNode:
             thread_id="th-001",
             step=0,
             checkpoint_blob=byte_list,  # type: ignore[arg-type]
-            metadata_blob=bytearray(b"meta"),
+            metadata_blob=bytearray(b"meta"),  # type: ignore[arg-type]
             state_hash="hash123",
         )
         assert isinstance(node.checkpoint_blob, bytes)
@@ -393,6 +393,23 @@ class TestForensicReports:
         with pytest.raises(ValueError, match="error_checkpoint_id must be a non-empty string"):
             RootCauseReport(thread_id="th-1", error_checkpoint_id="", error_message="msg")
 
+    def test_root_cause_report_root_tool_name_defaults_to_none_ac_45(self) -> None:
+        """AC-45: root_tool_name is optional and last, so existing construction is unchanged."""
+        keyword = RootCauseReport(thread_id="th-1", error_checkpoint_id="cp-1", error_message="m")
+        assert keyword.root_tool_name is None
+
+        positional = RootCauseReport("th-1", "cp-1", "m", "call-1", "w-1", 2, "summary")
+        assert positional.root_tool_call_id == "call-1"
+        assert positional.root_channel_write == "w-1"
+        assert positional.causal_path_length == 2
+        assert positional.diagnostic_summary == "summary"
+        assert positional.root_tool_name is None
+
+        named = RootCauseReport(
+            thread_id="th-1", error_checkpoint_id="cp-1", error_message="m", root_tool_name="search"
+        )
+        assert named.root_tool_name == "search"
+
 
 class TestSchemaDDLAndConstraints:
     """Test suite for Cypher schema DDL statements and initialize_schema function."""
@@ -466,24 +483,48 @@ class TestSchemaDDLAndConstraints:
         initialize_schema(conn)
 
         # 1. Thread constraint
-        conn.execute("CREATE (:Thread {thread_id: $thread_id, created_at: $created_at})", {"thread_id": "t1", "created_at": "2026-11-12T00:00:00Z"})
+        conn.execute(
+            "CREATE (:Thread {thread_id: $thread_id, created_at: $created_at})",
+            {"thread_id": "t1", "created_at": "2026-11-12T00:00:00Z"},
+        )
         with pytest.raises(IntegrityError, match="uniqueness constraint violated"):
-            conn.execute("CREATE (:Thread {thread_id: $thread_id, created_at: $created_at})", {"thread_id": "t1", "created_at": "2026-11-12T01:00:00Z"})
+            conn.execute(
+                "CREATE (:Thread {thread_id: $thread_id, created_at: $created_at})",
+                {"thread_id": "t1", "created_at": "2026-11-12T01:00:00Z"},
+            )
 
         # 2. Checkpoint constraint
-        conn.execute("CREATE (:Checkpoint {checkpoint_id: $checkpoint_id, thread_id: $thread_id})", {"checkpoint_id": "cp1", "thread_id": "t1"})
+        conn.execute(
+            "CREATE (:Checkpoint {checkpoint_id: $checkpoint_id, thread_id: $thread_id})",
+            {"checkpoint_id": "cp1", "thread_id": "t1"},
+        )
         with pytest.raises(IntegrityError, match="uniqueness constraint violated"):
-            conn.execute("CREATE (:Checkpoint {checkpoint_id: $checkpoint_id, thread_id: $thread_id})", {"checkpoint_id": "cp1", "thread_id": "t1"})
+            conn.execute(
+                "CREATE (:Checkpoint {checkpoint_id: $checkpoint_id, thread_id: $thread_id})",
+                {"checkpoint_id": "cp1", "thread_id": "t1"},
+            )
 
         # 3. Write constraint
-        conn.execute("CREATE (:Write {write_id: $write_id, channel: $channel})", {"write_id": "w1", "channel": "c"})
+        conn.execute(
+            "CREATE (:Write {write_id: $write_id, channel: $channel})",
+            {"write_id": "w1", "channel": "c"},
+        )
         with pytest.raises(IntegrityError, match="uniqueness constraint violated"):
-            conn.execute("CREATE (:Write {write_id: $write_id, channel: $channel})", {"write_id": "w1", "channel": "c"})
+            conn.execute(
+                "CREATE (:Write {write_id: $write_id, channel: $channel})",
+                {"write_id": "w1", "channel": "c"},
+            )
 
         # 4. ToolCall constraint
-        conn.execute("CREATE (:ToolCall {call_id: $call_id, tool_name: $tool_name})", {"call_id": "tc1", "tool_name": "calc"})
+        conn.execute(
+            "CREATE (:ToolCall {call_id: $call_id, tool_name: $tool_name})",
+            {"call_id": "tc1", "tool_name": "calc"},
+        )
         with pytest.raises(IntegrityError, match="uniqueness constraint violated"):
-            conn.execute("CREATE (:ToolCall {call_id: $call_id, tool_name: $tool_name})", {"call_id": "tc1", "tool_name": "calc"})
+            conn.execute(
+                "CREATE (:ToolCall {call_id: $call_id, tool_name: $tool_name})",
+                {"call_id": "tc1", "tool_name": "calc"},
+            )
 
     def test_constraint_uniqueness_enforcement_real_relate(self) -> None:
         """Verify real Relate database enforces uniqueness constraints matching schema DDL."""
@@ -583,7 +624,9 @@ class TestFakeRelateDriverFeatures:
         assert InMemoryRelateDriver is FakeRelateDriver
 
         driver = FakeRelateDriver()
-        driver.connect().execute("CREATE CONSTRAINT c1 IF NOT EXISTS FOR (t:Thread) REQUIRE t.thread_id IS UNIQUE")
+        driver.connect().execute(
+            "CREATE CONSTRAINT c1 IF NOT EXISTS FOR (t:Thread) REQUIRE t.thread_id IS UNIQUE"
+        )
         assert len(driver.constraints) == 1
 
         driver.reset()

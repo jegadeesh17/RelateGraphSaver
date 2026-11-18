@@ -5,12 +5,14 @@
 from __future__ import annotations
 
 import concurrent.futures
+import logging
 import sys
 import threading
 from pathlib import Path
 from typing import Any
 
 import pytest
+import relate
 
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
 if _PROJECT_ROOT not in sys.path:
@@ -61,6 +63,7 @@ class TestProxyLifecycle:
 
     def test_proxy_startup_failure_raises_connection_error(self) -> None:
         """Verify startup exception in connection factory raises RelateConnectionError."""
+
         def broken_factory(path: str) -> Any:
             raise RuntimeError("Database driver failed to initialize")
 
@@ -93,13 +96,15 @@ class TestProxyExecution:
             res1 = proxy.execute("CREATE (t:Thread {thread_id: $tid})", {"tid": "thread-102"})
             assert isinstance(res1, list)
 
-            res2 = proxy.execute("MATCH (t:Thread {thread_id: $tid}) RETURN t.thread_id AS id", {"tid": "thread-102"})
+            res2 = proxy.execute(
+                "MATCH (t:Thread {thread_id: $tid}) RETURN t.thread_id AS id", {"tid": "thread-102"}
+            )
             assert res2 == [{"id": "thread-102"}]
 
     def test_execute_batch_atomicity_ac_08(self) -> None:
         """AC-08: Verify execute_batch executes multiple statements in a single transaction."""
         with RelateThreadProxy(db_path=":memory:") as proxy:
-            statements = [
+            statements: list[tuple[str, dict[str, Any]]] = [
                 ("CREATE (t:Thread {thread_id: 'batch-1'})", {}),
                 ("CREATE (t:Thread {thread_id: 'batch-2'})", {}),
                 ("CREATE (t:Thread {thread_id: 'batch-3'})", {}),
@@ -113,7 +118,7 @@ class TestProxyExecution:
     def test_transaction_alias_ac_08(self) -> None:
         """AC-08: Verify transaction() alias behaves identically to execute_batch()."""
         with RelateThreadProxy(db_path=":memory:") as proxy:
-            statements = [
+            statements: list[tuple[str, dict[str, Any]]] = [
                 ("CREATE (t:Thread {thread_id: 'tx-1'})", {}),
                 ("CREATE (t:Thread {thread_id: 'tx-2'})", {}),
             ]
@@ -127,7 +132,7 @@ class TestProxyExecution:
         """AC-08: Verify failed statement in transaction rolls back all statements."""
         with RelateThreadProxy(db_path=":memory:") as proxy:
             # Statement 1 succeeds, Statement 2 has syntax error
-            statements = [
+            statements: list[tuple[str, dict[str, Any]]] = [
                 ("CREATE (t:Thread {thread_id: 'rollback-item'})", {}),
                 ("INVALID CYPHER SYNTAX", {}),
             ]
@@ -160,21 +165,25 @@ class TestProxyExecution:
         with RelateThreadProxy(db_path=":memory:") as proxy:
             # Test execute dict
             exec_fut: concurrent.futures.Future[Any] = concurrent.futures.Future()
-            proxy._queue.put({
-                "type": "execute",
-                "cypher": "CREATE (t:Thread {thread_id: 'dict-1'}) RETURN t.thread_id AS id",
-                "params": {},
-                "future": exec_fut,
-            })
+            proxy._queue.put(
+                {
+                    "type": "execute",
+                    "cypher": "CREATE (t:Thread {thread_id: 'dict-1'}) RETURN t.thread_id AS id",
+                    "params": {},
+                    "future": exec_fut,
+                }
+            )
             assert exec_fut.result(timeout=5.0) == [{"id": "dict-1"}]
 
             # Test transaction dict
             tx_fut: concurrent.futures.Future[Any] = concurrent.futures.Future()
-            proxy._queue.put({
-                "type": "transaction",
-                "statements": [("CREATE (t:Thread {thread_id: 'dict-2'})", {})],
-                "future": tx_fut,
-            })
+            proxy._queue.put(
+                {
+                    "type": "transaction",
+                    "statements": [("CREATE (t:Thread {thread_id: 'dict-2'})", {})],
+                    "future": tx_fut,
+                }
+            )
             assert len(tx_fut.result(timeout=5.0)) == 1
 
             # Test is_alive dict
@@ -211,13 +220,13 @@ class TestProxyValidationAndErrors:
                 proxy.execute_batch("not a list")  # type: ignore[arg-type]
 
             with pytest.raises(RelateCheckpointError, match="2-tuple"):
-                proxy.execute_batch(["invalid item"])  # type: ignore[arg-type]
+                proxy.execute_batch(["invalid item"])  # type: ignore[list-item]
 
             with pytest.raises(RelateCheckpointError, match="invalid or empty query"):
                 proxy.execute_batch([("", {})])
 
             with pytest.raises(RelateCheckpointError, match="parameters must be a dictionary"):
-                proxy.execute_batch([("RETURN 1", "not a dict")])  # type: ignore[arg-type]
+                proxy.execute_batch([("RETURN 1", "not a dict")])  # type: ignore[list-item]
 
     def test_cypher_syntax_error_wrapped(self) -> None:
         """Verify database syntax errors are wrapped into RelateCheckpointError."""
@@ -232,7 +241,10 @@ class TestProxyValidationAndErrors:
             proxy.execute_write("CREATE (t:Thread {thread_id: 'dup-id'})")
             with pytest.raises(RelateCheckpointError) as exc_info:
                 proxy.execute_write("CREATE (t:Thread {thread_id: 'dup-id'})")
-            assert "ConstraintValidationFailed" in str(exc_info.value) or "unique" in str(exc_info.value).lower()
+            assert (
+                "ConstraintValidationFailed" in str(exc_info.value)
+                or "unique" in str(exc_info.value).lower()
+            )
 
     def test_closed_proxy_operations_raise_relate_connection_error(self) -> None:
         """Verify calling methods on a closed proxy raises RelateConnectionError."""
@@ -284,3 +296,133 @@ class TestProxyFakeDriverCompatibility:
             )
             assert len(res) == 1
             assert res[0]["id"] == "fake-thread"
+
+
+class _SpyConnection:
+    """Wraps a real connection and records commit, flush and close calls in order."""
+
+    def __init__(self, inner: Any, events: list[str], flush_error: Exception | None = None) -> None:
+        self._inner = inner
+        self._events = events
+        self._flush_error = flush_error
+
+    @property
+    def autocommit(self) -> bool:
+        return bool(self._inner.autocommit)
+
+    @autocommit.setter
+    def autocommit(self, value: bool) -> None:
+        self._inner.autocommit = value
+
+    def commit(self) -> None:
+        self._events.append("commit")
+        self._inner.commit()
+
+    def flush(self) -> None:
+        self._events.append("flush")
+        if self._flush_error is not None:
+            raise self._flush_error
+        self._inner.flush()
+
+    def close(self) -> None:
+        self._events.append("close")
+        self._inner.close()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+def _spy_proxy(
+    events: list[str], *, wal_enabled: bool = True, flush_error: Exception | None = None
+) -> RelateThreadProxy:
+    def factory(db_path: str) -> _SpyConnection:
+        return _SpyConnection(relate.connect(database=db_path), events, flush_error)
+
+    return RelateThreadProxy(
+        db_path=":memory:", wal_enabled=wal_enabled, connection_factory=factory
+    )
+
+
+_CREATE: list[tuple[str, dict[str, Any]]] = [("CREATE (:Thread {thread_id: $t})", {"t": "spy"})]
+_COUNT = "MATCH (t:Thread {thread_id: 'spy'}) RETURN count(t) AS n"
+
+
+class TestProxyFlushControl:
+    """execute_batch(flush=False) commits without a flush; close() flushes, abort() does not."""
+
+    def test_batch_flushes_by_default_adr_0014(self) -> None:
+        """ADR-0014: the default batch commits and then flushes."""
+        events: list[str] = []
+        proxy = _spy_proxy(events)
+        try:
+            events.clear()
+            proxy.execute_batch(_CREATE)
+            assert events == ["commit", "flush"]
+        finally:
+            proxy.abort()
+
+    def test_batch_without_flush_still_commits_adr_0014(self) -> None:
+        """ADR-0014: flush=False commits before returning and skips the flush."""
+        events: list[str] = []
+        proxy = _spy_proxy(events)
+        try:
+            events.clear()
+            proxy.execute_batch(_CREATE, flush=False)
+            assert events == ["commit"]
+            assert proxy.execute_read(_COUNT)[0]["n"] == 1
+        finally:
+            proxy.abort()
+
+    def test_failed_batch_without_flush_rolls_back_adr_0014(self) -> None:
+        """ADR-0014: a failing flush=False batch rolls back as one transaction."""
+        events: list[str] = []
+        proxy = _spy_proxy(events)
+        try:
+            events.clear()
+            with pytest.raises(Exception):  # noqa: B017
+                proxy.execute_batch([*_CREATE, ("THIS IS NOT CYPHER", {})], flush=False)
+            assert "flush" not in events
+            assert proxy.execute_read(_COUNT)[0]["n"] == 0
+        finally:
+            proxy.abort()
+
+    def test_close_flushes_before_closing_adr_0014(self) -> None:
+        """ADR-0014: close() flushes explicitly, then closes the connection."""
+        events: list[str] = []
+        proxy = _spy_proxy(events)
+        proxy.execute_batch(_CREATE, flush=False)
+        events.clear()
+        proxy.close()
+        assert events == ["flush", "close"]
+
+    def test_close_does_not_flush_without_wal_adr_0014(self) -> None:
+        """ADR-0014: with wal_enabled=False nothing flushes, including close()."""
+        events: list[str] = []
+        proxy = _spy_proxy(events, wal_enabled=False)
+        proxy.execute_batch(_CREATE)
+        events.clear()
+        proxy.close()
+        assert events == ["close"]
+
+    def test_abort_does_not_flush_adr_0014(self) -> None:
+        """ADR-0014: abort() closes the connection without flushing."""
+        events: list[str] = []
+        proxy = _spy_proxy(events)
+        proxy.execute_batch(_CREATE, flush=False)
+        events.clear()
+        proxy.abort()
+        assert events == ["close"]
+
+    def test_close_flush_failure_is_logged_and_connection_closed_adr_0014(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """ADR-0014: a failing flush on close logs a WARNING and the connection still closes."""
+        events: list[str] = []
+        proxy = _spy_proxy(events, flush_error=RuntimeError("disk full"))
+        events.clear()
+        with caplog.at_level(logging.WARNING):
+            proxy.close()
+        assert events == ["flush", "close"]
+        assert any(
+            r.levelno == logging.WARNING and "disk full" in r.getMessage() for r in caplog.records
+        )

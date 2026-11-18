@@ -327,3 +327,52 @@ class TestDAGVisualizer:
             assert "thread-child-replay" in parent_output
             assert "forked_agent" in parent_output
             assert "[BRANCH]" in parent_output
+
+
+class TestFullCheckpointIds:
+    """Checkpoint ids are rendered in full so that same-second ids stay distinguishable."""
+
+    def test_tree_shows_full_distinct_ids_for_same_second_checkpoints_ac_62_ac_63(self) -> None:
+        """AC-62, AC-63: ids sharing a long prefix each appear unshortened and distinct."""
+        ids = [f"1f1e314c-8a21-6b3e-8000-00000000000{n}" for n in range(1, 7)]
+        with RelateSaver(db_path=":memory:") as saver:
+            thread_id = "thread-same-second"
+            parent: str | None = None
+            for step, cid in enumerate(ids):
+                _create_checkpoint(
+                    saver,
+                    thread_id,
+                    cid,
+                    step=step,
+                    node=f"node_{step}",
+                    parent_checkpoint_id=parent,
+                )
+                parent = cid
+
+            output_str = DAGVisualizer(saver).render_to_string(thread_id)
+
+        for cid in ids:
+            assert f"(id: {cid})" in output_str
+        assert output_str.count("1f1e314c") == len(ids)
+        assert len({cid for cid in ids if cid in output_str}) == len(ids)
+
+    def test_cycle_detected_line_shows_full_id_ac_62(self) -> None:
+        """AC-62: the cycle-detected line carries the full checkpoint id."""
+        cid = "1f1e314c-8a21-6b3e-8000-000000000001"
+        with RelateSaver(db_path=":memory:") as saver:
+            visualizer = DAGVisualizer(saver)
+            root = Tree("root")
+            visualizer._add_checkpoint_subtree(
+                tree_node=root,
+                cid=cid,
+                parsed_checkpoints={},
+                writes_by_cid={},
+                children_map={},
+                current_thread_id="t",
+                visited={cid},
+            )
+            console = Console(record=True, width=120)
+            with console.capture() as capture:
+                console.print(root)
+
+        assert f"cycle detected: {cid}" in capture.get()

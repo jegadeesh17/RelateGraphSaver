@@ -57,13 +57,7 @@ def test_roundtrip_primitives_and_collections_ac_13(serializer: RelateStateSeria
         "bool_false": False,
         "none_val": None,
         "list_val": [1, "two", 3.0, [4, 5]],
-        "nested_dict": {
-            "level1": {
-                "level2": {
-                    "leaf": "deep_value"
-                }
-            }
-        },
+        "nested_dict": {"level1": {"level2": {"leaf": "deep_value"}}},
     }
 
     # Test typed serialization
@@ -313,15 +307,14 @@ def test_unserializable_pydantic_attribute_pinpoints_key_ac_12(
     serializer: RelateStateSerializer,
 ) -> None:
     """AC-12: Model attribute containing un-serializable object identifies offending key."""
+
     class CustomContainer:
         def __init__(self, conn: Any) -> None:
             self.network_conn = conn
 
     test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        payload = {
-            "container": CustomContainer(conn=test_socket)
-        }
+        payload = {"container": CustomContainer(conn=test_socket)}
 
         with pytest.raises(CheckpointSerializationError) as exc_info:
             serializer.dumps(payload)

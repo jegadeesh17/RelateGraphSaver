@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.4
 ## [Unreleased]
 
 ### Added
+- Tool-call capture: `RelateSaver.put()` and `put_writes()` record each tool call and its outcome as a `:ToolCall` node; `fork_in_memory()` copies tool calls only up to the fork point (ADR-0010).
+- `root_tool_name` on `RootCauseReport`, `trace_root_cause()` and the `relate-dag forensics trace-error` panel, naming the tool behind a failure.
+- Key-free tool-calling demo (`examples/tool_agent.py`) with an end-to-end forensics test.
+- Async checkpointer methods (`aget_tuple`, `alist`, `aput`, `aput_writes`).
+- Benchmark script comparing `RelateSaver` with LangGraph's `SqliteSaver` (`benchmarks/bench_checkpointers.py`, ADR-0008, ADR-0012).
+- Read-only mode, `RelateSaver(read_only=True)`, used by the inspection commands so they leave a store byte-identical (ADR-0015).
+- Committed demo store (`examples/data/demo.rl`) with three threads, and `examples/build_demo_store.py` to rebuild it offline.
+- README sections: use case, how we use Relate and why, where the data lives, exploring the demo store, measured benchmark results and the single-process limit.
 - Cypher forensic diagnostic engine (`RelateForensics`, `detect_loops()`, `trace_root_cause()`) detecting state oscillations, repeating node cycles, and backward causal failure root-cause analysis.
 - CLI forensic diagnostic subcommands (`relate-dag forensics loops` and `relate-dag forensics trace-error`) with rich tabular rendering.
 - End-to-end multi-agent research demo application (`examples/research_agent.py`) orchestrating Planner, Researcher, Human Review interrupt, and Critic with live terminal DAG visualization.
@@ -25,7 +33,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.4
 - Write-ahead log (WAL) synchronization and crash recovery support for durable checkpointing.
 - Integration test suite validating end-to-end checkpointing, pagination, history retrieval, and multi-threaded execution.
 
+### Changed
+- Variable-length ancestry queries start from the target checkpoint instead of scanning the whole chain.
+- Tool-call capture sends only new statements per saver (ADR-0011) and commits without its own flush; the store is flushed on close (ADR-0014).
+
 ### Fixed
+- `click` and `langchain-core` are declared as runtime dependencies, so a clean install runs the CLI.
+- `ruff check`, `ruff format --check` and `mypy src tests` pass.
+- `put()` latency no longer grows with the length of the checkpoint chain.
+- A tool call could go missing under concurrent async runs.
+- The clean-install test skips only when the package index is unreachable (ADR-0013).
+- The benchmark uses an equivalent SQLite ancestry query and removes only its own files (ADR-0012).
+- CLI output is readable on any stdout encoding; `tree` shows full checkpoint ids; the LangGraph error suffix is trimmed from forensics output.
+- `examples/build_demo_store.py` rejects an output path without the `.rl` suffix, and on failure removes only its own staging file.
 - Aligned research demo pipeline default database path to `checkpoints.rl` for zero-configuration CLI visualization.
 - Propagated startup file-lock concurrency errors and added automatic transaction rollback on failure in `RelateThreadProxy`.
 - Added flag syntax `--checkpoint / -c` support in `relate-dag replay` CLI and guarded metadata dictionary access.

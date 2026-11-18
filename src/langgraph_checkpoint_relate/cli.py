@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
+from typing import Any
 
-import click
 import typer
 from rich.console import Console
 from rich.panel import Panel
@@ -37,6 +38,37 @@ console = Console()
 err_console = Console(stderr=True)
 
 
+def _make_output_streams_lossy() -> None:
+    """Replace unencodable characters instead of raising on stdout and stderr (AC-59).
+
+    Stored data (node names, messages) can hold characters the terminal encoding lacks;
+    the stream keeps its encoding and only its error handler changes.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(errors="replace")
+        except (ValueError, OSError):
+            logger.debug("Could not reconfigure %r to replace unencodable characters", stream)
+
+
+@app.callback()
+def _configure_output() -> None:
+    # No docstring: Typer would use it as the root help text instead of ``help=`` above.
+    # Runs before every command, including when the installed script calls ``app`` directly.
+    _make_output_streams_lossy()
+
+
+def _open_inspection_saver(db: str) -> RelateSaver:
+    """Open the store for an inspection command without modifying the file (ADR-0015).
+
+    An in-memory store starts empty, so there is nothing to protect and it stays writable.
+    """
+    return RelateSaver(db_path=db, read_only=db != ":memory:")
+
+
 @app.command(name="tree", help="Visualize execution DAG for a thread.")
 def tree(
     thread_id: str = typer.Argument(
@@ -62,7 +94,7 @@ def tree(
         raise typer.Exit(code=1)
 
     try:
-        with DAGVisualizer(db_path=db) as visualizer:
+        with _open_inspection_saver(db) as saver, DAGVisualizer(saver) as visualizer:
             tree_obj = visualizer.render_tree(thread_id)
             console.print(tree_obj)
     except typer.Exit:
@@ -131,7 +163,7 @@ def replay(
     source_saver: RelateSaver | None = None
     sandboxed_saver: RelateSaver | None = None
     try:
-        source_saver = RelateSaver(db_path=db)
+        source_saver = _open_inspection_saver(db)
         sandboxed_saver = TimeTravelEngine.fork_in_memory(
             source_saver=source_saver,
             thread_id=thread_id,
@@ -173,7 +205,9 @@ def replay(
 class ForensicsGroup(TyperGroup):
     """Custom TyperGroup routing 'relate-dag forensics <thread_id>' to default diagnose command."""
 
-    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+    # ``ctx`` is typed Any because the Context class differs between Typer releases
+    # (real click or Typer's vendored copy).
+    def parse_args(self, ctx: Any, args: list[str]) -> list[str]:
         if args:
             first_non_option = next((a for a in args if not a.startswith("-")), None)
             if first_non_option and first_non_option not in self.commands:
@@ -226,7 +260,7 @@ def forensics_loops(
         raise typer.Exit(code=1)
 
     try:
-        with RelateForensics(db_path=db) as forensics_engine:
+        with _open_inspection_saver(db) as saver, RelateForensics(saver) as forensics_engine:
             reports = forensics_engine.detect_loops(thread_id, threshold=threshold)
             if reports:
                 table = Table(title=f"Detected Loops: {thread_id}")
@@ -244,7 +278,7 @@ def forensics_loops(
                 console.print(table)
             else:
                 console.print(
-                    f"[green]✓[/green] No loops or repeating cycles detected in thread '{thread_id}' (threshold: {threshold})."
+                    f"[green]OK[/green] No loops or repeating cycles detected in thread '{thread_id}' (threshold: {threshold})."
                 )
     except typer.Exit:
         raise
@@ -283,17 +317,18 @@ def forensics_trace_error(
         raise typer.Exit(code=1)
 
     try:
-        with RelateForensics(db_path=db) as forensics_engine:
+        with _open_inspection_saver(db) as saver, RelateForensics(saver) as forensics_engine:
             report = forensics_engine.trace_root_cause(thread_id)
             if report.error_message == "No error detected" and not report.error_checkpoint_id:
                 console.print(
-                    f"[green]✓[/green] No error detected in execution thread '{thread_id}'. Workflow completed cleanly."
+                    f"[green]OK[/green] No error detected in execution thread '{thread_id}'. Workflow completed cleanly."
                 )
             else:
                 panel_content = (
                     f"[bold cyan]Error Checkpoint ID:[/bold cyan] {report.error_checkpoint_id}\n"
                     f"[bold red]Error Message:[/bold red]       {report.error_message}\n"
                     f"[bold yellow]Root Tool Call ID:[/bold yellow]   {report.root_tool_call_id or 'None'}\n"
+                    f"[bold yellow]Root Tool Name:[/bold yellow]      {report.root_tool_name or 'None'}\n"
                     f"[bold yellow]Root Channel Write:[/bold yellow]  {report.root_channel_write or 'None'}\n"
                     f"[bold green]Causal Path Length:[/bold green]  {report.causal_path_length}\n"
                     f"[bold white]Diagnostic Summary:[/bold white]  {report.diagnostic_summary}"
@@ -360,7 +395,7 @@ def forensics_diagnose(
         raise typer.Exit(code=1)
 
     try:
-        with RelateForensics(db_path=db) as forensics_engine:
+        with _open_inspection_saver(db) as saver, RelateForensics(saver) as forensics_engine:
             records = forensics_engine.saver.proxy.execute_read(
                 "MATCH (c:Checkpoint {thread_id: $thread_id}) RETURN count(c) AS count",
                 {"thread_id": thread_id},
@@ -400,6 +435,7 @@ def forensics_diagnose(
                     f"[bold cyan]Error Checkpoint ID:[/bold cyan] {root_cause.error_checkpoint_id}\n"
                     f"[bold red]Error Message:[/bold red]       {root_cause.error_message}\n"
                     f"[bold yellow]Root Tool Call ID:[/bold yellow]   {root_cause.root_tool_call_id or 'None'}\n"
+                    f"[bold yellow]Root Tool Name:[/bold yellow]      {root_cause.root_tool_name or 'None'}\n"
                     f"[bold yellow]Root Channel Write:[/bold yellow]  {root_cause.root_channel_write or 'None'}\n"
                     f"[bold green]Causal Path Length:[/bold green]  {root_cause.causal_path_length}\n"
                     f"[bold white]Diagnostic Summary:[/bold white]  {root_cause.diagnostic_summary}"

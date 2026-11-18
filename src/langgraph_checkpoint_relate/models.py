@@ -75,7 +75,9 @@ class CheckpointNode:
         if not isinstance(self.step, int) or self.step < 0:
             raise ValueError(f"step must be a non-negative integer, got {self.step!r}")
         if not isinstance(self.checkpoint_ns, str):
-            raise TypeError(f"checkpoint_ns must be a string, got {type(self.checkpoint_ns).__name__}")
+            raise TypeError(
+                f"checkpoint_ns must be a string, got {type(self.checkpoint_ns).__name__}"
+            )
         if self.parent_checkpoint_id is not None and not isinstance(self.parent_checkpoint_id, str):
             raise TypeError("parent_checkpoint_id must be a string or None")
         if not isinstance(self.state_hash, str) or not self.state_hash.strip():
@@ -107,7 +109,9 @@ class CheckpointNode:
             metadata_blob=_normalize_bytes(raw_md_blob, "metadata_blob"),
             state_hash=str(data["state_hash"]),
             checkpoint_ns=str(data.get("checkpoint_ns", "")),
-            parent_checkpoint_id=str(data["parent_checkpoint_id"]) if data.get("parent_checkpoint_id") else None,
+            parent_checkpoint_id=str(data["parent_checkpoint_id"])
+            if data.get("parent_checkpoint_id")
+            else None,
             created_at=str(data.get("created_at", _utc_now_iso())),
         )
 
@@ -140,7 +144,9 @@ class WriteNode:
         if not isinstance(self.idx, int) or self.idx < 0:
             raise ValueError(f"idx must be a non-negative integer, got {self.idx!r}")
         if not isinstance(self.checkpoint_ns, str):
-            raise TypeError(f"checkpoint_ns must be a string, got {type(self.checkpoint_ns).__name__}")
+            raise TypeError(
+                f"checkpoint_ns must be a string, got {type(self.checkpoint_ns).__name__}"
+            )
         if not isinstance(self.created_at, str) or not self.created_at.strip():
             raise ValueError("created_at must be a non-empty ISO-8601 string")
 
@@ -273,7 +279,9 @@ class LoopReport:
         if not isinstance(self.thread_id, str) or not self.thread_id.strip():
             raise ValueError("thread_id must be a non-empty string")
         if not isinstance(self.occurrence_count, int) or self.occurrence_count < 0:
-            raise ValueError(f"occurrence_count must be non-negative, got {self.occurrence_count!r}")
+            raise ValueError(
+                f"occurrence_count must be non-negative, got {self.occurrence_count!r}"
+            )
         if not isinstance(self.checkpoint_id_range, tuple) or len(self.checkpoint_id_range) != 2:
             raise ValueError("checkpoint_id_range must be a 2-tuple of (start_id, end_id)")
 
@@ -289,6 +297,7 @@ class RootCauseReport:
     root_channel_write: str | None = None
     causal_path_length: int = 0
     diagnostic_summary: str = ""
+    root_tool_name: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.thread_id, str) or not self.thread_id.strip():
@@ -300,7 +309,9 @@ class RootCauseReport:
         if not isinstance(self.error_message, str):
             raise TypeError("error_message must be a string")
         if not isinstance(self.causal_path_length, int) or self.causal_path_length < 0:
-            raise ValueError(f"causal_path_length must be non-negative, got {self.causal_path_length!r}")
+            raise ValueError(
+                f"causal_path_length must be non-negative, got {self.causal_path_length!r}"
+            )
 
 
 __all__ = [

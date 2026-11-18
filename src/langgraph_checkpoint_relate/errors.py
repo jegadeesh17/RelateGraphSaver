@@ -32,6 +32,10 @@ class RelateCheckpointNotFoundError(RelateCheckpointError):
     """Raised when a specified thread or checkpoint cannot be located."""
 
 
+class RelateReadOnlyError(RelateCheckpointError):
+    """Raised when a write is attempted through a read-only saver or proxy."""
+
+
 # Specification parity aliases
 CheckpointSerializationError = RelateSerializationError
 CheckpointNotFoundError = RelateCheckpointNotFoundError
@@ -43,5 +47,6 @@ __all__ = [
     "RelateCheckpointNotFoundError",
     "RelateConcurrencyError",
     "RelateConnectionError",
+    "RelateReadOnlyError",
     "RelateSerializationError",
 ]

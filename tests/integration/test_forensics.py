@@ -13,11 +13,13 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import time
 from collections.abc import Generator
 from pathlib import Path
 from typing import Any, TypedDict
 
 import pytest
+from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import empty_checkpoint
 from langgraph.graph import END, START, StateGraph
@@ -29,10 +31,10 @@ if _PROJECT_ROOT not in sys.path:
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from langgraph_checkpoint_relate.errors import CheckpointNotFoundError
-from langgraph_checkpoint_relate.forensics import RelateForensics
-from langgraph_checkpoint_relate.models import LoopReport, RootCauseReport
-from langgraph_checkpoint_relate.saver import RelateSaver
+from langgraph_checkpoint_relate.errors import CheckpointNotFoundError  # noqa: E402
+from langgraph_checkpoint_relate.forensics import RelateForensics  # noqa: E402
+from langgraph_checkpoint_relate.models import LoopReport, RootCauseReport  # noqa: E402
+from langgraph_checkpoint_relate.saver import RelateSaver  # noqa: E402
 
 
 @pytest.fixture
@@ -106,8 +108,12 @@ class TestRelateForensics:
         workflow.add_node("ping", node_ping)
         workflow.add_node("pong", node_pong)
         workflow.add_edge(START, "ping")
-        workflow.add_conditional_edges("ping", route_condition, {"ping": "ping", "pong": "pong", END: END})
-        workflow.add_conditional_edges("pong", route_condition, {"ping": "ping", "pong": "pong", END: END})
+        workflow.add_conditional_edges(
+            "ping", route_condition, {"ping": "ping", "pong": "pong", END: END}
+        )
+        workflow.add_conditional_edges(
+            "pong", route_condition, {"ping": "ping", "pong": "pong", END: END}
+        )
 
         thread_id = "thread-oscillation-001"
         config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
@@ -244,17 +250,25 @@ class TestRelateForensics:
         """Verify CheckpointNotFoundError for non-existent thread and argument validation."""
         with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
             # 1. Non-existent thread
-            with pytest.raises(CheckpointNotFoundError, match="not found or contains no checkpoints"):
+            with pytest.raises(
+                CheckpointNotFoundError, match="not found or contains no checkpoints"
+            ):
                 saver.detect_loops("missing-thread-xyz")
 
-            with pytest.raises(CheckpointNotFoundError, match="not found or contains no checkpoints"):
+            with pytest.raises(
+                CheckpointNotFoundError, match="not found or contains no checkpoints"
+            ):
                 saver.trace_root_cause("missing-thread-xyz")
 
             # 2. Empty or invalid thread_id
-            with pytest.raises(CheckpointNotFoundError, match="thread_id must be a non-empty string"):
+            with pytest.raises(
+                CheckpointNotFoundError, match="thread_id must be a non-empty string"
+            ):
                 saver.detect_loops("")
 
-            with pytest.raises(CheckpointNotFoundError, match="thread_id must be a non-empty string"):
+            with pytest.raises(
+                CheckpointNotFoundError, match="thread_id must be a non-empty string"
+            ):
                 saver.trace_root_cause("")
 
             # 3. Invalid threshold
@@ -292,11 +306,11 @@ class TestRelateForensics:
                         "checkpoint_id": cid,
                     }
                 }
-                cp = dict(empty_checkpoint())
+                cp: Any = dict(empty_checkpoint())
                 cp["id"] = cid
                 if prev_cid:
                     cp["parent_checkpoint_id"] = prev_cid
-                saver.put(cfg, cp, {"node": node_name, "step": idx}, {})
+                saver.put(cfg, cp, {"node": node_name, "step": idx}, {})  # type: ignore[typeddict-unknown-key]
                 prev_cid = cid
 
             reports = saver.detect_loops(thread_id, threshold=2)
@@ -312,10 +326,12 @@ class TestRelateForensics:
         with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
             # Step 1: Checkpoint with ToolCall that failed
             cid_step1 = "cp-tool-001"
-            cfg1: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_id": cid_step1}}
-            cp1 = dict(empty_checkpoint())
+            cfg1: RunnableConfig = {
+                "configurable": {"thread_id": thread_id, "checkpoint_id": cid_step1}
+            }
+            cp1: Any = dict(empty_checkpoint())
             cp1["id"] = cid_step1
-            saver.put(cfg1, cp1, {"step": 1, "node": "tool_executor"}, {})
+            saver.put(cfg1, cp1, {"step": 1, "node": "tool_executor"}, {})  # type: ignore[typeddict-unknown-key]
 
             # Create tool call and link via INVOKED
             saver.proxy.execute_write(
@@ -335,11 +351,13 @@ class TestRelateForensics:
 
             # Step 2: Checkpoint downstream where error is recorded
             cid_step2 = "cp-tool-002"
-            cfg2: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_id": cid_step2}}
-            cp2 = dict(empty_checkpoint())
+            cfg2: RunnableConfig = {
+                "configurable": {"thread_id": thread_id, "checkpoint_id": cid_step2}
+            }
+            cp2: Any = dict(empty_checkpoint())
             cp2["id"] = cid_step2
             cp2["parent_checkpoint_id"] = cid_step1
-            saver.put(cfg2, cp2, {"step": 2, "node": "error_handler"}, {})
+            saver.put(cfg2, cp2, {"step": 2, "node": "error_handler"}, {})  # type: ignore[typeddict-unknown-key]
 
             # Put __error__ write at step 2
             saver.put_writes(
@@ -356,3 +374,114 @@ class TestRelateForensics:
             assert "HTTP 429" in report.error_message or "search_api" in report.error_message
             assert "call-search-err-99" in report.diagnostic_summary
 
+    def test_trace_root_cause_names_failing_tool_from_put_writes_ac_45(
+        self, temp_disk_db: str
+    ) -> None:
+        """AC-45: a tool call recorded via put_writes() is reported by tool_name and call_id."""
+        thread_id = "thread-tool-name-001"
+        call_id = "call-weather-77"
+        with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
+            cfg: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+            cp: Any = dict(empty_checkpoint())
+            cp["id"] = "cp-name-001"
+            saved_cfg = saver.put(cfg, cp, {"step": 1, "source": "loop", "parents": {}}, {})
+            ai = AIMessage(
+                content="",
+                tool_calls=[{"id": call_id, "name": "get_weather", "args": {"city": "X"}}],
+            )
+            saver.put_writes(saved_cfg, [("messages", [ai])], task_id="task-ai")
+            tool_msg = ToolMessage(content="upstream down", tool_call_id=call_id, status="error")
+            saver.put_writes(saved_cfg, [("messages", [tool_msg])], task_id="task-tool")
+
+            report = saver.trace_root_cause(thread_id)
+
+        assert report.root_tool_call_id == call_id
+        assert report.root_tool_name == "get_weather"
+        assert f"Root tool invocation: '{call_id}'. Failing tool: 'get_weather'." in (
+            report.diagnostic_summary
+        )
+
+    def _record_failed_tool_call(self, db_path: str, thread_id: str, error_text: str) -> None:
+        """Persist one failed tool call (AI request plus error ToolMessage) for a thread."""
+        with RelateSaver(db_path=db_path, wal_enabled=True) as saver:
+            cfg: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+            cp: Any = dict(empty_checkpoint())
+            cp["id"] = "cp-suffix-001"
+            saved_cfg = saver.put(cfg, cp, {"step": 1, "source": "loop", "parents": {}}, {})
+            ai = AIMessage(
+                content="",
+                tool_calls=[{"id": "call-sfx-1", "name": "fetch_source", "args": {}}],
+            )
+            saver.put_writes(saved_cfg, [("messages", [ai])], task_id="task-ai")
+            tool_msg = ToolMessage(content=error_text, tool_call_id="call-sfx-1", status="error")
+            saver.put_writes(saved_cfg, [("messages", [tool_msg])], task_id="task-tool")
+
+    def test_trace_root_cause_drops_trailing_langgraph_suffix_ac_65(
+        self, temp_disk_db: str
+    ) -> None:
+        """AC-65: the displayed error loses the trailing suffix; the stored error is unchanged."""
+        stored = "Error: ValueError('boom')\n Please fix your mistakes."
+        self._record_failed_tool_call(temp_disk_db, "thread-sfx-trim", stored)
+
+        with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
+            report = saver.trace_root_cause("thread-sfx-trim")
+            rows = saver.proxy.execute_read(
+                "MATCH (tc:ToolCall {call_id: 'call-sfx-1'}) RETURN tc.error AS error", {}
+            )
+
+        assert report.error_message == "Error: ValueError('boom')"
+        assert "Please fix your mistakes" not in report.diagnostic_summary
+        assert rows[0]["error"] == stored
+
+    def test_trace_root_cause_keeps_error_without_trailing_suffix_ac_66(
+        self, temp_disk_db: str
+    ) -> None:
+        """AC-66: an error that only contains the phrase mid-text is displayed exactly."""
+        stored = "Please fix your mistakes. The upstream API rejected the request"
+        self._record_failed_tool_call(temp_disk_db, "thread-sfx-keep", stored)
+
+        with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
+            report = saver.trace_root_cause("thread-sfx-keep")
+
+        assert report.error_message == stored
+
+    def test_trace_root_cause_long_next_chain_is_fast_ac_27(self, temp_disk_db: str) -> None:
+        """AC-27: root cause on a 300-checkpoint NEXT chain finds the first antecedent quickly."""
+        thread_id = "thread-long-chain-001"
+        chain_length = 300
+        with RelateSaver(db_path=temp_disk_db, wal_enabled=False) as saver:
+            config: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+            first_id = ""
+            for step in range(chain_length):
+                cp: Any = dict(empty_checkpoint())
+                cp["id"] = f"cp-long-{step:04d}"
+                config = saver.put(config, cp, {"step": step, "source": "loop", "parents": {}}, {})
+                if step == 0:
+                    first_id = config["configurable"]["checkpoint_id"]
+
+            saver.proxy.execute_write(
+                "CREATE (tc:ToolCall {call_id: $call_id, tool_name: $name, args_blob: $args, "
+                "error: $err, created_at: $created_at}) "
+                "WITH tc "
+                "MATCH (c:Checkpoint {checkpoint_id: $cid}) "
+                "MERGE (c)-[:INVOKED]->(tc)",
+                {
+                    "call_id": "call-long-chain-1",
+                    "name": "slow_api",
+                    "args": b"{}",
+                    "err": "HTTP 503: upstream unavailable",
+                    "created_at": "2026-11-12T00:00:00Z",
+                    "cid": first_id,
+                },
+            )
+            saver.put_writes(config, [("__error__", "Chain aborted")], task_id="task-long")
+
+            started = time.perf_counter()
+            report = saver.trace_root_cause(thread_id)
+            elapsed = time.perf_counter() - started
+
+        assert report.error_checkpoint_id == config["configurable"]["checkpoint_id"]
+        assert report.root_tool_call_id == "call-long-chain-1"
+        assert report.root_tool_name == "slow_api"
+        assert report.causal_path_length == chain_length - 1
+        assert elapsed < 1.0

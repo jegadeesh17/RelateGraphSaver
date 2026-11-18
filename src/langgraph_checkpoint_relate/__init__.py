@@ -7,6 +7,7 @@ from langgraph_checkpoint_relate.errors import (
     RelateCheckpointNotFoundError,
     RelateConcurrencyError,
     RelateConnectionError,
+    RelateReadOnlyError,
     RelateSerializationError,
 )
 from langgraph_checkpoint_relate.forensics import RelateForensics
@@ -27,6 +28,7 @@ __all__ = [
     "RelateConcurrencyError",
     "RelateConnectionError",
     "RelateForensics",
+    "RelateReadOnlyError",
     "RelateSaver",
     "RelateSerializationError",
     "RootCauseReport",

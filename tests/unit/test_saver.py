@@ -824,18 +824,30 @@ class TestRelateSaverNamespaces:
             thread_id = "thread-ns-multi"
 
             # 1. Put root namespace checkpoint ("")
-            cfg_root: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
-            ret_root = saver.put(cfg_root, _make_checkpoint("cp-root-01", {"layer": "root"}), {"step": 1}, {})
+            cfg_root: RunnableConfig = {
+                "configurable": {"thread_id": thread_id, "checkpoint_ns": ""}
+            }
+            ret_root = saver.put(
+                cfg_root, _make_checkpoint("cp-root-01", {"layer": "root"}), {"step": 1}, {}
+            )
             assert ret_root["configurable"]["checkpoint_ns"] == ""
 
             # 2. Put subgraph_a checkpoint
-            cfg_a: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": "subgraph_a"}}
-            ret_a = saver.put(cfg_a, _make_checkpoint("cp-suba-01", {"layer": "sub_a"}), {"step": 1}, {})
+            cfg_a: RunnableConfig = {
+                "configurable": {"thread_id": thread_id, "checkpoint_ns": "subgraph_a"}
+            }
+            ret_a = saver.put(
+                cfg_a, _make_checkpoint("cp-suba-01", {"layer": "sub_a"}), {"step": 1}, {}
+            )
             assert ret_a["configurable"]["checkpoint_ns"] == "subgraph_a"
 
             # 3. Put subgraph_b checkpoint
-            cfg_b: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": "subgraph_b"}}
-            ret_b = saver.put(cfg_b, _make_checkpoint("cp-subb-01", {"layer": "sub_b"}), {"step": 1}, {})
+            cfg_b: RunnableConfig = {
+                "configurable": {"thread_id": thread_id, "checkpoint_ns": "subgraph_b"}
+            }
+            ret_b = saver.put(
+                cfg_b, _make_checkpoint("cp-subb-01", {"layer": "sub_b"}), {"step": 1}, {}
+            )
             assert ret_b["configurable"]["checkpoint_ns"] == "subgraph_b"
 
             # Verify persisted nodes in Relate property graph
@@ -873,15 +885,31 @@ class TestRelateSaverNamespaces:
             thread_id = "thread-ns-list"
 
             # Populate checkpoints across root, subgraph_a, and subgraph_b
-            cfg_root: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+            cfg_root: RunnableConfig = {
+                "configurable": {"thread_id": thread_id, "checkpoint_ns": ""}
+            }
             saver.put(cfg_root, _make_checkpoint("cp-root-1", {"val": 10}), {"step": 1}, {})
-            saver.put(cfg_root, _make_checkpoint("cp-root-2", {"val": 20}, parent_checkpoint_id="cp-root-1"), {"step": 2}, {})
+            saver.put(
+                cfg_root,
+                _make_checkpoint("cp-root-2", {"val": 20}, parent_checkpoint_id="cp-root-1"),
+                {"step": 2},
+                {},
+            )
 
-            cfg_a: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": "subgraph_a"}}
+            cfg_a: RunnableConfig = {
+                "configurable": {"thread_id": thread_id, "checkpoint_ns": "subgraph_a"}
+            }
             saver.put(cfg_a, _make_checkpoint("cp-suba-1", {"val": 100}), {"step": 1}, {})
-            saver.put(cfg_a, _make_checkpoint("cp-suba-2", {"val": 200}, parent_checkpoint_id="cp-suba-1"), {"step": 2}, {})
+            saver.put(
+                cfg_a,
+                _make_checkpoint("cp-suba-2", {"val": 200}, parent_checkpoint_id="cp-suba-1"),
+                {"step": 2},
+                {},
+            )
 
-            cfg_b: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": "subgraph_b"}}
+            cfg_b: RunnableConfig = {
+                "configurable": {"thread_id": thread_id, "checkpoint_ns": "subgraph_b"}
+            }
             saver.put(cfg_b, _make_checkpoint("cp-subb-1", {"val": 1000}), {"step": 1}, {})
 
             # 1. Filter by checkpoint_ns="subgraph_a" via config
@@ -915,7 +943,9 @@ class TestRelateSaverNamespaces:
             assert [t.checkpoint["id"] for t in list_filter_root] == ["cp-root-2", "cp-root-1"]
 
             # 6. Non-existent namespace returns empty iterator
-            cfg_nonexistent: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": "nonexistent_sub"}}
+            cfg_nonexistent: RunnableConfig = {
+                "configurable": {"thread_id": thread_id, "checkpoint_ns": "nonexistent_sub"}
+            }
             list_empty = list(saver.list(cfg_nonexistent))
             assert list_empty == []
 
@@ -925,7 +955,9 @@ class TestRelateSaverNamespaces:
             thread_id = "thread-ns-parents"
 
             # Step 1: Root namespace checkpoint 1
-            cfg_root: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+            cfg_root: RunnableConfig = {
+                "configurable": {"thread_id": thread_id, "checkpoint_ns": ""}
+            }
             meta_root1: CheckpointMetadata = {"step": 1, "parents": {}}
             saver.put(cfg_root, _make_checkpoint("cp-root-1", {"val": "root1"}), meta_root1, {})
 
@@ -934,12 +966,17 @@ class TestRelateSaverNamespaces:
             saver.put(cfg_root, _make_checkpoint("cp-root-2", {"val": "root2"}), meta_root2, {})
 
             # Step 3: Subgraph A checkpoint 1 (invoked from root-2, but subgraph itself has no prior parent)
-            cfg_sub: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": "subgraph_a"}}
+            cfg_sub: RunnableConfig = {
+                "configurable": {"thread_id": thread_id, "checkpoint_ns": "subgraph_a"}
+            }
             meta_sub1: CheckpointMetadata = {"step": 1, "parents": {"": "cp-root-2"}}
             saver.put(cfg_sub, _make_checkpoint("cp-suba-1", {"val": "sub1"}), meta_sub1, {})
 
             # Step 4: Subgraph A checkpoint 2 (has root parent and subgraph_a parent)
-            meta_sub2: CheckpointMetadata = {"step": 2, "parents": {"": "cp-root-2", "subgraph_a": "cp-suba-1"}}
+            meta_sub2: CheckpointMetadata = {
+                "step": 2,
+                "parents": {"": "cp-root-2", "subgraph_a": "cp-suba-1"},
+            }
             saver.put(cfg_sub, _make_checkpoint("cp-suba-2", {"val": "sub2"}), meta_sub2, {})
 
             # Verify causal NEXT edges in Relate graph
@@ -973,7 +1010,9 @@ class TestRelateSaverNamespaces:
             assert ret["configurable"]["checkpoint_ns"] == ""
 
             # get_tuple with nonexistent namespace returns None
-            cfg_ghost: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": "ghost_ns"}}
+            cfg_ghost: RunnableConfig = {
+                "configurable": {"thread_id": thread_id, "checkpoint_ns": "ghost_ns"}
+            }
             assert saver.get_tuple(cfg_ghost) is None
 
             # list with empty/None config yields empty iterator gracefully

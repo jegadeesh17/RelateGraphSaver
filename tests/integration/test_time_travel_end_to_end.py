@@ -1,4 +1,4 @@
-"""End-to-end integration tests validating Milestone 2: Core Flows and Time-Travel Debugger.
+"""End-to-end integration tests for pending writes, human-in-the-loop interrupts and time-travel replay.
 
 Verifies end-to-end workflows across the checkpointer stack:
 - Pending channel writes and human-in-the-loop interrupt persistence (AC-14, AC-15, AC-16).
@@ -110,8 +110,8 @@ class SubgraphWorkflowState(TypedDict):
     validation_status: str
 
 
-class TestMilestone2Integration:
-    """Milestone 2 integration test suite covering AC-14 through AC-24."""
+class TestTimeTravelIntegration:
+    """Integration test suite covering AC-14 through AC-24."""
 
     def test_human_in_the_loop_interrupt_and_resume_flow_ac_14_ac_15_ac_16(
         self, temp_disk_db: str
@@ -137,7 +137,7 @@ class TestMilestone2Integration:
         builder.add_edge("ask_human", "process")
         builder.add_edge("process", END)
 
-        thread_id = "thread-m2-hitl-001"
+        thread_id = "thread-hitl-001"
         config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
 
         # Stage 1: Run workflow until interrupt on disk-backed saver
@@ -212,7 +212,7 @@ class TestMilestone2Integration:
         - AC-17: Hierarchical subgraphs with varying checkpoint_ns persist attributes intact.
         - AC-18: list() filtering by checkpoint_ns yields only matching checkpoints.
         """
-        thread_id = "thread-m2-namespaces-002"
+        thread_id = "thread-namespaces-002"
         root_ns = ""
         subgraph_worker_ns = "worker_subgraph"
         subgraph_validator_ns = "validator_subgraph"
@@ -223,7 +223,7 @@ class TestMilestone2Integration:
                 "configurable": {"thread_id": thread_id, "checkpoint_ns": root_ns}
             }
             cp_root = _build_checkpoint("cp-root-01", {"input_text": "data_payload"})
-            saver.put(cfg_root, cp_root, {"step": 0, "node": "root_dispatcher"}, {})
+            saver.put(cfg_root, cp_root, {"step": 0, "node": "root_dispatcher"}, {})  # type: ignore[typeddict-unknown-key]
 
             # 2. Worker subgraph checkpoints (AC-17)
             cfg_worker_1: RunnableConfig = {
@@ -239,7 +239,7 @@ class TestMilestone2Integration:
             saver.put(
                 cfg_worker_1,
                 cp_worker_1,
-                {
+                {  # type: ignore[typeddict-unknown-key]
                     "step": 1,
                     "node": "worker_node",
                     "parents": {root_ns: "cp-root-01", subgraph_worker_ns: ""},
@@ -260,7 +260,7 @@ class TestMilestone2Integration:
             saver.put(
                 cfg_worker_2,
                 cp_worker_2,
-                {
+                {  # type: ignore[typeddict-unknown-key]
                     "step": 2,
                     "node": "worker_node",
                     "parents": {subgraph_worker_ns: "cp-worker-01"},
@@ -282,7 +282,7 @@ class TestMilestone2Integration:
             saver.put(
                 cfg_validator,
                 cp_val,
-                {
+                {  # type: ignore[typeddict-unknown-key]
                     "step": 3,
                     "node": "validator_node",
                     "parents": {subgraph_validator_ns: "", subgraph_worker_ns: "cp-worker-02"},
@@ -351,7 +351,7 @@ class TestMilestone2Integration:
         - AC-19: fork_in_memory() clones subgraph up to target checkpoint into :memory: saver.
         - AC-20: In-memory sandbox writes leave .rl disk file bitwise unmodified.
         """
-        thread_id = "thread-m2-timetravel-003"
+        thread_id = "thread-timetravel-003"
         checkpoint_ids = ["cp-base-00", "cp-base-01", "cp-base-02"]
 
         # 1. Establish durable lineage on disk
@@ -359,13 +359,13 @@ class TestMilestone2Integration:
             cfg: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
 
             cp_0 = _build_checkpoint(checkpoint_ids[0], {"state": "init"})
-            disk_saver.put(cfg, cp_0, {"step": 0, "node": "start_node"}, {})
+            disk_saver.put(cfg, cp_0, {"step": 0, "node": "start_node"}, {})  # type: ignore[typeddict-unknown-key]
 
             cp_1 = _build_checkpoint(checkpoint_ids[1], {"state": "step_1"}, checkpoint_ids[0])
             disk_saver.put(
                 {"configurable": {"thread_id": thread_id, "checkpoint_id": checkpoint_ids[0]}},
                 cp_1,
-                {"step": 1, "node": "worker_node"},
+                {"step": 1, "node": "worker_node"},  # type: ignore[typeddict-unknown-key]
                 {},
             )
 
@@ -373,7 +373,7 @@ class TestMilestone2Integration:
             disk_saver.put(
                 {"configurable": {"thread_id": thread_id, "checkpoint_id": checkpoint_ids[1]}},
                 cp_2,
-                {"step": 2, "node": "end_node"},
+                {"step": 2, "node": "end_node"},  # type: ignore[typeddict-unknown-key]
                 {},
             )
 
@@ -413,7 +413,7 @@ class TestMilestone2Integration:
                 sandbox_saver.put(
                     {"configurable": {"thread_id": thread_id, "checkpoint_id": parent_id}},
                     spec_cp,
-                    {"step": i, "node": f"speculative_node_{i}"},
+                    {"step": i, "node": f"speculative_node_{i}"},  # type: ignore[typeddict-unknown-key]
                     {},
                 )
 
@@ -445,7 +445,7 @@ class TestMilestone2Integration:
         self, temp_disk_db: str, cli_runner: CliRunner
     ) -> None:
         """AC-21: Non-existent checkpoint raises CheckpointNotFoundError listing candidates."""
-        thread_id = "thread-m2-candidates-004"
+        thread_id = "thread-candidates-004"
         checkpoint_ids = ["cp-cand-01", "cp-cand-02", "cp-cand-03"]
 
         with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
@@ -453,7 +453,7 @@ class TestMilestone2Integration:
             parent: str | None = None
             for idx, cid in enumerate(checkpoint_ids):
                 cp = _build_checkpoint(cid, {"v": idx}, parent)
-                saver.put(cfg, cp, {"step": idx, "node": f"step_{idx}"}, {})
+                saver.put(cfg, cp, {"step": idx, "node": f"step_{idx}"}, {})  # type: ignore[typeddict-unknown-key]
                 parent = cid
 
             # Invoking fork_in_memory with a non-existent checkpoint must raise CheckpointNotFoundError
@@ -488,13 +488,13 @@ class TestMilestone2Integration:
         - AC-23: Branches and pending writes annotated with status tags ([BRANCH], [INTERRUPT], [PENDING]).
         - AC-24: Non-existent thread exits with code 1.
         """
-        thread_id = "thread-m2-visualizer-005"
+        thread_id = "thread-visualizer-005"
 
         with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
             # Step 1: Root
             cfg_1: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
             cp_1 = _build_checkpoint("cp-vis-01", {"data": "start"})
-            saver.put(cfg_1, cp_1, {"step": 1, "node": "router_agent"}, {})
+            saver.put(cfg_1, cp_1, {"step": 1, "node": "router_agent"}, {})  # type: ignore[typeddict-unknown-key]
 
             # Step 2: Main path with interrupt write (AC-23: [INTERRUPT])
             cfg_2: RunnableConfig = {
@@ -505,7 +505,7 @@ class TestMilestone2Integration:
                 }
             }
             cp_2 = _build_checkpoint("cp-vis-02", {"data": "paused"}, "cp-vis-01")
-            saver.put(cfg_2, cp_2, {"step": 2, "node": "approval_gate"}, {})
+            saver.put(cfg_2, cp_2, {"step": 2, "node": "approval_gate"}, {})  # type: ignore[typeddict-unknown-key]
             saver.put_writes(
                 {"configurable": {"thread_id": thread_id, "checkpoint_id": "cp-vis-02"}},
                 [("__interrupt__", {"reason": "Waiting on manager"})],
@@ -521,7 +521,7 @@ class TestMilestone2Integration:
                 }
             }
             cp_branch = _build_checkpoint("cp-vis-br01", {"data": "alt_path"}, "cp-vis-01")
-            saver.put(cfg_branch, cp_branch, {"step": 2, "node": "fallback_worker"}, {})
+            saver.put(cfg_branch, cp_branch, {"step": 2, "node": "fallback_worker"}, {})  # type: ignore[typeddict-unknown-key]
             saver.put_writes(
                 {"configurable": {"thread_id": thread_id, "checkpoint_id": "cp-vis-br01"}},
                 [("messages", {"content": "pending fallback response"})],
@@ -564,7 +564,7 @@ class TestMilestone2Integration:
         assert "not found" in missing_result.output.lower()
 
     def test_complete_cross_journey_wiring(self, temp_disk_db: str, cli_runner: CliRunner) -> None:
-        """Full end-to-end integration journey combining all Milestone 2 capabilities.
+        """Full end-to-end journey combining interrupts, replay and visualization.
 
         Drives:
         1. LangGraph StateGraph pipeline running to a human-in-the-loop interrupt.
@@ -599,7 +599,7 @@ class TestMilestone2Integration:
         workflow.add_edge("review", "finalize")
         workflow.add_edge("finalize", END)
 
-        thread_id = "thread-m2-journey-full"
+        thread_id = "thread-journey-full"
         config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
 
         # Step 1: Run on disk until interrupt
@@ -640,7 +640,7 @@ class TestMilestone2Integration:
             sandbox.put(
                 {"configurable": {"thread_id": thread_id, "checkpoint_id": int_cid}},
                 speculative_cp,
-                {"step": 99, "node": "sandbox_review"},
+                {"step": 99, "node": "sandbox_review"},  # type: ignore[typeddict-unknown-key]
                 {},
             )
             sandbox_tuple = sandbox.get_tuple({"configurable": {"thread_id": thread_id}})

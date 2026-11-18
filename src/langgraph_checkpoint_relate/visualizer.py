@@ -366,7 +366,6 @@ class DAGVisualizer:
         """Format the primary checkpoint display line for the tree."""
         step = info["step"]
         cid = info["checkpoint_id"]
-        short_id = cid if len(cid) <= 12 else cid[:8]
         created_at = escape(str(info["created_at"]))
 
         node = info.get("node")
@@ -382,7 +381,7 @@ class DAGVisualizer:
 
         ns_str = f" [ns: {escape(str(info['checkpoint_ns']))}]" if info.get("checkpoint_ns") else ""
 
-        return f"{status_markup} Step {step}{ns_str}: {node_str} (id: {escape(short_id)}) - {created_at}"
+        return f"{status_markup} Step {step}{ns_str}: {node_str} (id: {escape(cid)}) - {created_at}"
 
     def _add_checkpoint_subtree(
         self,
@@ -396,7 +395,7 @@ class DAGVisualizer:
     ) -> None:
         """Recursively append checkpoint nodes, pending writes, and branch subtrees."""
         if cid in visited:
-            tree_node.add(f"[dim red](cycle detected: {escape(cid[:8])})[/dim red]")
+            tree_node.add(f"[dim red](cycle detected: {escape(cid)})[/dim red]")
             return
         visited.add(cid)
 
@@ -440,9 +439,9 @@ class DAGVisualizer:
 
             if rel_type == "FORKED_TO":
                 child_info = parsed_checkpoints[child_id]
-                fork_header = "[bold cyan]🔀 Branch: [BRANCH][/bold cyan]"
+                fork_header = "[bold cyan]Branch: [BRANCH][/bold cyan]"
                 if child_info["thread_id"] != current_thread_id:
-                    fork_header = f"[bold cyan]🔀 Branch: [BRANCH] (thread: {escape(child_info['thread_id'])})[/bold cyan]"
+                    fork_header = f"[bold cyan]Branch: [BRANCH] (thread: {escape(child_info['thread_id'])})[/bold cyan]"
                 branch_node = current_node.add(fork_header)
                 self._add_checkpoint_subtree(
                     tree_node=branch_node,

@@ -114,8 +114,8 @@ class TestRelateSaverEndToEnd:
             assert records[0]["thread_count"] == 0
 
             # Verify round-trip put and get on fresh store
-            config = {"configurable": {"thread_id": "thread-init-01", "checkpoint_ns": ""}}
-            checkpoint = {
+            config: Any = {"configurable": {"thread_id": "thread-init-01", "checkpoint_ns": ""}}
+            checkpoint: Any = {
                 "v": 1,
                 "id": "cp-init-001",
                 "ts": datetime.now(UTC).isoformat(),
@@ -123,7 +123,7 @@ class TestRelateSaverEndToEnd:
                 "channel_versions": {"status": 1},
                 "versions_seen": {},
             }
-            metadata = {"source": "input", "step": 0, "writes": {}, "parents": {}}
+            metadata: Any = {"source": "input", "step": 0, "writes": {}, "parents": {}}
             res_config = saver.put(config, checkpoint, metadata, {})
             assert res_config["configurable"]["checkpoint_id"] == "cp-init-001"
 
@@ -170,9 +170,9 @@ class TestRelateSaverEndToEnd:
         builder.add_edge("format", END)
 
         with RelateSaver(db_path=temp_disk_path, wal_enabled=True) as saver:
-            graph: Pregel = builder.compile(checkpointer=saver)
+            graph: Pregel[Any, Any, Any, Any] = builder.compile(checkpointer=saver)
 
-            run_config = {"configurable": {"thread_id": "thread-pregel-01"}}
+            run_config: Any = {"configurable": {"thread_id": "thread-pregel-01"}}
             initial_state: PipelineState = {
                 "step": 0,
                 "data": "raw",
@@ -201,7 +201,7 @@ class TestRelateSaverEndToEnd:
                 len(history) >= 4
             )  # __start__, enrich (step 1), process (step 2), format (step 3)
 
-            steps = [h.metadata.get("step") for h in history if "step" in h.metadata]
+            steps: list[Any] = [h.metadata.get("step") for h in history if "step" in h.metadata]
             assert steps == sorted(steps, reverse=True)
             assert steps[0] == 3
 
@@ -224,7 +224,7 @@ class TestRelateSaverEndToEnd:
             for i in range(1, 6):
                 cid = f"cp-page-{i:03d}"
                 created_ids.append(cid)
-                chk = {
+                chk: Any = {
                     "v": 1,
                     "id": cid,
                     "ts": f"2026-11-12T10:{i:02d}:00Z",
@@ -232,19 +232,19 @@ class TestRelateSaverEndToEnd:
                     "channel_versions": {"counter": i, "val": i},
                     "versions_seen": {},
                 }
-                meta = {
+                meta: Any = {
                     "source": "loop",
                     "step": i,
                     "writes": {},
                     "parents": {parent_id: "parent"} if parent_id else {},
                 }
-                cfg = {"configurable": {"thread_id": thread_id, "checkpoint_id": parent_id}}
+                cfg: Any = {"configurable": {"thread_id": thread_id, "checkpoint_id": parent_id}}
                 saver.put(cfg, chk, meta, {})
                 parent_id = cid
 
             # AC-04: get_tuple with targeted checkpoint_id
             target_id = created_ids[2]  # cp-page-003
-            target_cfg = {"configurable": {"thread_id": thread_id, "checkpoint_id": target_id}}
+            target_cfg: Any = {"configurable": {"thread_id": thread_id, "checkpoint_id": target_id}}
             target_tuple = saver.get_tuple(target_cfg)
             assert target_tuple is not None
             assert target_tuple.checkpoint["id"] == target_id
@@ -254,8 +254,8 @@ class TestRelateSaverEndToEnd:
             # AC-07: list with before and limit parameters
             # Query checkpoints before cp-page-004 with limit=2
             cutoff_id = created_ids[3]  # cp-page-004
-            paged_cfg = {"configurable": {"thread_id": thread_id}}
-            before_cfg = {"configurable": {"thread_id": thread_id, "checkpoint_id": cutoff_id}}
+            paged_cfg: Any = {"configurable": {"thread_id": thread_id}}
+            before_cfg: Any = {"configurable": {"thread_id": thread_id, "checkpoint_id": cutoff_id}}
 
             paged_records = list(saver.list(paged_cfg, before=before_cfg, limit=2))
             assert len(paged_records) == 2
@@ -271,7 +271,7 @@ class TestRelateSaverEndToEnd:
             assert res_thread is None
 
             # Seed an existing thread
-            chk = {
+            chk: Any = {
                 "v": 1,
                 "id": "cp-exist-001",
                 "ts": datetime.now(UTC).isoformat(),
@@ -316,7 +316,7 @@ class TestRelateSaverEndToEnd:
 
         with RelateSaver(db_path=temp_disk_path, wal_enabled=True) as saver:
             graph = builder.compile(checkpointer=saver)
-            thread_cfg = {"configurable": {"thread_id": "thread-branch-01"}}
+            thread_cfg: Any = {"configurable": {"thread_id": "thread-branch-01"}}
 
             # Run 1: initial execution
             res1 = graph.invoke({"counter": 0, "path": "start"}, config=thread_cfg)
@@ -328,7 +328,7 @@ class TestRelateSaverEndToEnd:
             root_cp_id = root_cp.checkpoint["id"]
 
             # Run 2: resume / branch from root_cp_id with modified state
-            branch_cfg = {
+            branch_cfg: Any = {
                 "configurable": {
                     "thread_id": "thread-branch-01",
                     "checkpoint_id": root_cp_id,
@@ -368,7 +368,7 @@ class TestRelateSaverEndToEnd:
                     for step_idx in range(writes_per_thread):
                         tid = f"thread-concurrent-{thread_idx}"
                         cid = f"cp-t{thread_idx}-s{step_idx}"
-                        chk = {
+                        chk: Any = {
                             "v": 1,
                             "id": cid,
                             "ts": datetime.now(UTC).isoformat(),
@@ -380,13 +380,13 @@ class TestRelateSaverEndToEnd:
                             "channel_versions": {"thread_idx": 1, "step": step_idx + 1},
                             "versions_seen": {},
                         }
-                        meta = {
+                        meta: Any = {
                             "source": "concurrent_test",
                             "step": step_idx,
                             "writes": {},
                             "parents": {},
                         }
-                        cfg = {"configurable": {"thread_id": tid}}
+                        cfg: Any = {"configurable": {"thread_id": tid}}
                         saver.put(cfg, chk, meta, {})
                 except Exception as exc:
                     errors.append(exc)
@@ -396,7 +396,7 @@ class TestRelateSaverEndToEnd:
                     barrier.wait(timeout=10.0)
                     for _ in range(15):
                         tid = f"thread-concurrent-{reader_idx % num_writers}"
-                        cfg = {"configurable": {"thread_id": tid}}
+                        cfg: Any = {"configurable": {"thread_id": tid}}
                         tuple_res = saver.get_tuple(cfg)
                         if tuple_res is not None:
                             # AC-09: Reader must observe consistent committed state
@@ -440,8 +440,8 @@ class TestRelateSaverEndToEnd:
 
         # Session 1: Commit two checkpoints to disk
         with RelateSaver(db_path=temp_disk_path, wal_enabled=True) as saver1:
-            cfg = {"configurable": {"thread_id": thread_id}}
-            chk1 = {
+            cfg: Any = {"configurable": {"thread_id": thread_id}}
+            chk1: Any = {
                 "v": 1,
                 "id": chk_id_1,
                 "ts": "2026-11-12T11:00:00Z",
@@ -451,7 +451,7 @@ class TestRelateSaverEndToEnd:
             }
             saver1.put(cfg, chk1, {"step": 1}, {})
 
-            chk2 = {
+            chk2: Any = {
                 "v": 1,
                 "id": chk_id_2,
                 "ts": "2026-11-12T11:01:00Z",
@@ -570,7 +570,7 @@ class TestRelateSaverEndToEnd:
 
         with RelateSaver(db_path=temp_disk_path, wal_enabled=True) as saver:
             graph = builder.compile(checkpointer=saver)
-            run_cfg = {"configurable": {"thread_id": "thread-rich-types"}}
+            run_cfg: Any = {"configurable": {"thread_id": "thread-rich-types"}}
 
             initial_state: RichTypeState = {
                 "messages": [HumanMessage(content="Run analysis query")],
@@ -621,8 +621,8 @@ class TestRelateSaverEndToEnd:
             assert len(connections_created) >= 1
             assert connections_created[0] == ":memory:"
 
-            cfg = {"configurable": {"thread_id": "thread-seam-test"}}
-            chk = {
+            cfg: Any = {"configurable": {"thread_id": "thread-seam-test"}}
+            chk: Any = {
                 "v": 1,
                 "id": "cp-seam-001",
                 "ts": datetime.now(UTC).isoformat(),

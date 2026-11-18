@@ -6,10 +6,12 @@ conforming to LangGraph's BaseCheckpointSaver interface.
 
 from __future__ import annotations
 
+import asyncio
+import builtins
 import logging
 import random
 import uuid
-from collections.abc import Iterator, Sequence
+from collections.abc import AsyncIterator, Iterable, Iterator, Sequence
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -29,9 +31,15 @@ from langgraph.checkpoint.base import (
 )
 from langgraph.checkpoint.serde.base import SerializerProtocol
 
-from langgraph_checkpoint_relate.errors import RelateCheckpointError
+from langgraph_checkpoint_relate.errors import RelateCheckpointError, RelateReadOnlyError
 from langgraph_checkpoint_relate.proxy import RelateThreadProxy
 from langgraph_checkpoint_relate.serde import RelateStateSerializer, default_serializer
+from langgraph_checkpoint_relate.tool_calls import (
+    AppliedToolCalls,
+    build_tool_call_statements,
+    detached_call_ids,
+    extract_tool_events,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +78,7 @@ class RelateSaver(BaseCheckpointSaver[str]):
         proxy: RelateThreadProxy | None = None,
         serde: RelateStateSerializer | SerializerProtocol | None = None,
         connection_factory: Any | None = None,
+        read_only: bool = False,
     ) -> None:
         """Initialize RelateSaver checkpointer.
 
@@ -80,9 +89,32 @@ class RelateSaver(BaseCheckpointSaver[str]):
             proxy: Optional pre-configured RelateThreadProxy actor instance.
             serde: Optional custom serializer protocol (defaults to RelateStateSerializer).
             connection_factory: Optional custom connection factory for driver injection.
+            read_only: Open the file store for inspection only. The file stays
+                byte-identical: no schema setup, no flush, and writes raise
+                RelateReadOnlyError. With a passed proxy, the saver takes its
+                read-only state from that proxy.
+
+        Raises:
+            ValueError: If read_only is true with ":memory:" or with a writable proxy.
         """
         self.serde: RelateStateSerializer | Any = serde or default_serializer
         super().__init__(serde=self.serde)
+        self._applied_tool_calls = AppliedToolCalls()
+
+        passed_proxy = db_path if isinstance(db_path, RelateThreadProxy) else proxy
+        if read_only:
+            if passed_proxy is not None:
+                if getattr(passed_proxy, "read_only", False) is not True:
+                    raise ValueError("read_only=True requires a read-only proxy")
+            elif str(db_path) == ":memory:":
+                raise ValueError(
+                    "read_only=True requires a file path; ':memory:' has nothing to inspect"
+                )
+        self.read_only = (
+            getattr(passed_proxy, "read_only", False) is True
+            if passed_proxy is not None
+            else read_only
+        )
 
         if isinstance(db_path, RelateThreadProxy):
             self.proxy = db_path
@@ -106,8 +138,14 @@ class RelateSaver(BaseCheckpointSaver[str]):
                 wal_enabled=wal_enabled,
                 connection_factory=connection_factory,
                 auto_init_schema=True,
+                read_only=read_only,
             )
             self._owns_proxy = True
+
+    def _check_writable(self) -> None:
+        """Refuse writes on a read-only saver before anything is serialized."""
+        if self.read_only:
+            raise RelateReadOnlyError("RelateSaver is read-only; checkpoints cannot be written")
 
     def get_next_version(self, current: str | None, channel: None = None) -> str:
         """Generate a monotonically increasing version identifier for channel writes.
@@ -159,7 +197,9 @@ class RelateSaver(BaseCheckpointSaver[str]):
             ValueError: If thread_id is missing, invalid, or empty.
             CheckpointSerializationError: If checkpoint or metadata cannot be serialized.
             RelateCheckpointError: If database persistence fails.
+            RelateReadOnlyError: If the saver is read-only.
         """
+        self._check_writable()
         configurable = config.get("configurable", {}) if config else {}
         thread_id = configurable.get("thread_id")
         if not thread_id or not isinstance(thread_id, str) or not thread_id.strip():
@@ -251,6 +291,14 @@ class RelateSaver(BaseCheckpointSaver[str]):
 
         self.proxy.execute_write(cypher, params)
 
+        channel_values = checkpoint.get("channel_values")
+        if isinstance(channel_values, dict):
+            self._capture_tool_calls(
+                values=channel_values.values(),
+                thread_id=thread_id,
+                checkpoint_id=checkpoint_id,
+            )
+
         return {
             "configurable": {
                 "thread_id": thread_id,
@@ -278,7 +326,11 @@ class RelateSaver(BaseCheckpointSaver[str]):
             writes: Sequence of (channel, value) write pairs.
             task_id: Identifier of the task that produced the writes.
             task_path: Optional execution path within the subgraph.
+
+        Raises:
+            RelateReadOnlyError: If the saver is read-only.
         """
+        self._check_writable()
         if not writes:
             return
 
@@ -336,6 +388,49 @@ class RelateSaver(BaseCheckpointSaver[str]):
             statements.append((stmt, params))
 
         self.proxy.execute_batch(statements)
+
+        self._capture_tool_calls(
+            values=[value for _, value in writes],
+            thread_id=thread_id,
+            checkpoint_id=checkpoint_id_str,
+        )
+
+    def _capture_tool_calls(
+        self,
+        values: Iterable[Any],
+        thread_id: str,
+        checkpoint_id: str,
+    ) -> None:
+        """Record new tool calls found in saved values as :ToolCall nodes (best effort).
+
+        Runs as its own transaction after the checkpoint or writes have committed, so a
+        failure here is logged and ignored and never affects the save (AC-47). Only events
+        this saver has not already committed are serialized and sent; when none are new, no
+        transaction is issued (ADR-0011). Only the checkpoint id and the exception class
+        name are logged, never call content.
+        """
+        try:
+            events = extract_tool_events(values)
+            plan = self._applied_tool_calls.plan(events, thread_id=thread_id)
+            if not plan.events.invocations and not plan.events.outcomes:
+                return
+            statements = build_tool_call_statements(
+                plan.events,
+                thread_id=thread_id,
+                checkpoint_id=checkpoint_id,
+                serde=self.serde,
+                created_at=_utc_now_iso(),
+            )
+            detached: frozenset[str] = frozenset()
+            if statements:
+                detached = detached_call_ids(self.proxy.execute_batch(statements, flush=False))
+            self._applied_tool_calls.mark_applied(plan, thread_id=thread_id, detached=detached)
+        except Exception as exc:
+            logger.warning(
+                "Tool call capture failed for checkpoint %s: %s",
+                checkpoint_id,
+                type(exc).__name__,
+            )
 
     def get_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
         """Retrieve the latest or targeted checkpoint tuple with pending writes.
@@ -616,6 +711,49 @@ class RelateSaver(BaseCheckpointSaver[str]):
             if limit is not None and yielded_count >= limit:
                 break
 
+    async def aget_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
+        """Async counterpart of get_tuple; runs it on a worker thread (AC-50, AC-54)."""
+        return await asyncio.to_thread(self.get_tuple, config)
+
+    async def alist(
+        self,
+        config: RunnableConfig | None,
+        *,
+        filter: dict[str, Any] | None = None,
+        before: RunnableConfig | None = None,
+        limit: int | None = None,
+    ) -> AsyncIterator[CheckpointTuple]:
+        """Async counterpart of list.
+
+        The synchronous generator is fully materialized in one worker-thread call,
+        then the tuples are yielded in order (AC-50, AC-54).
+        """
+        tuples = await asyncio.to_thread(
+            lambda: builtins.list(self.list(config, filter=filter, before=before, limit=limit))
+        )
+        for tup in tuples:
+            yield tup
+
+    async def aput(
+        self,
+        config: RunnableConfig,
+        checkpoint: Checkpoint,
+        metadata: CheckpointMetadata,
+        new_versions: ChannelVersions,
+    ) -> RunnableConfig:
+        """Async counterpart of put; runs it on a worker thread (AC-50, AC-54)."""
+        return await asyncio.to_thread(self.put, config, checkpoint, metadata, new_versions)
+
+    async def aput_writes(
+        self,
+        config: RunnableConfig,
+        writes: Sequence[tuple[str, Any]],
+        task_id: str,
+        task_path: str = "",
+    ) -> None:
+        """Async counterpart of put_writes; runs it on a worker thread (AC-50, AC-54)."""
+        await asyncio.to_thread(self.put_writes, config, writes, task_id, task_path)
+
     def fork_in_memory(
         self,
         thread_id: str,
@@ -652,7 +790,7 @@ class RelateSaver(BaseCheckpointSaver[str]):
         self,
         thread_id: str,
         threshold: int = 2,
-    ) -> list[LoopReport]:
+    ) -> builtins.list[LoopReport]:
         """Identify state oscillation or repeating cycle paths in the Cypher DAG.
 
         Delegates to RelateForensics.detect_loops.
@@ -695,6 +833,8 @@ class RelateSaver(BaseCheckpointSaver[str]):
         Args:
             timeout: Optional maximum duration in seconds to await flush completion.
         """
+        if self.read_only:
+            return
         if hasattr(self.proxy, "flush"):
             self.proxy.flush(timeout=timeout)
 

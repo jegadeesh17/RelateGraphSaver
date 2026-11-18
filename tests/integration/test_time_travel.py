@@ -13,20 +13,24 @@ from pathlib import Path
 from typing import Any, TypedDict, cast
 
 import pytest
+from examples.tool_agent import TOOL_NAME, run_tool_agent
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import tool
 from langgraph.checkpoint.base import (
     ChannelVersions,
     Checkpoint,
     CheckpointMetadata,
     empty_checkpoint,
 )
-from langgraph.graph import END, START, StateGraph
+from langgraph.graph import END, START, MessagesState, StateGraph
+from langgraph.prebuilt import ToolNode
 
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from langgraph_checkpoint_relate.errors import CheckpointNotFoundError
+from langgraph_checkpoint_relate.errors import CheckpointNotFoundError, RelateCheckpointError
 from langgraph_checkpoint_relate.saver import RelateSaver
 from langgraph_checkpoint_relate.time_travel import TimeTravelEngine, fork_in_memory
 
@@ -509,3 +513,286 @@ class TestTimeTravelReplay:
             assert final_source_tuple.checkpoint["channel_values"]["count"] == 60
         finally:
             source_saver.close()
+
+
+class TestForkFromReadOnlySource:
+    """Replay opens its source read-only, so the source stays bitwise untouched (ADR-0015)."""
+
+    def test_fork_from_read_only_source_leaves_file_unchanged_ac_83(
+        self, temp_disk_db: str
+    ) -> None:
+        """AC-83: hash before the open equals hash after the close, covering open and close."""
+        thread_id = "thread-ro-fork"
+        with RelateSaver(db_path=temp_disk_db) as writer:
+            cfg = writer.put(
+                {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}},
+                _make_checkpoint("cp-ro-0", {"value": "zero"}),
+                {"step": 0},
+                {"value": "1.0"},
+            )
+            writer.put(
+                cfg,
+                _make_checkpoint("cp-ro-1", {"value": "one"}, "cp-ro-0"),
+                {"step": 1},
+                {"value": "2.0"},
+            )
+
+        directory = os.path.dirname(temp_disk_db)
+        before_hash = _compute_file_sha256(temp_disk_db)
+        before_listing = sorted(os.listdir(directory))
+
+        source = RelateSaver(db_path=temp_disk_db, read_only=True)
+        sandbox = source.fork_in_memory(thread_id, "cp-ro-1")
+        try:
+            assert sandbox.read_only is False
+            latest = sandbox.get_tuple({"configurable": {"thread_id": thread_id}})
+            assert latest is not None
+            assert latest.checkpoint["channel_values"]["value"] == "one"
+
+            # The fork is writable and independent of the read-only source.
+            sandbox.put(
+                {"configurable": {"thread_id": thread_id, "checkpoint_id": "cp-ro-1"}},
+                _make_checkpoint("cp-ro-2", {"value": "speculative"}, "cp-ro-1"),
+                {"step": 2},
+                {"value": "3.0"},
+            )
+        finally:
+            sandbox.close()
+            source.close()
+
+        assert _compute_file_sha256(temp_disk_db) == before_hash
+        assert sorted(os.listdir(directory)) == before_listing
+
+    def test_fork_of_missing_checkpoint_from_read_only_source_raises_ac_21(
+        self, temp_disk_db: str
+    ) -> None:
+        """AC-21: an unknown checkpoint still raises CheckpointNotFoundError on a read-only source."""
+        with RelateSaver(db_path=temp_disk_db) as writer:
+            writer.put(
+                {"configurable": {"thread_id": "thread-ro-missing", "checkpoint_ns": ""}},
+                _make_checkpoint("cp-ro-0", {"value": "zero"}),
+                {"step": 0},
+                {"value": "1.0"},
+            )
+        before_hash = _compute_file_sha256(temp_disk_db)
+        with RelateSaver(db_path=temp_disk_db, read_only=True) as source:
+            with pytest.raises(CheckpointNotFoundError):
+                source.fork_in_memory("thread-ro-missing", "no-such-checkpoint")
+        assert _compute_file_sha256(temp_disk_db) == before_hash
+
+
+def _tool_rows(saver: RelateSaver) -> dict[str, dict[str, Any]]:
+    """Return every ToolCall node keyed by call_id, with the checkpoint that invoked it."""
+    rows = saver.proxy.execute_read(
+        "MATCH (c:Checkpoint)-[:INVOKED]->(tc:ToolCall) "
+        "RETURN c.checkpoint_id AS checkpoint_id, tc.call_id AS call_id, "
+        "tc.tool_name AS tool_name, tc.args_blob AS args_blob, tc.result_blob AS result_blob, "
+        "tc.error AS error, tc.created_at AS created_at"
+    )
+    return {str(row["call_id"]): row for row in rows}
+
+
+def _count_nodes(saver: RelateSaver, label: str) -> int:
+    rows = saver.proxy.execute_read(f"MATCH (n:{label}) RETURN count(n) AS n")
+    return int(rows[0]["n"])
+
+
+def _checkpoint_with(
+    saver: RelateSaver, config: RunnableConfig, *, has_tool_result: bool, has_tool_call: bool
+) -> str:
+    """Return the id of the checkpoint whose messages match the given tool call/result shape."""
+    for item in saver.list(config):
+        messages: list[AnyMessage] = item.checkpoint["channel_values"].get("messages", [])
+        called = any(isinstance(m, AIMessage) and m.tool_calls for m in messages)
+        answered = any(isinstance(m, ToolMessage) for m in messages)
+        if called == has_tool_call and answered == has_tool_result:
+            return str(item.config["configurable"]["checkpoint_id"])
+    raise AssertionError("no checkpoint with the requested tool call shape")
+
+
+class _UnreadableSerde:
+    """A serializer that cannot read any stored blob."""
+
+    def loads(self, data: bytes) -> Any:
+        raise ValueError("blob is unreadable")
+
+
+_REPLAY_CALL_ID = "call_replay_fixed"
+_tool_behavior = {"fail": True}
+
+
+@tool
+def flaky_lookup(key: str) -> str:
+    """Fail while the module-level behavior says so, otherwise succeed."""
+    if _tool_behavior["fail"]:
+        raise RuntimeError(f"lookup of {key} failed")
+    return f"value for {key}"
+
+
+def _flaky_agent(state: MessagesState) -> dict[str, list[AnyMessage]]:
+    if any(isinstance(m, ToolMessage) for m in state["messages"]):
+        return {"messages": [AIMessage(content="done")]}
+    call = {"name": "flaky_lookup", "args": {"key": "k"}, "id": _REPLAY_CALL_ID}
+    return {"messages": [AIMessage(content="", tool_calls=[call])]}
+
+
+def _flaky_route(state: MessagesState) -> str:
+    last = state["messages"][-1]
+    return "tools" if isinstance(last, AIMessage) and last.tool_calls else END
+
+
+def _flaky_graph(saver: RelateSaver) -> Any:
+    builder = StateGraph(MessagesState)
+    builder.add_node("agent", _flaky_agent)
+    builder.add_node("tools", ToolNode([flaky_lookup], handle_tool_errors=True))
+    builder.add_edge(START, "agent")
+    builder.add_conditional_edges("agent", _flaky_route, ["tools", END])
+    builder.add_edge("tools", "agent")
+    return builder.compile(checkpointer=saver)
+
+
+class TestForkToolCalls:
+    """ADR-0010: a fork copies lineage tool calls, with outcomes only up to the fork point."""
+
+    def test_fork_at_latest_names_the_same_failing_tool_ac_19(self, temp_disk_db: str) -> None:
+        thread_id = "tt-tools-latest"
+        config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+        with RelateSaver(db_path=temp_disk_db) as source:
+            run_tool_agent(source, thread_id, fail=True)
+            latest = source.get_tuple(config)
+            assert latest is not None
+            target = str(latest.config["configurable"]["checkpoint_id"])
+            fork = source.fork_in_memory(thread_id, target)
+            try:
+                expected = source.trace_root_cause(thread_id)
+                actual = fork.trace_root_cause(thread_id)
+                assert expected.root_tool_name == TOOL_NAME
+                assert actual.error_checkpoint_id == expected.error_checkpoint_id
+                assert actual.error_message == expected.error_message
+                assert actual.root_tool_call_id == expected.root_tool_call_id
+                assert actual.root_tool_name == expected.root_tool_name
+                assert set(_tool_rows(fork)) == set(_tool_rows(source))
+            finally:
+                fork.close()
+
+    def test_fork_before_the_result_copies_the_call_without_an_outcome_ac_19(
+        self, temp_disk_db: str
+    ) -> None:
+        thread_id = "tt-tools-before-result"
+        config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+        with RelateSaver(db_path=temp_disk_db) as source:
+            run_tool_agent(source, thread_id, fail=True)
+            source_row = next(iter(_tool_rows(source).values()))
+            assert source_row["error"]
+            target = _checkpoint_with(source, config, has_tool_result=False, has_tool_call=True)
+            fork = source.fork_in_memory(thread_id, target)
+            try:
+                rows = _tool_rows(fork)
+                assert set(rows) == {source_row["call_id"]}
+                row = rows[source_row["call_id"]]
+                assert row["tool_name"] == TOOL_NAME
+                assert row["args_blob"] is not None
+                assert row["created_at"] == source_row["created_at"]
+                assert row["checkpoint_id"] == source_row["checkpoint_id"]
+                assert row["result_blob"] is None
+                assert row["error"] is None
+            finally:
+                fork.close()
+
+    def test_replay_in_the_fork_records_the_new_outcome_ac_19(self, temp_disk_db: str) -> None:
+        thread_id = "tt-tools-replay"
+        config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+        _tool_behavior["fail"] = True
+        try:
+            with RelateSaver(db_path=temp_disk_db) as source:
+                _flaky_graph(source).invoke({"messages": [HumanMessage(content="go")]}, config)
+                assert _tool_rows(source)[_REPLAY_CALL_ID]["error"]
+                target = _checkpoint_with(source, config, has_tool_result=False, has_tool_call=True)
+                fork = source.fork_in_memory(thread_id, target)
+                try:
+                    assert _tool_rows(fork)[_REPLAY_CALL_ID]["error"] is None
+
+                    _tool_behavior["fail"] = False
+                    replay_config: RunnableConfig = {
+                        "configurable": {"thread_id": thread_id, "checkpoint_id": target}
+                    }
+                    _flaky_graph(fork).invoke(None, replay_config)
+
+                    row = _tool_rows(fork)[_REPLAY_CALL_ID]
+                    assert row["result_blob"] is not None
+                    assert row["error"] is None
+                    # The source keeps its own recorded failure.
+                    assert _tool_rows(source)[_REPLAY_CALL_ID]["error"]
+                finally:
+                    fork.close()
+        finally:
+            _tool_behavior["fail"] = True
+
+    def test_tool_call_linked_only_outside_the_lineage_is_not_copied_ac_19(
+        self, temp_disk_db: str
+    ) -> None:
+        thread_id = "tt-tools-outside"
+        with RelateSaver(db_path=temp_disk_db) as source:
+            run_tool_agent(source, thread_id, fail=True)
+            invoking_id = str(next(iter(_tool_rows(source).values()))["checkpoint_id"])
+            parent_rows = source.proxy.execute_read(
+                "MATCH (c:Checkpoint {checkpoint_id: $cid}) "
+                "RETURN c.parent_checkpoint_id AS parent_id",
+                {"cid": invoking_id},
+            )
+            parent_id = parent_rows[0]["parent_id"]
+            assert parent_id is not None
+            fork = source.fork_in_memory(thread_id, str(parent_id))
+            try:
+                assert _count_nodes(fork, "ToolCall") == 0
+                edges = fork.proxy.execute_read("MATCH ()-[r:INVOKED]->() RETURN count(r) AS n")
+                assert int(edges[0]["n"]) == 0
+                assert _count_nodes(fork, "Checkpoint") < _count_nodes(source, "Checkpoint")
+            finally:
+                fork.close()
+
+    def test_unreadable_fork_point_blob_raises_checkpoint_error_ac_19(
+        self, temp_disk_db: str
+    ) -> None:
+        thread_id = "tt-tools-unreadable"
+        config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+        with RelateSaver(db_path=temp_disk_db) as source:
+            run_tool_agent(source, thread_id, fail=True)
+            latest = source.get_tuple(config)
+            assert latest is not None
+            target = str(latest.config["configurable"]["checkpoint_id"])
+            source.serde = _UnreadableSerde()
+            with pytest.raises(RelateCheckpointError, match="fork-point checkpoint"):
+                source.fork_in_memory(thread_id, target)
+
+    def test_fork_with_tool_calls_leaves_the_source_graph_untouched_ac_20(
+        self, temp_disk_db: str
+    ) -> None:
+        thread_id = "tt-tools-untouched"
+        config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+
+        def graph_counts(saver: RelateSaver) -> tuple[int, int]:
+            nodes = saver.proxy.execute_read("MATCH (n) RETURN count(n) AS n")
+            rels = saver.proxy.execute_read("MATCH ()-[r]->() RETURN count(r) AS n")
+            return int(nodes[0]["n"]), int(rels[0]["n"])
+
+        # Node and relationship counts are compared instead of the file's sha256: relate-db
+        # rewrites the .rl file on every open and close, even when the session only reads
+        # (the hash changes with no fork involved), and holds an exclusive lock on it while open.
+        with RelateSaver(db_path=temp_disk_db) as source:
+            run_tool_agent(source, thread_id, fail=True)
+            latest = source.get_tuple(config)
+            assert latest is not None
+            target = str(latest.config["configurable"]["checkpoint_id"])
+            tool_rows_before = _tool_rows(source)
+
+            before = graph_counts(source)
+            fork = source.fork_in_memory(thread_id, target)
+            try:
+                assert _count_nodes(fork, "ToolCall") == 1
+                fork.trace_root_cause(thread_id)
+            finally:
+                fork.close()
+
+            assert graph_counts(source) == before
+            assert _tool_rows(source) == tool_rows_before
