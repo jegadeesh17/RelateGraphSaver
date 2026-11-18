@@ -17,6 +17,7 @@ from langgraph_checkpoint_relate.errors import (
     RelateCheckpointError,
     RelateConcurrencyError,
     RelateConnectionError,
+    RelateReadOnlyError,
 )
 from langgraph_checkpoint_relate.schema import initialize_schema
 
@@ -106,8 +107,15 @@ class RelateThreadProxy:
         connection_factory: Callable[..., Any] | None = None,
         auto_init_schema: bool = True,
         default_timeout: float | None = 30.0,
+        *,
+        read_only: bool = False,
     ) -> None:
+        if read_only and db_path == ":memory:":
+            raise ValueError(
+                "read_only=True requires a file path; ':memory:' has nothing to inspect"
+            )
         self.db_path = db_path
+        self.read_only = read_only
         self.wal_enabled = wal_enabled
         self.auto_init_schema = auto_init_schema
         self.default_timeout = default_timeout
@@ -154,20 +162,22 @@ class RelateThreadProxy:
 
     def _open_connection(self) -> Any:
         """Open database connection on the worker thread."""
-        if self.db_path != ":memory:":
+        if self.db_path != ":memory:" and not self.read_only:
             parent_dir = os.path.dirname(os.path.abspath(self.db_path))
             if parent_dir:
                 os.makedirs(parent_dir, exist_ok=True)
 
         if self._connection_factory is not None:
             return self._connection_factory(self.db_path)
+        if self.read_only:
+            return relate.connect(database=self.db_path, read_only=True)
         return relate.connect(database=self.db_path)
 
     def _worker_loop(self) -> None:
         """Worker thread loop executing commands strictly on this thread."""
         try:
             self._conn = self._open_connection()
-            if self.auto_init_schema:
+            if self.auto_init_schema and not self.read_only:
                 initialize_schema(self._conn)
             self._ready_event.set()
         except Exception as exc:
@@ -198,15 +208,40 @@ class RelateThreadProxy:
                 logger.debug("Callable work item raised exception: %s", call_exc)
             return
         if isinstance(item, DbCommand):
+            if item.is_write and self.read_only:
+                item.future.set_exception(self._read_only_error())
+                return
             self._handle_db_command(item)
         elif isinstance(item, BatchCommand):
+            if self.read_only:
+                item.future.set_exception(self._read_only_error())
+                return
             self._handle_batch_command(item)
         elif isinstance(item, tuple) and len(item) == 4:
+            if self.read_only:
+                self._fail_tuple_command(item, self._read_only_error())
+                return
             self._handle_tuple_command(item)
         elif isinstance(item, dict):
             self._handle_dict_command(item)
         else:
             logger.warning("Unrecognized message type submitted to actor queue: %r", type(item))
+
+    @staticmethod
+    def _read_only_error() -> RelateReadOnlyError:
+        return RelateReadOnlyError("RelateThreadProxy is read-only; writes are not allowed")
+
+    @staticmethod
+    def _fail_tuple_command(item: tuple[Any, Any, Any, Any], err: RelateCheckpointError) -> None:
+        """Fail a (query, params, event, result_holder) item without touching the driver."""
+        _, _, event, holder = item
+        if isinstance(holder, dict):
+            holder["result"] = None
+            holder["error"] = err
+        elif isinstance(holder, list):
+            holder.append(err)
+        if hasattr(event, "set"):
+            event.set()
 
     def _handle_db_command(self, cmd: DbCommand) -> None:
         """Execute a single Cypher command."""
@@ -327,10 +362,17 @@ class RelateThreadProxy:
                 is_write=msg.get("is_write", True),
                 future=future or concurrent.futures.Future(),
             )
+            if db_cmd.is_write and self.read_only:
+                db_cmd.future.set_exception(self._read_only_error())
+                return
             self._handle_db_command(db_cmd)
             return
 
         if msg_type == "transaction":
+            if self.read_only:
+                if future is not None:
+                    future.set_exception(self._read_only_error())
+                return
             batch_cmd = BatchCommand(
                 statements=msg["statements"],
                 future=future or concurrent.futures.Future(),
@@ -352,7 +394,8 @@ class RelateThreadProxy:
         """Close connection and fail any remaining pending commands."""
         if self._conn is not None:
             # Batches committed without their own flush become durable here.
-            if self.wal_enabled and hasattr(self._conn, "flush"):
+            # A read-only connection never flushes.
+            if self.wal_enabled and not self.read_only and hasattr(self._conn, "flush"):
                 try:
                     self._conn.flush()
                 except Exception as flush_exc:
@@ -424,6 +467,7 @@ class RelateThreadProxy:
         timeout: float | None = None,
     ) -> list[dict[str, Any]]:
         """Execute a mutating Cypher query under the exclusive writer lock."""
+        self._check_writable()
         return self._dispatch_execute(cypher, params, is_write=True, timeout=timeout)
 
     def execute(
@@ -433,6 +477,7 @@ class RelateThreadProxy:
         timeout: float | None = None,
     ) -> list[dict[str, Any]]:
         """Execute a Cypher statement (read or write)."""
+        self._check_writable()
         return self._dispatch_execute(query, params, is_write=True, timeout=timeout)
 
     def _dispatch_execute(
@@ -477,6 +522,7 @@ class RelateThreadProxy:
         per-write flush is skipped; the data is flushed by the next flushed write
         or by ``close()``.
         """
+        self._check_writable()
         self._check_active()
 
         if isinstance(statements, (str, bytes)) or not isinstance(statements, Sequence):
@@ -522,6 +568,11 @@ class RelateThreadProxy:
         """Alias for execute_batch providing transaction semantics."""
         return self.execute_batch(queries_and_params, timeout=timeout)
 
+    def _check_writable(self) -> None:
+        """Refuse writes on a read-only proxy before anything is queued."""
+        if self.read_only:
+            raise self._read_only_error()
+
     def _check_active(self) -> None:
         """Verify the actor proxy is active and worker thread is alive."""
         if self._is_closed:
@@ -530,8 +581,10 @@ class RelateThreadProxy:
             raise RelateConnectionError("RelateThreadProxy background worker thread is not running")
 
     def flush(self, timeout: float | None = None) -> None:
-        """Explicitly flush pending changes to disk WAL."""
+        """Explicitly flush pending changes to disk WAL (a no-op when read-only)."""
         self._check_active()
+        if self.read_only:
+            return
         fut: concurrent.futures.Future[None] = concurrent.futures.Future()
 
         def do_flush() -> None:

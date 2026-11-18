@@ -515,6 +515,72 @@ class TestTimeTravelReplay:
             source_saver.close()
 
 
+class TestForkFromReadOnlySource:
+    """Replay opens its source read-only, so the source stays bitwise untouched (ADR-0015)."""
+
+    def test_fork_from_read_only_source_leaves_file_unchanged_ac_83(
+        self, temp_disk_db: str
+    ) -> None:
+        """AC-83: hash before the open equals hash after the close, covering open and close."""
+        thread_id = "thread-ro-fork"
+        with RelateSaver(db_path=temp_disk_db) as writer:
+            cfg = writer.put(
+                {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}},
+                _make_checkpoint("cp-ro-0", {"value": "zero"}),
+                {"step": 0},
+                {"value": "1.0"},
+            )
+            writer.put(
+                cfg,
+                _make_checkpoint("cp-ro-1", {"value": "one"}, "cp-ro-0"),
+                {"step": 1},
+                {"value": "2.0"},
+            )
+
+        directory = os.path.dirname(temp_disk_db)
+        before_hash = _compute_file_sha256(temp_disk_db)
+        before_listing = sorted(os.listdir(directory))
+
+        source = RelateSaver(db_path=temp_disk_db, read_only=True)
+        sandbox = source.fork_in_memory(thread_id, "cp-ro-1")
+        try:
+            assert sandbox.read_only is False
+            latest = sandbox.get_tuple({"configurable": {"thread_id": thread_id}})
+            assert latest is not None
+            assert latest.checkpoint["channel_values"]["value"] == "one"
+
+            # The fork is writable and independent of the read-only source.
+            sandbox.put(
+                {"configurable": {"thread_id": thread_id, "checkpoint_id": "cp-ro-1"}},
+                _make_checkpoint("cp-ro-2", {"value": "speculative"}, "cp-ro-1"),
+                {"step": 2},
+                {"value": "3.0"},
+            )
+        finally:
+            sandbox.close()
+            source.close()
+
+        assert _compute_file_sha256(temp_disk_db) == before_hash
+        assert sorted(os.listdir(directory)) == before_listing
+
+    def test_fork_of_missing_checkpoint_from_read_only_source_raises_ac_21(
+        self, temp_disk_db: str
+    ) -> None:
+        """AC-21: an unknown checkpoint still raises CheckpointNotFoundError on a read-only source."""
+        with RelateSaver(db_path=temp_disk_db) as writer:
+            writer.put(
+                {"configurable": {"thread_id": "thread-ro-missing", "checkpoint_ns": ""}},
+                _make_checkpoint("cp-ro-0", {"value": "zero"}),
+                {"step": 0},
+                {"value": "1.0"},
+            )
+        before_hash = _compute_file_sha256(temp_disk_db)
+        with RelateSaver(db_path=temp_disk_db, read_only=True) as source:
+            with pytest.raises(CheckpointNotFoundError):
+                source.fork_in_memory("thread-ro-missing", "no-such-checkpoint")
+        assert _compute_file_sha256(temp_disk_db) == before_hash
+
+
 def _tool_rows(saver: RelateSaver) -> dict[str, dict[str, Any]]:
     """Return every ToolCall node keyed by call_id, with the checkpoint that invoked it."""
     rows = saver.proxy.execute_read(

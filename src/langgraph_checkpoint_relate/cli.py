@@ -61,6 +61,14 @@ def _configure_output() -> None:
     _make_output_streams_lossy()
 
 
+def _open_inspection_saver(db: str) -> RelateSaver:
+    """Open the store for an inspection command without modifying the file (ADR-0015).
+
+    An in-memory store starts empty, so there is nothing to protect and it stays writable.
+    """
+    return RelateSaver(db_path=db, read_only=db != ":memory:")
+
+
 @app.command(name="tree", help="Visualize execution DAG for a thread.")
 def tree(
     thread_id: str = typer.Argument(
@@ -86,7 +94,7 @@ def tree(
         raise typer.Exit(code=1)
 
     try:
-        with DAGVisualizer(db_path=db) as visualizer:
+        with _open_inspection_saver(db) as saver, DAGVisualizer(saver) as visualizer:
             tree_obj = visualizer.render_tree(thread_id)
             console.print(tree_obj)
     except typer.Exit:
@@ -155,7 +163,7 @@ def replay(
     source_saver: RelateSaver | None = None
     sandboxed_saver: RelateSaver | None = None
     try:
-        source_saver = RelateSaver(db_path=db)
+        source_saver = _open_inspection_saver(db)
         sandboxed_saver = TimeTravelEngine.fork_in_memory(
             source_saver=source_saver,
             thread_id=thread_id,
@@ -252,7 +260,7 @@ def forensics_loops(
         raise typer.Exit(code=1)
 
     try:
-        with RelateForensics(db_path=db) as forensics_engine:
+        with _open_inspection_saver(db) as saver, RelateForensics(saver) as forensics_engine:
             reports = forensics_engine.detect_loops(thread_id, threshold=threshold)
             if reports:
                 table = Table(title=f"Detected Loops: {thread_id}")
@@ -309,7 +317,7 @@ def forensics_trace_error(
         raise typer.Exit(code=1)
 
     try:
-        with RelateForensics(db_path=db) as forensics_engine:
+        with _open_inspection_saver(db) as saver, RelateForensics(saver) as forensics_engine:
             report = forensics_engine.trace_root_cause(thread_id)
             if report.error_message == "No error detected" and not report.error_checkpoint_id:
                 console.print(
@@ -387,7 +395,7 @@ def forensics_diagnose(
         raise typer.Exit(code=1)
 
     try:
-        with RelateForensics(db_path=db) as forensics_engine:
+        with _open_inspection_saver(db) as saver, RelateForensics(saver) as forensics_engine:
             records = forensics_engine.saver.proxy.execute_read(
                 "MATCH (c:Checkpoint {thread_id: $thread_id}) RETURN count(c) AS count",
                 {"thread_id": thread_id},

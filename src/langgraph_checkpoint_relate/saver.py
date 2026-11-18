@@ -31,7 +31,7 @@ from langgraph.checkpoint.base import (
 )
 from langgraph.checkpoint.serde.base import SerializerProtocol
 
-from langgraph_checkpoint_relate.errors import RelateCheckpointError
+from langgraph_checkpoint_relate.errors import RelateCheckpointError, RelateReadOnlyError
 from langgraph_checkpoint_relate.proxy import RelateThreadProxy
 from langgraph_checkpoint_relate.serde import RelateStateSerializer, default_serializer
 from langgraph_checkpoint_relate.tool_calls import (
@@ -78,6 +78,7 @@ class RelateSaver(BaseCheckpointSaver[str]):
         proxy: RelateThreadProxy | None = None,
         serde: RelateStateSerializer | SerializerProtocol | None = None,
         connection_factory: Any | None = None,
+        read_only: bool = False,
     ) -> None:
         """Initialize RelateSaver checkpointer.
 
@@ -88,10 +89,32 @@ class RelateSaver(BaseCheckpointSaver[str]):
             proxy: Optional pre-configured RelateThreadProxy actor instance.
             serde: Optional custom serializer protocol (defaults to RelateStateSerializer).
             connection_factory: Optional custom connection factory for driver injection.
+            read_only: Open the file store for inspection only. The file stays
+                byte-identical: no schema setup, no flush, and writes raise
+                RelateReadOnlyError. With a passed proxy, the saver takes its
+                read-only state from that proxy.
+
+        Raises:
+            ValueError: If read_only is true with ":memory:" or with a writable proxy.
         """
         self.serde: RelateStateSerializer | Any = serde or default_serializer
         super().__init__(serde=self.serde)
         self._applied_tool_calls = AppliedToolCalls()
+
+        passed_proxy = db_path if isinstance(db_path, RelateThreadProxy) else proxy
+        if read_only:
+            if passed_proxy is not None:
+                if getattr(passed_proxy, "read_only", False) is not True:
+                    raise ValueError("read_only=True requires a read-only proxy")
+            elif str(db_path) == ":memory:":
+                raise ValueError(
+                    "read_only=True requires a file path; ':memory:' has nothing to inspect"
+                )
+        self.read_only = (
+            getattr(passed_proxy, "read_only", False) is True
+            if passed_proxy is not None
+            else read_only
+        )
 
         if isinstance(db_path, RelateThreadProxy):
             self.proxy = db_path
@@ -115,8 +138,14 @@ class RelateSaver(BaseCheckpointSaver[str]):
                 wal_enabled=wal_enabled,
                 connection_factory=connection_factory,
                 auto_init_schema=True,
+                read_only=read_only,
             )
             self._owns_proxy = True
+
+    def _check_writable(self) -> None:
+        """Refuse writes on a read-only saver before anything is serialized."""
+        if self.read_only:
+            raise RelateReadOnlyError("RelateSaver is read-only; checkpoints cannot be written")
 
     def get_next_version(self, current: str | None, channel: None = None) -> str:
         """Generate a monotonically increasing version identifier for channel writes.
@@ -168,7 +197,9 @@ class RelateSaver(BaseCheckpointSaver[str]):
             ValueError: If thread_id is missing, invalid, or empty.
             CheckpointSerializationError: If checkpoint or metadata cannot be serialized.
             RelateCheckpointError: If database persistence fails.
+            RelateReadOnlyError: If the saver is read-only.
         """
+        self._check_writable()
         configurable = config.get("configurable", {}) if config else {}
         thread_id = configurable.get("thread_id")
         if not thread_id or not isinstance(thread_id, str) or not thread_id.strip():
@@ -295,7 +326,11 @@ class RelateSaver(BaseCheckpointSaver[str]):
             writes: Sequence of (channel, value) write pairs.
             task_id: Identifier of the task that produced the writes.
             task_path: Optional execution path within the subgraph.
+
+        Raises:
+            RelateReadOnlyError: If the saver is read-only.
         """
+        self._check_writable()
         if not writes:
             return
 
@@ -798,6 +833,8 @@ class RelateSaver(BaseCheckpointSaver[str]):
         Args:
             timeout: Optional maximum duration in seconds to await flush completion.
         """
+        if self.read_only:
+            return
         if hasattr(self.proxy, "flush"):
             self.proxy.flush(timeout=timeout)
 

@@ -6,6 +6,7 @@ and boundary error handling (AC-24, AC-32).
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -623,6 +624,108 @@ class TestCliForensicsToolName:
         assert result.exit_code == 0
         assert "Root Tool" not in result.output
         assert "Status:            OK" in result.output
+
+
+def _file_state(db_file: str) -> tuple[str, list[str]]:
+    """Return the store's sha256 and the sorted listing of its directory."""
+    path = Path(db_file)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    return digest, sorted(p.name for p in path.parent.iterdir())
+
+
+def _inspection_args(command: str, thread_id: str, checkpoint_id: str, db_file: str) -> list[str]:
+    commands = {
+        "tree": ["tree", thread_id, "--db", db_file],
+        "forensics": ["forensics", thread_id, "--db", db_file],
+        "loops": ["forensics", "loops", thread_id, "--db", db_file],
+        "trace-error": ["forensics", "trace-error", thread_id, "--db", db_file],
+        "replay": ["replay", thread_id, "--checkpoint", checkpoint_id, "--db", db_file],
+    }
+    return commands[command]
+
+
+class TestCliReadOnlyInspection:
+    """Inspection commands leave the store byte-identical (AC-75, AC-84, ADR-0015)."""
+
+    @pytest.mark.parametrize("command", ["tree", "forensics", "loops", "trace-error", "replay"])
+    def test_command_leaves_store_unchanged_ac_84(
+        self,
+        runner: CliRunner,
+        seeded_db: tuple[str, str, list[str]],
+        command: str,
+    ) -> None:
+        """AC-84: the command succeeds; sha256 and directory listing are unchanged."""
+        db_file, thread_id, checkpoint_ids = seeded_db
+        before = _file_state(db_file)
+
+        result = runner.invoke(
+            app, _inspection_args(command, thread_id, checkpoint_ids[1], db_file)
+        )
+
+        assert result.exit_code == 0
+        assert _file_state(db_file) == before
+
+    @pytest.mark.parametrize("command", ["tree", "forensics", "loops", "trace-error", "replay"])
+    def test_exit_code_matches_a_writable_copy_ac_84(
+        self,
+        runner: CliRunner,
+        seeded_db: tuple[str, str, list[str]],
+        tmp_path: Path,
+        command: str,
+    ) -> None:
+        """AC-84: the exit code equals the one from a copy that a writable saver has opened."""
+        db_file, thread_id, checkpoint_ids = seeded_db
+        copy_file = str(tmp_path / "writable_copy.rl")
+        shutil.copy(db_file, copy_file)
+        with RelateSaver(db_path=copy_file) as writable:
+            writable.get_tuple({"configurable": {"thread_id": thread_id}})
+
+        args = _inspection_args(command, thread_id, checkpoint_ids[1], db_file)
+        copy_args = _inspection_args(command, thread_id, checkpoint_ids[1], copy_file)
+        assert runner.invoke(app, args).exit_code == runner.invoke(app, copy_args).exit_code
+
+    @pytest.mark.parametrize("command", ["forensics", "trace-error"])
+    def test_tool_failure_commands_leave_store_unchanged_ac_84(
+        self,
+        runner: CliRunner,
+        seeded_tool_error_db: tuple[str, str],
+        command: str,
+    ) -> None:
+        """AC-84: a store with a failed tool call is inspected without modification."""
+        db_file, thread_id = seeded_tool_error_db
+        before = _file_state(db_file)
+        result = runner.invoke(app, _inspection_args(command, thread_id, "", db_file))
+        assert result.exit_code == 0
+        assert "fetch_source" in result.output
+        assert _file_state(db_file) == before
+
+    def test_loops_command_leaves_loop_store_unchanged_ac_84(
+        self, runner: CliRunner, seeded_loop_db: tuple[str, str]
+    ) -> None:
+        """AC-84: loop detection on a store with a loop leaves it unchanged."""
+        db_file, thread_id = seeded_loop_db
+        before = _file_state(db_file)
+        result = runner.invoke(app, ["forensics", "loops", thread_id, "--db", db_file])
+        assert result.exit_code == 0
+        assert _file_state(db_file) == before
+
+    @pytest.mark.parametrize("command", ["tree", "forensics", "loops", "trace-error", "replay"])
+    def test_missing_file_is_reported_and_not_created_ac_85(
+        self, runner: CliRunner, tmp_path: Path, command: str
+    ) -> None:
+        """AC-85: a missing store exits 1 with the not-found message and is not created."""
+        missing = str(tmp_path / "missing.rl")
+        result = runner.invoke(app, _inspection_args(command, "t", "c", missing))
+        assert result.exit_code == 1
+        assert "Database file not found" in result.output
+        assert list(tmp_path.iterdir()) == []
+
+    def test_memory_database_keeps_working_ac_84(self, runner: CliRunner) -> None:
+        """An empty :memory: store keeps a writable saver, so it fails as before, not as read-only."""
+        result = runner.invoke(app, ["tree", "t", "--db", ":memory:"])
+        assert result.exit_code == 1
+        assert "Error:" in result.output
+        assert "read-only" not in result.output.lower()
 
 
 def _console_script() -> str | None:
