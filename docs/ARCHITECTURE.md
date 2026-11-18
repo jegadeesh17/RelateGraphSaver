@@ -9,19 +9,19 @@ Status: FROZEN
 
 ## Overview
 
-RelateGraphSaver provides an embedded, graph-native checkpoint saver for LangGraph powered by the embedded Relate database engine from Neo4j. It needs no external database server (PostgreSQL or a Neo4j server daemon): execution state is persisted into a single local `.rl` file backed by Write-Ahead Logging (WAL). Workflows, branching paths, tool executions, and pending writes map directly to a directed property graph. A dedicated actor queue (`RelateThreadProxy`) handles thread affinity and serializes write access across concurrent worker threads, `TimeTravelEngine` enables zero-cleanup in-memory branching replays, and `DAGVisualizer` provides terminal-native Cypher diagnostics. Tool calls made by the model during a real run are captured from the persisted LangChain messages into `:ToolCall` nodes, so root-cause analysis works on data the run itself produced ([ADR-0005](DECISIONS.md#adr-0005-capture-tool-calls-from-persisted-langchain-messages)). Async graph execution (`ainvoke`, `astream`) runs the synchronous methods off the event loop ([ADR-0006](DECISIONS.md#adr-0006-async-checkpointer-methods-delegate-to-the-synchronous-methods-on-worker-threads)). Inspection commands open the store read-only ([ADR-0015](DECISIONS.md#adr-0015-read-only-opening-for-inspection-commands)). Rationale and alternatives are in [decisions](DECISIONS.md).
+RelateGraphSaver provides an embedded, graph-native checkpoint saver for LangGraph powered by the embedded Relate database engine from Neo4j. It needs no external database server (PostgreSQL or a Neo4j server daemon): execution state is persisted into a single local `.rl` file backed by Write-Ahead Logging (WAL). Workflows, branching paths, tool executions, and pending writes map directly to a directed property graph. A dedicated actor queue (`RelateThreadProxy`) handles thread affinity and serializes write access across concurrent worker threads, `TimeTravelEngine` enables zero-cleanup in-memory branching replays, and `DAGVisualizer` provides terminal-native Cypher diagnostics. Tool calls made by the model during a real run are captured from the persisted LangChain messages into `:ToolCall` nodes, so root-cause analysis works on data the run itself produced ([ADR-0005](DECISIONS.md#adr-0005-capture-tool-calls-from-persisted-langchain-messages)). Async graph execution (`ainvoke`, `astream`) runs the synchronous methods off the event loop ([ADR-0006](DECISIONS.md#adr-0006-async-checkpointer-methods-delegate-to-the-synchronous-methods-on-worker-threads)). Inspection commands open the store read-only ([ADR-0015](DECISIONS.md#adr-0015-read-only-opening-for-inspection-commands)). `replay.py` re-runs a user's graph from a stored checkpoint inside an in-memory fork and diffs the result against the recorded run ([ADR-0017](DECISIONS.md#adr-0017-replay-runs-user-graph-code-only-against-an-in-memory-sandbox)); forensics traces a failing tool's argument back to the write that first held it and summarizes tool failures across threads ([ADR-0018](DECISIONS.md#adr-0018-argument-provenance-by-string-containment-earliest-write-wins)). The committed demo store includes a run against the public PyPI JSON API ([ADR-0019](DECISIONS.md#adr-0019-the-demo-store-holds-a-real-api-thread-and-its-build-needs-network-access)). Rationale and alternatives are in [decisions](DECISIONS.md).
 
 ## Technology stack
 
 - **Language:** Python 3.11+ (`requires-python = ">=3.11"`; developed and tested on 3.13)
-- **Graph Database Engine:** `relate-db` (Embedded Neo4j-compatible Cypher engine with single-file WAL storage and in-memory `:memory:` URI support)
+- **Graph Database Engine:** `relate-db` (Embedded Neo4j-compatible Cypher engine with single-file WAL storage and in-memory `:memory:` URI support). The requirement is `>=1.1.0` if the full suite and benchmark pass on 1.1.0, else `>=1.0.2,<1.1` ([ADR-0020](DECISIONS.md#adr-0020-relate-db-version-policy-decided-by-the-test-result), pending)
 - **Agent Framework:** `langgraph-checkpoint >= 2.0.0`, `langgraph >= 0.2.0`, `langchain-core >= 0.2.0` (imported directly for `RunnableConfig` and message types; declared explicitly per [ADR-0009](DECISIONS.md#adr-0009-declare-every-directly-imported-runtime-dependency-and-prove-it-with-a-clean-install))
 - **Serialization:** `langgraph.checkpoint.serde.jsonplus.JsonPlusSerializer`
 - **Async:** standard library `asyncio` (`asyncio.to_thread`); no async database driver
 - **CLI & Terminal UI:** `typer >= 0.12.0`, `click >= 8.1.0`, `rich >= 13.7.0`
 - **Type Checking & Linting:** `mypy >= 1.11.0`, `ruff >= 0.6.0`
 - **Testing Runner:** `pytest >= 8.3.0`, `pytest-mock >= 3.14.0`. Async tests call `asyncio.run(...)` inside ordinary test functions; no pytest async plugin is added.
-- **Benchmark (dev only):** `langgraph-checkpoint-sqlite >= 2.0.0` in the `dev` extra, never in `[project].dependencies` ([ADR-0008](DECISIONS.md#adr-0008-standalone-benchmark-script-against-sqlitesaver))
+- **Benchmark (dev only):** `langgraph-checkpoint-sqlite >= 2.0.0` in the `dev` extra, never in `[project].dependencies` ([ADR-0008](DECISIONS.md#adr-0008-standalone-benchmark-script-against-sqlitesaver)). Optional `llm` extra: `langchain-openai`, used only by `examples/openrouter_agent.py`. The demo HTTP client is the standard library (`urllib.request`).
 
 ## Test commands
 
@@ -41,6 +41,8 @@ ruff check . && ruff format --check . && mypy src tests && python -m pytest -q -
 ```
 All four steps exit 0 (AC-35, AC-36, AC-37, AC-38). `ruff` covers every Python file in the repository, including `benchmarks/` and `examples/`; `mypy` covers `src` and `tests` only. The mypy configuration that makes this possible is described in [ADR-0007](DECISIONS.md#adr-0007-static-quality-gates-pass-through-configuration-and-behavior-neutral-fixes).
 
+**`network` marker (AC-131, RC-11).** The one live test that calls pypi.org is marked `@pytest.mark.network`, registered in `pyproject.toml` next to `slow`. `tests/conftest.py` deselects `network` items in `pytest_collection_modifyitems` (reporting them through `pytest_deselected`) unless the `-m` expression contains `network`, so the full and fast commands above stay offline and unchanged, and `python -m pytest -m network` runs the live test by hand. We do not add `-m "not network"` to `addopts`: a second `-m` on the command line replaces it, so `-m "not slow"` would select the live test again.
+
 ### One file test command
 ```bash
 python -m pytest -q tests/unit/test_<module>.py
@@ -52,7 +54,7 @@ python benchmarks/bench_checkpointers.py --checkpoints 1000
 ```
 The benchmark is not collected by pytest (`testpaths = ["tests"]`, and the file is not named `test_*`). See [Benchmark](#benchmark).
 
-*Note on test performance:* Tests that run full multi-agent simulation loops, process termination crash simulations, fresh-environment installs, or large graph workloads are marked `@pytest.mark.slow`. The fast suite completes in under 15 seconds.
+*Note on test performance:* Tests that run full multi-agent simulation loops, process termination crash simulations, fresh-environment installs, or large graph workloads are marked `@pytest.mark.slow`. The fast suite targets under 15 seconds but measured about 100 seconds on the development machine on 2026-11-18; new replay and demo tests reuse session-scoped stores to avoid adding to it.
 
 ## Components
 
@@ -70,6 +72,7 @@ graph TD
         Proxy["RelateThreadProxy\n(Actor Queue & Single-Writer Lock)"]
         TimeTravel["TimeTravelEngine\n(In-Memory Sandboxed Replay)"]
         Visualizer["DAGVisualizer\n(Cypher Forensics & Tree CLI)"]
+        Replay["replay\n(user graph re-run & run diff)"]
     end
 
     subgraph Storage["Embedded Storage Layer"]
@@ -89,6 +92,8 @@ graph TD
     Saver -.->|fork_in_memory| TimeTravel
     Visualizer -->|read-only Cypher queries| DiskDB
     Visualizer -->|render ASCII DAG & trace loops| Client
+    Replay -->|fork_in_memory, then compile user graph on the fork| TimeTravel
+    Replay -->|read recorded run, read-only| DiskDB
 ```
 
 ### Component Summary
@@ -96,7 +101,9 @@ graph TD
 - **`tool_calls` (tool call extractor):** Pure functions that find AI tool calls and tool result messages in written values and turn them into idempotent `:ToolCall` Cypher statements, plus `AppliedToolCalls`, the per-saver record of what has already been committed so each save sends only new statements. It never raises; malformed entries are skipped.
 - **`RelateThreadProxy`:** Actor queue and thread-affinity broker running on a dedicated thread, serializing database write transactions and enforcing single-writer access to prevent thread-affinity exceptions and file lock collisions.
 - **`TimeTravelEngine`:** In-memory replay controller that extracts execution subgraphs and clones them into isolated `:memory:` database instances for zero-side-effect what-if debugging.
-- **`DAGVisualizer`:** Graph forensics and diagnostic renderer that executes Cypher path queries to produce Unicode execution trees, cycle detection reports, and failure root-cause traces.
+- **`DAGVisualizer`:** Graph forensics and diagnostic renderer that executes Cypher path queries to produce Unicode execution trees, cycle detection reports, and failure root-cause traces. Status tags follow the [tree status rule](#tree-status-rule).
+- **`RelateForensics`** (`forensics.py`): loop detection, root-cause tracing, [argument provenance and the cross-thread failure summary](#9-argument-provenance-and-tool-failure-summary-forensicspy).
+- **`replay`** (`replay.py`): loads a user's graph from a spec, re-runs it from a checkpoint against an in-memory fork, and diffs it against the recorded run ([Replay engine](#8-replay-engine-replaypy)).
 
 ## Graph schema and data models
 
@@ -112,76 +119,26 @@ erDiagram
     Checkpoint ||--o{ Write : "HAS_WRITE"
     Checkpoint ||--o{ ToolCall : "INVOKED"
     Write ||--o| ToolCall : "INVOKED"
-
-    Thread {
-        string thread_id PK
-        string created_at
-    }
-
-    Checkpoint {
-        string checkpoint_id PK
-        string thread_id FK
-        string checkpoint_ns
-        string parent_checkpoint_id
-        int step
-        bytes checkpoint_blob
-        bytes metadata_blob
-        string state_hash
-        string created_at
-    }
-
-    Write {
-        string write_id PK
-        string thread_id FK
-        string checkpoint_ns
-        string checkpoint_id FK
-        string task_id
-        string channel
-        bytes write_blob
-        int idx
-        string created_at
-    }
-
-    ToolCall {
-        string call_id PK
-        string tool_name
-        bytes args_blob
-        bytes result_blob
-        string error
-        string created_at
-    }
 ```
+Properties of each label are listed under [Node Labels and Properties](#node-labels-and-properties).
 
 ### Node Labels and Properties
 
 #### 1. `:Thread`
-Represents an isolated LangGraph execution thread.
-- `thread_id` (String, Indexed, Unique): Unique identifier of the workflow execution thread.
-- `created_at` (String, ISO-8601): Timestamp when the thread was first registered.
+An isolated LangGraph execution thread: `thread_id` (String, Indexed, Unique) and `created_at` (String, ISO-8601, when the thread was first registered).
 
 #### 2. `:Checkpoint`
-Represents an immutable snapshot of state at a discrete workflow step.
-- `checkpoint_id` (String, Indexed, Unique): Unique checkpoint identifier (UUID or ULID generated by LangGraph).
-- `thread_id` (String, Indexed): Parent thread identifier.
-- `checkpoint_ns` (String, default `""`): Subgraph namespace identifier for nested multi-agent workflows.
-- `parent_checkpoint_id` (String, Nullable): ID of the preceding checkpoint.
-- `step` (Integer): Monotonically increasing execution step counter.
-- `checkpoint_blob` (Bytes): Serialized channel state and versions encoded via `JsonPlusSerializer`.
-- `metadata_blob` (Bytes): Serialized step metadata (writes, node name, source step).
-- `state_hash` (String, Indexed): SHA-256 hash of serialized state channels used for O(1) cycle and oscillation detection.
-- `created_at` (String, ISO-8601): Commit timestamp.
+An immutable snapshot of state at one workflow step.
+- `checkpoint_id` (String, Indexed, Unique; UUID generated by LangGraph), `thread_id` (String, Indexed), `checkpoint_ns` (String, default `""`, subgraph namespace), `parent_checkpoint_id` (String, Nullable).
+- `step` (Integer, monotonically increasing), `created_at` (String, ISO-8601 commit timestamp).
+- `checkpoint_blob` (Bytes): channel values, channel versions and `versions_seen`, encoded via `JsonPlusSerializer`. `metadata_blob` (Bytes): serialized step metadata (source, step).
+- `state_hash` (String, Indexed): SHA-256 of the serialized state channels, used for O(1) cycle and oscillation detection.
 
 #### 3. `:Write`
-Represents pending channel updates or intermediate writes (such as human-in-the-loop pending actions).
-- `write_id` (String, Indexed, Unique): Composite identifier (`{thread_id}:{checkpoint_ns}:{checkpoint_id}:{task_id}:{idx}`).
-- `thread_id` (String): Associated thread identifier.
-- `checkpoint_ns` (String): Associated namespace.
-- `checkpoint_id` (String): Targeted checkpoint identifier.
-- `task_id` (String): LangGraph task identifier that emitted the write.
-- `channel` (String): State channel receiving the write.
-- `write_blob` (Bytes): Serialized write value.
-- `idx` (Integer): Zero-based sequence index within the task emission batch.
-- `created_at` (String, ISO-8601): Write timestamp.
+A pending channel update or intermediate write (such as a human-in-the-loop pending action), stored on the checkpoint its task ran from.
+- `write_id` (String, Indexed, Unique): `{thread_id}:{checkpoint_ns}:{checkpoint_id}:{task_id}:{idx}`.
+- `thread_id`, `checkpoint_ns`, `checkpoint_id` (String): where the write belongs. `task_id` (String): LangGraph task that emitted it. `channel` (String): state channel receiving it.
+- `write_blob` (Bytes, serialized value), `idx` (Integer, zero-based index within the task's batch), `created_at` (String, ISO-8601).
 
 #### 4. `:ToolCall`
 Represents one tool invocation requested by the model, written by `RelateSaver` from the LangChain messages of a real run ([ADR-0005](DECISIONS.md#adr-0005-capture-tool-calls-from-persisted-langchain-messages)). These are exactly the properties `forensics.py` reads; no other properties are written.
@@ -407,38 +364,39 @@ class RootCauseReport:
     root_channel_write: str | None = None
     causal_path_length: int = 0
     diagnostic_summary: str = ""
-    root_tool_name: str | None = None   # last field, default None
+    root_tool_name: str | None = None
+    origin_argument: str | None = None  # origin fields: see Argument provenance (AC-121)
+    origin_node: str | None = None
+    origin_step: int | None = None
+    origin_hops: int | None = None
 ```
 
-`root_tool_name` lets the report name the failing tool by `tool_name` and `call_id` (AC-45). It is the last field with a default, so positional and keyword construction without it keeps working. `trace_root_cause()` sets it from the `tool_name` column of the same causal-query row that supplies `root_tool_call_id`, in every priority branch that sets `root_tool_call_id`. When it is set, the diagnostic summary appends one sentence, `Failing tool: '<tool_name>'.`, after the `Root tool invocation: '<call_id>'.` sentence.
+`root_tool_name` lets the report name the failing tool by `tool_name` and `call_id` (AC-45). It and the four origin fields come after the original fields and default to `None`, so positional and keyword construction without them keeps working. `diagnostic_summary` text does not change when an origin is found. `trace_root_cause()` sets it from the `tool_name` column of the same causal-query row that supplies `root_tool_call_id`, in every priority branch that sets `root_tool_call_id`. When it is set, the diagnostic summary appends one sentence, `Failing tool: '<tool_name>'.`, after the `Root tool invocation: '<call_id>'.` sentence.
 
 ### 4. CLI Command Interface (`relate-dag`)
 
-- **`relate-dag tree <thread_id> [--file <path>]`:** renders a Unicode DAG tree of checkpoints, branching points, and status tags (`[PENDING]`, `[ERROR]`, `[OK]`).
-- **`relate-dag replay <thread_id> --checkpoint <id> [--edit <json>]`:** spawns an interactive in-memory replay session starting from the specified checkpoint.
+Every command takes `--db/-d PATH` (`tree` also accepts `--file/-f`). Errors print a `[bold red]Error:` line and exit 1 through `typer.Exit(1)`, with no Python traceback.
+
+- **`relate-dag tree <thread_id>`:** renders a Unicode tree of checkpoints, branch points (`Branch: [BRANCH]`) and one status tag per checkpoint, chosen by the [tree status rule](#tree-status-rule).
+- **`relate-dag replay <thread_id> [<checkpoint_id> | --checkpoint/-c ID] [--branch/-b ID] [--graph/-g SPEC] [--update JSON] [--set-message INDEX=TEXT]... [--as-node NAME]`:** there is no interactive session and no `--edit` option.
+  - Without `--graph`, it forks into `:memory:` and prints the six existing summary lines (`Sandboxed replay initialized successfully.`, Source Thread, Replay Thread, Checkpoint ID, Replay Step, Isolation), then `Hint: add --graph path/to/file.py:factory to re-run the graph from this checkpoint.`; no graph code runs (AC-109, RC-02, RC-03). `--update`, `--set-message` or `--as-node` without `--graph` exit 1 with an `Error:` line naming `--graph` (AC-112).
+  - With `--graph`, it calls `replay_from_checkpoint` on the read-only source and prints a success line, a `Replay result` section (fork, updated, new final and recorded final checkpoint ids; whether it stopped at an interrupt), a `Tool calls` table (rows such as `fetch_source #1`, `error -> ok`, `url: <before> -> <after>`) and a `Final state changes` table (channel or `messages[i]`, before, after). An empty diff prints `No tool calls or state changed.` (AC-110, AC-111). Output is ASCII (`->`), so cp1252 stdout works (AC-118). `--branch` with `--graph` is rejected with exit 1.
+  - `--update` must parse as a JSON object (AC-113). `--set-message` splits on the first `=` into a non-negative integer index and text, and may repeat (AC-114). A `GraphSpecError` prints its message, which contains the spec (AC-115); LangGraph's `InvalidUpdateError` prints its message plus `Hint: pass --as-node with the node that should be treated as the writer.` (AC-116); any other exception from user graph code prints `Error: replay failed: <type>: <message>`.
 - **`relate-dag forensics loops <thread_id> [--threshold <int>]`:** queries the Cypher graph for repeating state transitions and displays cycle tables.
-- **`relate-dag forensics trace-error <thread_id>`:** traverses backward causal paths to print root-cause analysis for failed threads. The report panel has a `Root Tool Name:` line (`None` when unknown) next to `Root Tool Call ID:`.
+- **`relate-dag forensics trace-error <thread_id>`:** traverses backward causal paths to print root-cause analysis for failed threads. The report panel has a `Root Tool Name:` line (`None` when unknown) next to `Root Tool Call ID:`, and, when the report has an origin, `Bad argument origin: <origin_argument> came from node <origin_node> (step <origin_step>, <origin_hops> hops before failure)` (AC-122).
+- **`relate-dag forensics failures`:** prints the [`failure_summary()`](#9-argument-provenance-and-tool-failure-summary-forensicspy) table (Tool, Failures, Calls, Threads, Origin nodes), or `No failing tool calls found.` when there are none (AC-123..AC-125). `failures` is registered in `ForensicsGroup`, so it is never read as a thread id (RC-04).
 
 `relate-dag --help` must work in a fresh environment with only the declared dependencies installed (AC-33).
 
-**Read-only store access ([ADR-0015](DECISIONS.md#adr-0015-read-only-opening-for-inspection-commands)).** `tree`, `forensics` (the combined summary), `forensics loops`, `forensics trace-error` and the source side of `replay` open the store with `RelateSaver(db, read_only=True)`. They pass that saver to `DAGVisualizer`, `RelateForensics` or `TimeTravelEngine.fork_in_memory` and close it in a `finally` or `with` block. Given a saver, the `DAGVisualizer` and `RelateForensics` constructors do not own or close it. The "Database file not found" check runs before opening, so a missing path still exits 1 with that message and is not created. `RelateReadOnlyError` is a `RelateCheckpointError`, so it is reported by the "Database error" handler. When `--db` is `:memory:`, the commands keep a writable saver, because an empty in-memory store has nothing to protect. After any of these commands, a closed file store is byte-identical and has no sidecar files.
+#### Tree status rule
+
+`DAGVisualizer._determine_status(info, writes, has_successor)` returns the first match: `[ERROR]` (detection unchanged), `[INTERRUPT]`, `[OK]` when the checkpoint has a `[:NEXT]` child, `[PENDING]` when it has stored writes, else `[OK]` ([ADR-0016](DECISIONS.md#adr-0016-tree-status-depends-on-whether-a-checkpoint-has-a-next-step), AC-88..AC-92). `has_successor` comes from the `[:NEXT]` children map only; a `[:FORKED_TO]` child does not count. Writes under a checkpoint with a `[:NEXT]` child are labelled `write: channel=..., task_id=...`; on a leaf they keep `pending write:` (AC-93).
+
+**Read-only store access ([ADR-0015](DECISIONS.md#adr-0015-read-only-opening-for-inspection-commands)).** `tree`, `forensics` (the combined summary), `forensics loops`, `forensics trace-error`, `forensics failures` and the source side of `replay` (with or without `--graph`, AC-117) open the store with `RelateSaver(db, read_only=True)`. They pass that saver to `DAGVisualizer`, `RelateForensics` or `TimeTravelEngine.fork_in_memory` and close it in a `finally` or `with` block. Given a saver, the `DAGVisualizer` and `RelateForensics` constructors do not own or close it. The "Database file not found" check runs before opening, so a missing path still exits 1 with that message and is not created. `RelateReadOnlyError` is a `RelateCheckpointError`, so it is reported by the "Database error" handler. When `--db` is `:memory:`, the commands keep a writable saver, because an empty in-memory store has nothing to protect. After any of these commands, a closed file store is byte-identical and has no sidecar files.
 
 ### 5. In-Memory Fakes for Testing
 
-For fast unit tests without disk I/O, the suite includes an in-memory seam fake:
-
-```python
-class InMemoryRelateDriver:
-    """In-memory dictionary/graph fake mimicking relate-db Cypher engine."""
-    def __init__(self) -> None:
-        self.nodes: dict[str, dict[str, Any]] = {}
-        self.edges: list[tuple[str, str, str]] = []
-
-    def run(self, query: str, parameters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-        ...
-```
-
-The fake's pattern matching does not cover the tool call Cypher. Tool call extraction is tested as pure functions; tool call persistence, forensics and async tests run against real `relate-db` `:memory:` databases, like the other integration tests.
+For fast unit tests without disk I/O, `tests/fakes/fake_relate_driver.py` provides `InMemoryRelateDriver`, a dictionary-backed fake of the relate-db driver (`nodes: dict[str, dict[str, Any]]`, `edges: list[tuple[str, str, str]]`, `run(query, parameters=None) -> list[dict[str, Any]]`). Replay, provenance and failure-summary tests use real `:memory:` stores; the dependency agent's seam is its `fetch_json` callable, faked in every test except the one marked `network`. The fake's pattern matching does not cover the tool call Cypher. Tool call extraction is tested as pure functions; tool call persistence, forensics and async tests run against real `relate-db` `:memory:` databases, like the other integration tests.
 
 ### 6. Tool call capture (`tool_calls.py`)
 
@@ -562,30 +520,91 @@ class AppliedToolCalls:
 - `tools` is `langgraph.prebuilt.ToolNode([fetch_source], handle_tool_errors=True)`. `fetch_source` raises `RuntimeError` when the demo runs in failing mode (default), so `ToolNode` emits a `ToolMessage` with `status="error"` and `graph.invoke` completes normally.
 - `run_tool_agent(saver: RelateSaver, thread_id: str, *, fail: bool = True) -> dict[str, Any]` runs `graph.invoke` and returns the final state. A `main()` with `--db` and `--thread-id` mirrors `research_agent.py`.
 
+### 8. Replay engine (`replay.py`)
+
+Re-runs a user's graph from a stored checkpoint inside an in-memory fork and compares the result with the recorded run (AC-94..AC-108, [ADR-0017](DECISIONS.md#adr-0017-replay-runs-user-graph-code-only-against-an-in-memory-sandbox)). It reuses `fork_in_memory` unchanged (RC-03) and `extract_tool_events` from `tool_calls.py`. `TimeTravelEngine.replay` is a static method with exactly the parameters of `replay_from_checkpoint`; it imports `replay` inside the method (avoiding an import cycle) and returns its result (AC-108). All names below are exported from `langgraph_checkpoint_relate`.
+
+```python
+GraphFactory = Callable[..., Any] | StateGraph   # factory accepting checkpointer=, or an uncompiled StateGraph
+class GraphSpecError(ValueError): ...            # errors.py; the message always contains the spec
+
+def load_graph_factory(spec: str) -> GraphFactory: ...
+def replay_from_checkpoint(source_saver: RelateSaver, thread_id: str, checkpoint_id: str,
+                           factory: GraphFactory, *, update: dict[str, Any] | None = None,
+                           as_node: str | None = None,
+                           set_messages: Mapping[int, str] | None = None) -> ReplayResult: ...
+def snapshot_run(saver: RelateSaver, thread_id: str, checkpoint_id: str) -> RunSnapshot: ...
+def diff_runs(recorded: RunSnapshot, replayed: RunSnapshot) -> RunDiff: ...
+```
+
+**Data models** (frozen dataclasses in `models.py`; fields in this order):
+
+| Dataclass | Fields |
+| :--- | :--- |
+| `ToolCallRecord` | `tool_name: str`, `ordinal: int` (1-based position among calls to that tool, in message order), `args: Any`, `status: str` (`"ok"`, `"error"` or `"no result"`), `call_id: str` and `detail: str \| None` (result or error text, first 120 characters); `call_id` and `detail` are `field(compare=False)` |
+| `RunSnapshot` | `thread_id: str`, `checkpoint_id: str`, `step: int`, `messages: tuple[Any, ...]` (the `messages` channel, in order), `channels: dict[str, Any]` (every other channel except `__*` and `branch:*`), `tool_calls: tuple[ToolCallRecord, ...]` |
+| `ChannelChange` | `channel: str` (channel name, or `messages[<index>]`), `kind: str` (`"added"`, `"removed"`, `"changed"`), `before: str \| None`, `after: str \| None` |
+| `ToolCallChange` | `tool_name: str`, `ordinal: int`, `kind: str`, `before: ToolCallRecord \| None`, `after: ToolCallRecord \| None` |
+| `RunDiff` | `tool_calls: tuple[ToolCallChange, ...]`, `messages: tuple[ChannelChange, ...]`, `channels: tuple[ChannelChange, ...]`; property `is_empty`. It holds no checkpoint ids, so two replays with the same inputs give equal diffs |
+| `ReplayResult` | `fork_checkpoint_id: str`, `updated_checkpoint_id: str` (equals the fork id when there is no edit), `final_checkpoint_id: str` (last sandbox checkpoint), `interrupted: bool`, `diff: RunDiff`, `recorded_checkpoint_id: str` (the recorded leaf the diff compares against) |
+
+**Graph spec** (`load_graph_factory`, AC-94..AC-97). The spec is split on its last `:` (so `C:/x/agent.py:make` works), and both sides must be non-empty. When the left side ends in `.py` or contains `/` or `\`, it is a file path resolved against the current working directory and loaded with `importlib.util.spec_from_file_location` as module `_relate_replay_<first 12 hex digits of sha256(resolved path)>`, registered in `sys.modules` before execution; `sys.path` is not changed, and `examples/` need not be a package. Otherwise it is `importlib.import_module(left)`. The attribute (one name) must be an uncompiled `StateGraph` or a callable that is not already compiled (`Pregel`), because a compiled graph carries its own checkpointer. Every failure (no `:`, missing file or module, any exception raised while importing, missing attribute, wrong type) raises `GraphSpecError` chained from the cause.
+
+**Replay procedure** (`replay_from_checkpoint`):
+1. Inputs are checked before any work, raising `ValueError`: `update` must be a dict, `set_messages` keys non-negative ints, and `update` may not contain `"messages"` when `set_messages` is given.
+2. `sandbox = TimeTravelEngine.fork_in_memory(source_saver, thread_id, checkpoint_id)`; an unknown checkpoint raises `CheckpointNotFoundError` as today. Steps 3-7 run in `try`/`finally: sandbox.close()`, so the sandbox is closed on success and on every exception. The source is only read (AC-103).
+3. Compile: `factory.compile(checkpointer=sandbox)` for a `StateGraph`, else `factory(checkpointer=sandbox)`. If the result lacks `invoke`, `get_state` or `update_state`, or its `checkpointer` is not `sandbox`, `GraphSpecError` is raised before any node runs.
+4. Edit, only when `update` or `set_messages` is given. With `cfg = {"configurable": {"thread_id": thread_id, "checkpoint_ns": "", "checkpoint_id": checkpoint_id}}`, the messages come from `graph.get_state(cfg).values.get("messages", [])`. Each edited message is `messages[i].model_copy(update={"content": text})`, which keeps its type and id, so LangGraph's `add_messages` reducer replaces it instead of appending a copy (AC-100); an index out of range or a message without an id raises `ValueError`. Then `graph.update_state(cfg, {**(update or {}), "messages": edited}, as_node=...)` (the `messages` key only when `set_messages` is given) gives `updated_checkpoint_id`. `as_node` is used when given; otherwise `"__start__"` when only `set_messages` is given and the fork checkpoint's step is 0 or less, else `None`, letting LangGraph infer the writer. `InvalidUpdateError` propagates unchanged (AC-101).
+5. Run: `graph.invoke(None, {"configurable": {"thread_id": thread_id, "checkpoint_id": updated_checkpoint_id}})`. An interrupt ends `invoke` normally; `interrupted` is `bool(graph.get_state(...).next)` afterwards (AC-102).
+6. Recorded run (AC-107): of the source checkpoints reached from the fork point by `[:NEXT*0..]` (anchored on the fork point, never following `[:FORKED_TO]`), those with no outgoing `[:NEXT]` are leaves; the one with the greatest `created_at`, then `step`, is `recorded_checkpoint_id`.
+7. `diff = diff_runs(snapshot_run(source_saver, thread_id, recorded), snapshot_run(sandbox, thread_id, final))`, taken before the sandbox closes.
+
+If LangGraph rejects the `__start__` edit of the first human message, the fallback is to fork at the checkpoint after the first model step and edit that AI message's tool-call arguments with `as_node="agent"`; the README command and AC-110 / AC-147 then change with it.
+
+**Snapshot and diff rules** (AC-104..AC-106):
+- `snapshot_run` reads `saver.get_tuple(...)` for that checkpoint. `tool_calls` come from `extract_tool_events(messages)`: invocations in message order, `ordinal` counted per `tool_name`, `status` from the matching outcome (`error` when `is_error`, else `ok`; `no result` when none). Calls trimmed from message history are absent.
+- Tool calls are matched by `(tool_name, ordinal)`, never by `call_id` (ids are random per run): only in the replay is `added`, only in the recording is `removed`, and differing `args` (compared with `==`) or `status` is `changed`. Result and error text are not compared.
+- Messages are compared by index as `"<type>: <str(content)[:120]>"`; extra entries are `added` or `removed`. Other channels compare `repr(value)`. Checkpoint ids, timestamps and message ids are never compared.
+- Order: tool calls by recorded position, then added ones; messages by index; channels by name.
+
+### 9. Argument provenance and tool failure summary (`forensics.py`)
+
+Finds the write that first held a failing tool's argument and summarizes failures across threads (AC-119..AC-125). It is a heuristic, not data-flow tracking ([ADR-0018](DECISIONS.md#adr-0018-argument-provenance-by-string-containment-earliest-write-wins)).
+
+```python
+class RelateForensics:
+    def trace_argument_origin(self, thread_id: str, error_checkpoint_id: str,
+                              args: Mapping[str, Any]) -> ArgumentOrigin | None: ...
+    def failure_summary(self) -> list[ToolFailureSummary]: ...
+```
+
+| Dataclass (`models.py`, frozen) | Fields |
+| :--- | :--- |
+| `ArgumentOrigin` | `argument: str` (argument name, for example `url`), `value: str`, `node: str` (`<unknown>` when not found), `step: int`, `hops: int` (`[:NEXT]` steps from the origin checkpoint to `error_checkpoint_id`), `checkpoint_id: str` |
+| `ToolFailureSummary` | `tool_name: str`, `failures: int`, `total_calls: int`, `threads: tuple[str, ...]` (sorted ids of threads where it failed), `origin_nodes: tuple[str, ...]` (sorted distinct origin nodes of its failed calls) |
+
+**`trace_argument_origin` rules:**
+- Candidates are top-level argument values that are `str` with at least 3 characters; anything else returns `None` (AC-120).
+- One read, anchored like `trace_root_cause`: `MATCH path = (err:Checkpoint {checkpoint_id: $id})<-[:NEXT*0..]-(a:Checkpoint {thread_id: $thread_id})-[:HAS_WRITE]->(w:Write)` returning `a.checkpoint_id`, `a.step`, `length(path)`, `w.channel`, `w.idx`, `w.write_blob`. Python deserializes writes in `step`, then `idx`, order, skips channels `__*` and `branch:*` and undeserializable blobs, and searches strings: plain strings, `BaseMessage.content` (string or text parts), `AIMessage.tool_calls[*]["args"]` values, and nested dicts, lists and tuples to depth 6. A match is case-sensitive substring containment; the first matching write wins (AC-119; open question 15).
+- Node: a write sits on the checkpoint its task ran from, so the node is the one whose `versions_seen` entry differs between that checkpoint and its `[:NEXT]` child (both `checkpoint_blob`s, one extra read); several are joined with `, ` in sorted order.
+
+**`trace_root_cause`** fills `origin_*` only when the root is a failing `:ToolCall` with a traceable argument (AC-121). It deserializes that call's `args_blob` and starts the trace at the *failure checkpoint*: the first checkpoint at or after `error_checkpoint_id` on the `[:NEXT]` path whose writes hold the `ToolMessage` for `root_tool_call_id`, or `error_checkpoint_id` if none. The `[:INVOKED]` edge sits on the step that requested the call, one step before the tool ran, so hops count from where the tool actually failed (AC-129).
+
+**`failure_summary`** (AC-123) runs one store-wide read, `MATCH (c:Checkpoint)-[:INVOKED]->(tc:ToolCall) RETURN c.thread_id, c.checkpoint_id, tc.call_id, tc.tool_name, tc.error, tc.args_blob`, and counts distinct `(thread_id, call_id)` pairs; a call failed when `error IS NOT NULL AND error <> ''`. Each failed call is traced as in `trace_root_cause`. Only tools with at least one failure are returned, by `failures` descending, then `tool_name` (open question 14). It runs one trace per failed call, which suits demo-sized stores and is not tuned for large ones.
+
+### 10. Dependency agent and demo store (`examples/`)
+
+- **`examples/dependency_agent.py`** (AC-127..AC-132): `create_dependency_graph(checkpointer=None, *, fetch_json=fetch_pypi_json)` and `run_dependency_agent(saver, thread_id, *, fetch_json=fetch_pypi_json) -> dict[str, Any]`. Graph `START -> intake -> planner -> agent -> tools -> agent -> report -> END` on a `MessagesState` subclass with `project: str`, `packages: list[str]`, `report: str`. `intake` reads the project name from "Audit the dependencies of RelateGraphSaver"; `planner` lists the project's runtime dependency names and naively appends the lower-cased project name, `relategraphsaver`, which does not exist on PyPI. `agent` is deterministic (no model, no key): first one `AIMessage` with one `lookup_pypi_package` call per package, then a final message. `tools` is `ToolNode([lookup_pypi_package], handle_tool_errors=True)`; `report` lists versions and failed lookups. `main()` uses `argparse` like the other examples.
+- **`fetch_pypi_json(name) -> dict[str, str]`:** `urllib.request` GET `https://pypi.org/pypi/<name>/json`, 10 s timeout, User-Agent `RelateGraphSaver-demo/<package version>` (no personal data); returns only `name`, `version`, `summary`. HTTP 404 raises `LookupError` whose message contains `404`; other network errors propagate as raised.
+- **`examples/build_demo_store.py`:** `build_demo_store(out_path, *, fetch_json=None)` (`None` means `fetch_pypi_json`) writes `demo-tool-fail`, `demo-tool-ok` and `demo-research` as before (RC-06) plus `demo-real-api` (AC-133, AC-134). `ToolNode` turns network errors into tool errors, so before promoting the staging file the builder checks that the `relategraphsaver` lookup holds an error containing `404` and every other lookup a result (AC-135). Otherwise it exits 1 with `Error: could not reach pypi.org: <first tool error>`, removes the staging file and leaves an existing store unchanged (AC-136). There is no offline option ([ADR-0019](DECISIONS.md#adr-0019-the-demo-store-holds-a-real-api-thread-and-its-build-needs-network-access)), and it never reads or writes `demo-llm.rl`. Tests compare checkpoint counts, tool names and error/no-error outcomes, not result text (AC-137).
+- **Optional, only after the project owner approves a model and its cost** (AC-139..AC-141): `examples/openrouter_agent.py --model <id>` uses `ChatOpenAI(base_url="https://openrouter.ai/api/v1", api_key=os.environ["OPENROUTER_API_KEY"], model=...)` from the `llm` extra (`langchain-openai`, never in `[project].dependencies`). With the key unset it exits 1 with an `Error:` line before importing the extra or touching the network. It never reads `.env` and records once into `examples/data/demo-llm.rl`, tracked by its own `.gitignore` negation.
+- `examples/research_agent.py` notes make no latency or speed claims (AC-126).
+
 ## Concurrency and crash safety model
 
 ### Thread Affinity and Actor Queue
 
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Worker1 as Worker Thread 1
-    actor Worker2 as Worker Thread 2
-    participant Proxy as RelateThreadProxy (Actor)
-    participant Engine as relate-db Driver
-    participant WAL as checkpoints.rl (WAL)
-
-    Worker1->>Proxy: put() -> enqueue(DbCommand)
-    Worker2->>Proxy: put_writes() -> enqueue(DbCommand)
-    activate Proxy
-    Proxy->>Engine: Begin Transaction, Run Cypher (Worker1)
-    Proxy->>WAL: Append Log Record & Commit
-    Proxy-->>Worker1: Complete Future (Success)
-    Proxy->>Engine: Begin Transaction, Run Cypher (Worker2)
-    Proxy->>WAL: Append Log Record & Commit
-    Proxy-->>Worker2: Complete Future (Success)
-    deactivate Proxy
-```
+Worker threads enqueue `DbCommand`s (from `put()`, `put_writes()` and the rest); the proxy runs them one at a time on its own thread (begin, run Cypher, commit and flush the WAL), then completes each caller's future.
 
 1. **Serialized Writes:** All mutating operations (`put`, `put_writes`, tool call capture, `fork`) pass through the `RelateThreadProxy` command queue. The proxy executes strictly on a single dedicated background thread, eliminating DB-API thread-affinity violations and file-lock collisions.
 2. **Crash Resilience:** Every commit flushes through the Write-Ahead Log before acknowledging caller futures, except the tool call capture transaction (see [Tool call capture ordering](#tool-call-capture-ordering)). If the host process crashes mid-step, uncommitted transactions are rolled back during WAL recovery on restart, guaranteeing zero orphaned nodes or dangling edges. Measured cost: in relate-db 1.0 each flush takes time proportional to the database file size, so with the default `wal_enabled=True` save latency grows as a thread's history grows (about 25 ms per save early and about 110 ms after 1,000 checkpoints in our benchmark). `wal_enabled=False` skips only the per-write flush and keeps saves flat (about 3 ms); a process kill still kept committed checkpoints in our tests, but durability across power loss without the flush is not verified, and the file grows larger. We keep the flush as the default.
@@ -599,20 +618,7 @@ sequenceDiagram
 
 ### Async execution
 
-```mermaid
-sequenceDiagram
-    participant Loop as Event loop (ainvoke / astream)
-    participant Pool as asyncio default executor thread
-    participant Saver as RelateSaver (sync method)
-    participant Proxy as RelateThreadProxy (Actor)
-
-    Loop->>Pool: await asyncio.to_thread(saver.put, ...)
-    Pool->>Saver: put(...)
-    Saver->>Proxy: execute_write / execute_batch (blocks on Future)
-    Proxy-->>Saver: Future result
-    Saver-->>Pool: RunnableConfig
-    Pool-->>Loop: resume coroutine
-```
+The event loop (`ainvoke` / `astream`) awaits `asyncio.to_thread(saver.put, ...)`; a default-executor thread runs the synchronous method, which blocks on the proxy's future, and the coroutine resumes with the result.
 
 - The event loop never blocks on database work. Concurrent `asyncio.gather` runs on distinct thread_ids (AC-53) occupy at most the default executor's worker count (`min(32, cpu_count + 4)`); beyond that, calls queue in the executor.
 - The proxy remains the single writer, so async and sync callers can share one `RelateSaver` safely.
@@ -682,6 +688,7 @@ RelateGraphSaver/
 │       ├── forensics.py        # Cypher loop & root-cause queries
 │       ├── models.py           # DTOs and report data structures
 │       ├── proxy.py            # RelateThreadProxy actor implementation
+│       ├── replay.py           # Graph-spec loader, sandbox replay, run snapshot and diff
 │       ├── saver.py            # RelateSaver (BaseCheckpointSaver, sync + async)
 │       ├── schema.py           # Cypher constraints and schema migrations
 │       ├── serde.py            # JsonPlusSerializer wrapper & error mapper
@@ -689,43 +696,30 @@ RelateGraphSaver/
 │       ├── tool_calls.py       # Tool call extractor and ToolCall statements
 │       └── visualizer.py       # Rich/Unicode tree terminal renderer
 ├── tests/                      # no __init__.py here (see ADR-0007)
-│   ├── conftest.py             # Shared fixtures and in-memory fakes
-│   ├── unit/
-│   │   ├── test_errors.py
-│   │   ├── test_models.py
-│   │   ├── test_packaging.py   # declared-dependency checks (AC-34, AC-57)
-│   │   ├── test_proxy.py
-│   │   ├── test_readme.py      # README content checks (AC-39, AC-40, AC-58)
-│   │   ├── test_saver.py
-│   │   ├── test_serde.py
-│   │   ├── test_tool_calls.py  # extractor and statement builder (AC-46, AC-47)
-│   │   └── test_visualizer.py
-│   ├── integration/
-│   │   ├── test_async_saver.py                 # AC-50..AC-55
-│   │   ├── test_checkpointing_end_to_end.py
-│   │   ├── test_clean_install.py               # slow: AC-33
-│   │   ├── test_cli.py
-│   │   ├── test_concurrency.py
-│   │   ├── test_crash_recovery.py
-│   │   ├── test_demo_store.py                  # committed demo store (AC-69..AC-75)
-│   │   ├── test_forensics.py
-│   │   ├── test_forensics_end_to_end.py
-│   │   ├── test_langgraph_workflow.py
-│   │   ├── test_read_only.py                   # read-only opening (AC-81..AC-87, ADR-0015)
-│   │   ├── test_time_travel.py
-│   │   ├── test_time_travel_end_to_end.py
-│   │   ├── test_tool_call_capture.py           # AC-41..AC-44, AC-46..AC-49
-│   │   ├── test_tool_calls_end_to_end.py
-│   │   └── test_tool_forensics_demo.py         # AC-45 via examples/tool_agent.py
-│   └── fakes/
-│       ├── __init__.py
-│       └── fake_relate_driver.py
+│   ├── conftest.py             # Shared fixtures; deselects `network` tests by default
+│   ├── unit/                   # test_errors, test_models, test_packaging (AC-34, AC-57),
+│   │                           # test_proxy, test_readme (README checks), test_saver, test_serde,
+│   │                           # test_tool_calls (AC-46, AC-47), test_visualizer (tree status),
+│   │                           # test_replay_diff.py (diff rules, AC-104..AC-106)
+│   ├── integration/            # test_async_saver, test_checkpointing_end_to_end,
+│   │                           # test_clean_install (slow, AC-33), test_cli, test_concurrency,
+│   │                           # test_crash_recovery, test_demo_store (committed store),
+│   │                           # test_forensics, test_forensics_end_to_end, test_langgraph_workflow,
+│   │                           # test_read_only (ADR-0015), test_time_travel(_end_to_end),
+│   │                           # test_tool_call_capture, test_tool_calls_end_to_end,
+│   │                           # test_tool_forensics_demo (AC-45),
+│   │                           # test_replay.py (AC-94..AC-103, AC-107, AC-108),
+│   │                           # test_dependency_agent.py (AC-127..AC-132; one `network` test)
+│   └── fakes/                  # __init__.py, fake_relate_driver.py
 ├── benchmarks/
 │   └── bench_checkpointers.py  # RelateSaver vs SqliteSaver (not a test)
 └── examples/
-    ├── build_demo_store.py     # Regenerates the committed demo store
+    ├── build_demo_store.py     # Regenerates the committed demo store (needs pypi.org)
     ├── data/
-    │   └── demo.rl             # Committed demo store, inspected read-only
+    │   ├── demo.rl             # Committed demo store (four threads), inspected read-only
+    │   └── demo-llm.rl         # Optional recorded LLM run (only if approved)
+    ├── dependency_agent.py     # Key-free PyPI dependency audit (real-API failure)
+    ├── openrouter_agent.py     # Optional LLM run (`llm` extra, OPENROUTER_API_KEY)
     ├── research_agent.py       # Multi-agent demo workflow
     └── tool_agent.py           # Key-free tool-calling demo for forensics
 ```
@@ -740,6 +734,7 @@ Configuration parameters can be supplied directly to `RelateSaver` or read from 
 | `RELATE_WAL_ENABLED` | boolean | `true` | Enables the per-write WAL flush for crash safety; tool call capture never flushes on its own ([ADR-0014](DECISIONS.md#adr-0014-tool-call-capture-commits-without-its-own-flush)). Measured cost under the concurrency and crash safety model |
 | `RELATE_PROXY_TIMEOUT_SEC` | float | `30.0` | Maximum wait time for actor queue transactions before raising timeout |
 | `RELATE_LOG_LEVEL` | string | `"INFO"` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+| `OPENROUTER_API_KEY` | string | unset | Optional; read only by `examples/openrouter_agent.py` from the process environment, never by the package or tests. Listed empty in `.env.example` |
 
 ## Setup requirements
 
@@ -752,10 +747,14 @@ Configuration parameters can be supplied directly to `RelateSaver` or read from 
 | Project virtual environment | n/a | `.venv/Scripts/python -m pip show langgraph-checkpoint-relate` | Create with `python -m venv .venv`, then `.venv/Scripts/python -m pip install -e ".[dev]"` (`.venv/bin/python` on macOS/Linux). The `dev` extra brings pytest, ruff, mypy and `langgraph-checkpoint-sqlite`. |
 
 ### Accounts and credentials
-None. The RelateGraphSaver engine operates completely in-process as an embedded system. It requires no external cloud accounts, SaaS API tokens, or paid credentials. The tool-calling demo uses a deterministic agent function, not a model API.
+None required. The engine, the tests and the committed demo store need no account or key; the tool and dependency demos use deterministic agent functions, and the PyPI JSON API needs no key. One optional row:
+
+| Service | Variable | Needed for | Where to get it | Cost | Tests without it |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| OpenRouter | `OPENROUTER_API_KEY` | only the optional recorded LLM run (`examples/openrouter_agent.py`) | openrouter.ai account settings | pay per token; model and spend approved by the project owner before any run | no test reads the key; AC-140 runs with it unset |
 
 ### Local services
-None. All graph storage is managed in-process via single-file `.rl` databases or `:memory:` targets. No Docker containers, PostgreSQL servers, or background daemon services are required. Network access to the package index is needed only for the slow clean-install test.
+None. All graph storage is managed in-process via single-file `.rl` databases or `:memory:` targets. No Docker containers, PostgreSQL servers, or background daemon services are required. Network access is needed only for the slow clean-install test (package index), for rebuilding `examples/data/demo.rl` and for the hand-run `network` test (both `https://pypi.org`). Replaying the dependency agent with `--graph` also calls pypi.org, because replay runs the real tool code.
 
 ## Expensive to change
 
@@ -780,12 +779,21 @@ None. All graph storage is managed in-process via single-file `.rl` databases or
 7. **Tool call recording rules:**
    - *Components:* one `[:INVOKED]` edge per (thread, call) from the first stored checkpoint whose save saw the call (a call seen before its named checkpoint is stored attaches to a later one); first outcome wins; orphan results create nothing.
    - *Why expensive:* Forensics picks the error checkpoint from where the `[:INVOKED]` edge attaches. Changing which checkpoint gets the edge, or allowing outcomes to be overwritten, changes the reports of already stored runs.
-8. **`RootCauseReport.root_tool_name`:**
-   - *Components:* public dataclass field and the `Failing tool:` summary sentence.
-   - *Why expensive:* It is public API; removing or renaming it breaks callers of `trace_root_cause()`.
+8. **`RootCauseReport.root_tool_name`, the origin fields and the provenance heuristic:**
+   - *Components:* `root_tool_name` and the `Failing tool:` summary sentence; `origin_argument`, `origin_node`, `origin_step`, `origin_hops`; `ArgumentOrigin`, `ToolFailureSummary`, `trace_argument_origin()`, `failure_summary()`; the containment rule, the earliest-write rule and hops counted from the failure checkpoint ([ADR-0018](DECISIONS.md#adr-0018-argument-provenance-by-string-containment-earliest-write-wins)).
+   - *Why expensive:* Public API; removing or renaming a field breaks callers of `trace_root_cause()`. Changing the heuristic changes the origin and hop count already shown in the README and the demo for the same stored data.
 9. **What an in-memory fork contains:**
    - *Components:* the copied set of `fork_in_memory()`: lineage checkpoints, their writes, and the tool calls they invoked, with the edges between them and only the outcomes already visible at the fork point ([ADR-0010](DECISIONS.md#adr-0010-in-memory-forks-copy-tool-call-data)).
    - *Why expensive:* Users run forensics and `relate-dag replay` on forks and expect the same answer as on the original run. Dropping a node type from the copy, narrowing which tool calls are included, or changing which outcomes are kept silently changes those answers without any error.
 10. **Read-only inspection leaves the store byte-identical:**
     - *Components:* the `read_only` keyword on `RelateSaver` and `RelateThreadProxy`, `RelateReadOnlyError`, the rule that every `relate-dag` inspection command opens the store read-only, and the `relate-db>=1.0.2` floor ([ADR-0015](DECISIONS.md#adr-0015-read-only-opening-for-inspection-commands)).
     - *Why expensive:* The committed demo store and anyone inspecting a shared or archived `.rl` file rely on inspection never changing it. Adding a write, a schema setup step or a flush to any inspection path, or opening one command writable again, makes every clone show a modified file with no error. `read_only` and `RelateReadOnlyError` are public API.
+11. **Replay API and its diff rules:**
+    - *Components:* `replay_from_checkpoint`, `snapshot_run`, `diff_runs`, `load_graph_factory`, `GraphSpecError`, `TimeTravelEngine.replay` and the six replay dataclasses; tool calls matched by tool name and ordinal; messages by index and first 120 characters; the rule that user graph code runs only against the sandbox saver ([ADR-0017](DECISIONS.md#adr-0017-replay-runs-user-graph-code-only-against-an-in-memory-sandbox)).
+    - *Why expensive:* Public API. Changing a matching key or the truncation changes what every replay reports (for example `error -> ok`) without an error, and callers compare `RunDiff` values for equality (AC-108).
+12. **Graph spec format:**
+    - *Components:* `path/to/file.py:attr` and `package.module:attr`, split on the last `:`, attribute a factory accepting `checkpointer=` or an uncompiled `StateGraph`.
+    - *Why expensive:* The README, users' scripts and CI jobs type these specs into `relate-dag replay --graph`; a new syntax or a stricter attribute rule breaks every saved command.
+13. **Committed demo store contents and the README that quotes them:**
+    - *Components:* exactly four threads (`demo-tool-fail`, `demo-tool-ok`, `demo-research`, `demo-real-api`) and their outcomes, the README's explore commands and quoted first checkpoint id, and the tests asserting both; the build needs pypi.org ([ADR-0019](DECISIONS.md#adr-0019-the-demo-store-holds-a-real-api-thread-and-its-build-needs-network-access)).
+    - *Why expensive:* Every rebuild writes new checkpoint ids, so the README id, sample outputs and tests must change in the same commit; a rebuild also depends on PyPI being reachable and on `relategraphsaver` still not existing there.
