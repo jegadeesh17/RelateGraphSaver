@@ -7,11 +7,13 @@ path traversals from failure nodes to offending antecedent writes or tool calls.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
+from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+
 from langgraph_checkpoint_relate.errors import CheckpointNotFoundError
-from langgraph_checkpoint_relate.models import LoopReport, RootCauseReport
+from langgraph_checkpoint_relate.models import ArgumentOrigin, LoopReport, RootCauseReport
 from langgraph_checkpoint_relate.saver import RelateSaver, _extract_bytes
 
 logger = logging.getLogger(__name__)
@@ -82,6 +84,57 @@ def _detect_sequence_cycles(
             i += 1
 
     return found_cycles
+
+
+_MIN_ARGUMENT_LENGTH = 3
+_MAX_SEARCH_DEPTH = 6
+_UNKNOWN_NODE = "<unknown>"
+
+
+def _message_contains(message: BaseMessage, needle: str, depth: int) -> bool:
+    """Return whether a message's text, or an AI message's tool-call arguments, hold needle."""
+    content = message.content
+    if isinstance(content, str):
+        if needle in content:
+            return True
+    else:
+        for part in content:
+            if isinstance(part, str):
+                if needle in part:
+                    return True
+            elif isinstance(part, dict) and part.get("type") == "text":
+                text = part.get("text")
+                if isinstance(text, str) and needle in text:
+                    return True
+    if isinstance(message, AIMessage):
+        for tool_call in message.tool_calls:
+            if _value_contains(tool_call.get("args"), needle, depth + 1):
+                return True
+    return False
+
+
+def _value_contains(value: Any, needle: str, depth: int = 0) -> bool:
+    """Case-sensitive containment search through strings, messages and nested containers."""
+    if depth > _MAX_SEARCH_DEPTH:
+        return False
+    if isinstance(value, str):
+        return needle in value
+    if isinstance(value, BaseMessage):
+        return _message_contains(value, needle, depth)
+    if isinstance(value, dict):
+        return any(_value_contains(item, needle, depth + 1) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_value_contains(item, needle, depth + 1) for item in value)
+    return False
+
+
+def _holds_tool_message(value: Any, tool_call_id: str) -> bool:
+    """Return whether a write value is, or is a sequence containing, the ToolMessage for an id."""
+    if isinstance(value, ToolMessage):
+        return value.tool_call_id == tool_call_id
+    if isinstance(value, (list, tuple)):
+        return any(isinstance(m, ToolMessage) and m.tool_call_id == tool_call_id for m in value)
+    return False
 
 
 class RelateForensics:
@@ -298,6 +351,138 @@ class RelateForensics:
             )
 
         return reports
+
+    def _loads_blob(self, raw: Any, what: str) -> Any:
+        """Deserialize a stored blob, returning None (and logging) when it cannot be read."""
+        try:
+            return self._saver.serde.loads(_extract_bytes(raw))
+        except Exception as exc:
+            logger.debug("Skipping undeserializable %s: %s", what, exc)
+            return None
+
+    def _writing_node(self, checkpoint_id: str, thread_id: str) -> str:
+        """Name the node(s) whose versions_seen entry changes after a checkpoint (ADR-0018)."""
+        rows = self._saver.proxy.execute_read(
+            "MATCH (a:Checkpoint {checkpoint_id: $id})-[:NEXT]->"
+            "(b:Checkpoint {thread_id: $thread_id}) "
+            "RETURN a.checkpoint_blob AS before_blob, b.checkpoint_blob AS after_blob "
+            "ORDER BY b.step ASC LIMIT 1",
+            {"id": checkpoint_id, "thread_id": thread_id},
+        )
+        if not rows:
+            return _UNKNOWN_NODE
+        before = self._loads_blob(rows[0].get("before_blob"), "checkpoint")
+        after = self._loads_blob(rows[0].get("after_blob"), "checkpoint")
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            return _UNKNOWN_NODE
+        seen_before = before.get("versions_seen")
+        seen_after = after.get("versions_seen")
+        if not isinstance(seen_before, dict) or not isinstance(seen_after, dict):
+            return _UNKNOWN_NODE
+        changed = sorted(
+            str(node) for node in seen_after if seen_after[node] != seen_before.get(node)
+        )
+        return ", ".join(changed) if changed else _UNKNOWN_NODE
+
+    def trace_argument_origin(
+        self, thread_id: str, error_checkpoint_id: str, args: Mapping[str, Any]
+    ) -> ArgumentOrigin | None:
+        """Find the earliest write that held a string argument of a failing tool call.
+
+        Only top-level string arguments of at least 3 characters are traced, by
+        case-sensitive containment; the earliest matching write on the ``[:NEXT]`` path
+        ending at ``error_checkpoint_id`` wins (ADR-0018). This is a heuristic, not
+        data-flow tracking.
+
+        Args:
+            thread_id: Execution thread identifier.
+            error_checkpoint_id: Checkpoint where the failure was found; hops count back from it.
+            args: The failing tool call's arguments.
+
+        Returns:
+            The origin, or None when no argument is traceable or no write holds one.
+
+        Raises:
+            CheckpointNotFoundError: If thread_id or error_checkpoint_id is not a non-empty string.
+        """
+        if not isinstance(thread_id, str) or not thread_id.strip():
+            raise CheckpointNotFoundError("thread_id must be a non-empty string.")
+        if not isinstance(error_checkpoint_id, str) or not error_checkpoint_id.strip():
+            raise CheckpointNotFoundError("error_checkpoint_id must be a non-empty string.")
+        if not isinstance(args, Mapping):
+            return None
+        candidates = [
+            (str(name), value)
+            for name, value in args.items()
+            if isinstance(value, str) and len(value) >= _MIN_ARGUMENT_LENGTH
+        ]
+        if not candidates:
+            return None
+
+        rows = self._saver.proxy.execute_read(
+            "MATCH path = (err:Checkpoint {checkpoint_id: $id})<-[:NEXT*0..]-"
+            "(a:Checkpoint {thread_id: $thread_id})-[:HAS_WRITE]->(w:Write) "
+            "RETURN a.checkpoint_id AS checkpoint_id, a.step AS step, length(path) AS hops, "
+            "       w.channel AS channel, w.idx AS idx, w.write_blob AS write_blob",
+            {"id": error_checkpoint_id, "thread_id": thread_id},
+        )
+        rows = sorted(rows, key=lambda r: (int(r.get("step") or 0), int(r.get("idx") or 0)))
+        for row in rows:
+            channel = str(row.get("channel") or "")
+            if channel.startswith(("__", "branch:")) or not row.get("write_blob"):
+                continue
+            value = self._loads_blob(row["write_blob"], f"write on channel '{channel}'")
+            if value is None:
+                continue
+            for name, needle in candidates:
+                if _value_contains(value, needle):
+                    checkpoint_id = str(row["checkpoint_id"])
+                    return ArgumentOrigin(
+                        argument=name,
+                        value=needle,
+                        node=self._writing_node(checkpoint_id, thread_id),
+                        step=int(row.get("step") or 0),
+                        # length(path) also counts the closing [:HAS_WRITE] edge.
+                        hops=max(int(row.get("hops") or 1) - 1, 0),
+                        checkpoint_id=checkpoint_id,
+                    )
+        return None
+
+    def _failure_checkpoint_id(
+        self, thread_id: str, error_checkpoint_id: str, tool_call_id: str
+    ) -> str:
+        """Return the first checkpoint at or after the error whose writes hold the tool's result."""
+        rows = self._saver.proxy.execute_read(
+            "MATCH path = (err:Checkpoint {checkpoint_id: $id})-[:NEXT*0..]->"
+            "(c:Checkpoint {thread_id: $thread_id})-[:HAS_WRITE]->(w:Write) "
+            "RETURN c.checkpoint_id AS checkpoint_id, length(path) AS distance, "
+            "       w.channel AS channel, w.write_blob AS write_blob",
+            {"id": error_checkpoint_id, "thread_id": thread_id},
+        )
+        for row in sorted(rows, key=lambda r: int(r.get("distance") or 0)):
+            channel = str(row.get("channel") or "")
+            if channel.startswith("__") or not row.get("write_blob"):
+                continue
+            value = self._loads_blob(row["write_blob"], f"write on channel '{channel}'")
+            if _holds_tool_message(value, tool_call_id):
+                return str(row["checkpoint_id"])
+        return error_checkpoint_id
+
+    def _trace_failing_call_origin(
+        self, thread_id: str, error_checkpoint_id: str, tool_call_id: str
+    ) -> ArgumentOrigin | None:
+        """Trace the arguments of a recorded tool call back to the write that first held one."""
+        rows = self._saver.proxy.execute_read(
+            "MATCH (tc:ToolCall {call_id: $call_id}) RETURN tc.args_blob AS args_blob",
+            {"call_id": tool_call_id},
+        )
+        if not rows or not rows[0].get("args_blob"):
+            return None
+        args = self._loads_blob(rows[0]["args_blob"], f"arguments of call '{tool_call_id}'")
+        if not isinstance(args, dict):
+            return None
+        start = self._failure_checkpoint_id(thread_id, error_checkpoint_id, tool_call_id)
+        return self.trace_argument_origin(thread_id, start, args)
 
     def trace_root_cause(self, thread_id: str) -> RootCauseReport:
         """Trace causal antecedent edges from an error checkpoint to offending write or tool call.
@@ -557,6 +742,14 @@ class RelateForensics:
         parts.append(f"Causal path distance: {causal_path_length} step(s).")
         diagnostic_summary = " ".join(parts)
 
+        origin: ArgumentOrigin | None = None
+        if root_tool_call_id is not None and any(
+            r.get("tool_call_id") == root_tool_call_id and r.get("tool_error") for r in causal_rows
+        ):
+            origin = self._trace_failing_call_origin(
+                thread_id, error_checkpoint_id, root_tool_call_id
+            )
+
         return RootCauseReport(
             thread_id=thread_id,
             error_checkpoint_id=error_checkpoint_id,
@@ -566,6 +759,10 @@ class RelateForensics:
             causal_path_length=causal_path_length,
             diagnostic_summary=diagnostic_summary,
             root_tool_name=root_tool_name,
+            origin_argument=origin.argument if origin else None,
+            origin_node=origin.node if origin else None,
+            origin_step=origin.step if origin else None,
+            origin_hops=origin.hops if origin else None,
         )
 
 

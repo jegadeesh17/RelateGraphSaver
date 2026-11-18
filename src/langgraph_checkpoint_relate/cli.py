@@ -27,7 +27,12 @@ from langgraph_checkpoint_relate.errors import (
     RelateCheckpointError,
 )
 from langgraph_checkpoint_relate.forensics import RelateForensics
-from langgraph_checkpoint_relate.models import ChannelChange, RunDiff, ToolCallChange
+from langgraph_checkpoint_relate.models import (
+    ChannelChange,
+    RootCauseReport,
+    RunDiff,
+    ToolCallChange,
+)
 from langgraph_checkpoint_relate.replay import load_graph_factory, replay_from_checkpoint
 from langgraph_checkpoint_relate.saver import RelateSaver
 from langgraph_checkpoint_relate.time_travel import TimeTravelEngine
@@ -429,6 +434,17 @@ def replay(
             source_saver.close()
 
 
+def _origin_line(report: RootCauseReport) -> str:
+    """Return the 'Bad argument origin' panel line with its newline, or '' without an origin."""
+    if report.origin_argument is None:
+        return ""
+    return (
+        "[bold yellow]Bad argument origin:[/bold yellow] "
+        f"{escape(report.origin_argument)} came from node {escape(str(report.origin_node))} "
+        f"(step {report.origin_step}, {report.origin_hops} hops before failure)\n"
+    )
+
+
 class ForensicsGroup(TyperGroup):
     """Custom TyperGroup routing 'relate-dag forensics <thread_id>' to default diagnose command."""
 
@@ -556,6 +572,7 @@ def forensics_trace_error(
                     f"[bold red]Error Message:[/bold red]       {report.error_message}\n"
                     f"[bold yellow]Root Tool Call ID:[/bold yellow]   {report.root_tool_call_id or 'None'}\n"
                     f"[bold yellow]Root Tool Name:[/bold yellow]      {report.root_tool_name or 'None'}\n"
+                    f"{_origin_line(report)}"
                     f"[bold yellow]Root Channel Write:[/bold yellow]  {report.root_channel_write or 'None'}\n"
                     f"[bold green]Causal Path Length:[/bold green]  {report.causal_path_length}\n"
                     f"[bold white]Diagnostic Summary:[/bold white]  {report.diagnostic_summary}"

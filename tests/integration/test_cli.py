@@ -15,12 +15,16 @@ import sys
 import tempfile
 from collections.abc import Generator
 from pathlib import Path
-from typing import Any, cast
+from typing import Annotated, Any, TypedDict, cast
 
 import pytest
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import tool
 from langgraph.checkpoint.base import empty_checkpoint
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
 from typer.testing import CliRunner
 
 from langgraph_checkpoint_relate.cli import app
@@ -1181,3 +1185,87 @@ class TestCliReplayGraph:
         stdout = proc.stdout.decode("cp1252")
         assert "error -> ok" in stdout
         assert "fetch_source #1" in stdout
+
+
+class _OriginState(TypedDict):
+    """State for a planner -> agent -> tools graph whose tool consumes the planner's value."""
+
+    target: str
+    messages: Annotated[list[AnyMessage], add_messages]
+
+
+@tool
+def _fetch_package(url: str) -> str:
+    """Fetch a package; fails for every url unless it ends with 'ok'."""
+    if not url.endswith("ok"):
+        raise RuntimeError(f"no such package: {url}")
+    return f"fetched {url}"
+
+
+_fetch_package.name = "fetch_package"
+
+
+def _run_origin_graph(db_file: str, thread_id: str, target: str) -> None:
+    """Persist one run in which the planner writes ``target`` and the tool call uses it."""
+
+    def planner(state: _OriginState) -> dict[str, Any]:
+        return {"target": target}
+
+    def agent(state: _OriginState) -> dict[str, Any]:
+        call = {"id": "call-origin-1", "name": "fetch_package", "args": {"url": state["target"]}}
+        return {"messages": [AIMessage(content="", tool_calls=[call])]}
+
+    builder = StateGraph(_OriginState)
+    builder.add_node("planner", planner)
+    builder.add_node("agent", agent)
+    builder.add_node("tools", ToolNode([_fetch_package], handle_tool_errors=True))
+    builder.add_edge(START, "planner")
+    builder.add_edge("planner", "agent")
+    builder.add_edge("agent", "tools")
+    builder.add_edge("tools", END)
+    with RelateSaver(db_path=db_file) as saver:
+        builder.compile(checkpointer=saver).invoke(
+            {"messages": [HumanMessage(content="look the package up")], "target": ""},
+            {"configurable": {"thread_id": thread_id}},
+        )
+
+
+def _flatten(output: str) -> str:
+    """Collapse panel borders and wrapping so a wrapped line can be matched as one string."""
+    return re.sub(r"[|│\s]+", " ", output)
+
+
+def test_trace_error_prints_bad_argument_origin_ac_122(runner: CliRunner, tmp_path: Path) -> None:
+    """AC-122: trace-error names the argument, node, step and hops of the bad argument."""
+    db_file = str(tmp_path / "origin.rl")
+    _run_origin_graph(db_file, "origin-fail", "pkg-alpha-9000")
+
+    result = runner.invoke(app, ["forensics", "trace-error", "origin-fail", "--db", db_file])
+
+    assert result.exit_code == 0
+    assert (
+        "Bad argument origin: url came from node planner (step 0, 2 hops before failure)"
+        in _flatten(result.output)
+    )
+
+
+def test_trace_error_omits_origin_line_without_origin_ac_122(
+    runner: CliRunner, seeded_error_db: tuple[str, str, str]
+) -> None:
+    """AC-122: a failure with no traceable tool argument prints no origin line."""
+    db_file, thread_id, _ = seeded_error_db
+
+    result = runner.invoke(app, ["forensics", "trace-error", thread_id, "--db", db_file])
+
+    assert result.exit_code == 0
+    assert "Root Tool Name:" in result.output
+    assert "Bad argument origin" not in result.output
+
+
+def test_trace_error_demo_tool_fail_still_names_the_tool_rc_05(runner: CliRunner) -> None:
+    """RC-05: the committed demo store still reports fetch_source and its call id."""
+    result = runner.invoke(app, ["forensics", "trace-error", DEMO_THREAD, "--db", str(DEMO_STORE)])
+
+    assert result.exit_code == 0
+    assert "fetch_source" in result.output
+    assert re.search(r"call_[0-9a-f]{32}", result.output)

@@ -16,13 +16,16 @@ import tempfile
 import time
 from collections.abc import Generator
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Annotated, Any, TypedDict
 
 import pytest
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import tool
 from langgraph.checkpoint.base import empty_checkpoint
 from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
 
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
 _SRC_DIR = str(Path(__file__).resolve().parents[2] / "src")
@@ -485,3 +488,160 @@ class TestRelateForensics:
         assert report.root_tool_name == "slow_api"
         assert report.causal_path_length == chain_length - 1
         assert elapsed < 1.0
+
+
+class ProvenanceState(TypedDict):
+    """State for the argument provenance graph: a planner-chosen target and a message log."""
+
+    target: str
+    messages: Annotated[list[AnyMessage], add_messages]
+
+
+PLANNED_TARGET = "pkg-alpha-9000"
+FETCH_CALL_ID = "call-provenance-1"
+
+
+@tool
+def fetch_package(url: str, retries: int = 1) -> str:
+    """Fetch a package; fails for every url unless it ends with 'ok'."""
+    if not url.endswith("ok"):
+        raise RuntimeError(f"no such package: {url}")
+    return f"fetched {url} after {retries} tries"
+
+
+def _run_provenance_graph(saver: RelateSaver, thread_id: str, target: str) -> None:
+    """Run planner -> agent -> tools; the planner writes ``target`` and the tool consumes it."""
+
+    def planner(state: ProvenanceState) -> dict[str, Any]:
+        return {"target": target}
+
+    def agent(state: ProvenanceState) -> dict[str, Any]:
+        call = {
+            "id": FETCH_CALL_ID,
+            "name": "fetch_package",
+            "args": {"url": state["target"], "retries": 5},
+        }
+        return {"messages": [AIMessage(content="", tool_calls=[call])]}
+
+    builder = StateGraph(ProvenanceState)
+    builder.add_node("planner", planner)
+    builder.add_node("agent", agent)
+    builder.add_node("tools", ToolNode([fetch_package], handle_tool_errors=True))
+    builder.add_edge(START, "planner")
+    builder.add_edge("planner", "agent")
+    builder.add_edge("agent", "tools")
+    builder.add_edge("tools", END)
+    graph = builder.compile(checkpointer=saver)
+    graph.invoke(
+        {"messages": [HumanMessage(content="please look the package up")], "target": ""},
+        {"configurable": {"thread_id": thread_id}},
+    )
+
+
+class TestArgumentProvenance:
+    """Argument provenance: which step first held a failing tool's argument (ADR-0018)."""
+
+    THREAD = "thread-provenance"
+
+    @staticmethod
+    def _failure_checkpoint_id(saver: RelateSaver, thread_id: str) -> str:
+        """Return the checkpoint whose writes hold the failing tool's ToolMessage."""
+        rows = saver.proxy.execute_read(
+            "MATCH (c:Checkpoint {thread_id: $t})-[:HAS_WRITE]->(w:Write) "
+            "WHERE w.channel = 'messages' RETURN c.checkpoint_id AS id, c.step AS step, "
+            "w.write_blob AS blob ORDER BY c.step",
+            {"t": thread_id},
+        )
+        for row in rows:
+            value = saver.serde.loads(bytes(row["blob"]))
+            if any(isinstance(m, ToolMessage) for m in value):
+                return str(row["id"])
+        raise AssertionError("no ToolMessage write found")
+
+    def test_origin_names_node_step_and_hops_of_earliest_write_ac_119(self) -> None:
+        """AC-119: the planner's write, not the later model message, is the origin."""
+        with RelateSaver(":memory:") as saver:
+            _run_provenance_graph(saver, self.THREAD, PLANNED_TARGET)
+            failure_cp = self._failure_checkpoint_id(saver, self.THREAD)
+
+            with RelateForensics(saver) as forensics:
+                origin = forensics.trace_argument_origin(
+                    self.THREAD, failure_cp, {"url": PLANNED_TARGET, "retries": 5}
+                )
+
+        assert origin is not None
+        assert origin.argument == "url"
+        assert origin.value == PLANNED_TARGET
+        assert origin.node == "planner"
+        # The planner ran from the step 0 checkpoint; the tool ran from the step 2 checkpoint.
+        assert origin.step == 0
+        assert origin.hops == 2
+
+    def test_origin_is_case_sensitive_ac_119(self) -> None:
+        """AC-119: containment is case-sensitive, so a different case finds nothing."""
+        with RelateSaver(":memory:") as saver:
+            _run_provenance_graph(saver, self.THREAD, PLANNED_TARGET)
+            failure_cp = self._failure_checkpoint_id(saver, self.THREAD)
+
+            with RelateForensics(saver) as forensics:
+                origin = forensics.trace_argument_origin(
+                    self.THREAD, failure_cp, {"url": PLANNED_TARGET.upper()}
+                )
+
+        assert origin is None
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            {"retries": 5, "flag": True, "items": ["pkg-alpha-9000"]},
+            {"url": "pk"},
+            {"url": "never-written-anywhere"},
+            {},
+        ],
+        ids=["non-string", "shorter-than-3", "untraceable", "empty"],
+    )
+    def test_untraceable_arguments_return_none_ac_120(self, args: dict[str, Any]) -> None:
+        """AC-120: non-string, short and untraceable arguments give no origin."""
+        with RelateSaver(":memory:") as saver:
+            _run_provenance_graph(saver, self.THREAD, PLANNED_TARGET)
+            failure_cp = self._failure_checkpoint_id(saver, self.THREAD)
+
+            with RelateForensics(saver) as forensics:
+                assert forensics.trace_argument_origin(self.THREAD, failure_cp, args) is None
+
+    def test_invalid_identifiers_are_rejected_ac_120(self) -> None:
+        """AC-120: an empty thread or checkpoint id raises instead of returning a guess."""
+        with RelateSaver(":memory:") as saver, RelateForensics(saver) as forensics:
+            with pytest.raises(CheckpointNotFoundError):
+                forensics.trace_argument_origin("", "cp-1", {"url": "abcdef"})
+            with pytest.raises(CheckpointNotFoundError):
+                forensics.trace_argument_origin("thread", " ", {"url": "abcdef"})
+
+    def test_trace_root_cause_fills_origin_for_failing_tool_ac_121(self) -> None:
+        """AC-121: the report names the argument, node, step and hops from the failing call."""
+        with RelateSaver(":memory:") as saver:
+            _run_provenance_graph(saver, self.THREAD, PLANNED_TARGET)
+
+            with RelateForensics(saver) as forensics:
+                report = forensics.trace_root_cause(self.THREAD)
+
+        assert report.root_tool_call_id == FETCH_CALL_ID
+        assert report.origin_argument == "url"
+        assert report.origin_node == "planner"
+        assert report.origin_step == 0
+        assert report.origin_hops == 2
+        assert "planner" not in report.diagnostic_summary
+
+    def test_trace_root_cause_leaves_origin_empty_without_failure_ac_121(self) -> None:
+        """AC-121: a thread whose tool call succeeds has no origin fields."""
+        with RelateSaver(":memory:") as saver:
+            _run_provenance_graph(saver, self.THREAD, "pkg-ok")
+
+            with RelateForensics(saver) as forensics:
+                report = forensics.trace_root_cause(self.THREAD)
+
+        assert report.error_message == "No error detected"
+        assert report.origin_argument is None
+        assert report.origin_node is None
+        assert report.origin_step is None
+        assert report.origin_hops is None

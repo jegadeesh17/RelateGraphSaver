@@ -24,6 +24,7 @@ from tests.fakes.fake_relate_driver import (
 
 from langgraph_checkpoint_relate.errors import RelateConnectionError
 from langgraph_checkpoint_relate.models import (
+    ArgumentOrigin,
     CheckpointNode,
     LoopReport,
     RootCauseReport,
@@ -409,6 +410,38 @@ class TestForensicReports:
             thread_id="th-1", error_checkpoint_id="cp-1", error_message="m", root_tool_name="search"
         )
         assert named.root_tool_name == "search"
+
+    def test_root_cause_report_origin_fields_are_optional_and_last_ac_121(self) -> None:
+        """AC-121: the origin fields default to None, so construction without them still works."""
+        positional = RootCauseReport("th-1", "cp-1", "m", "call-1", "w-1", 2, "summary", "search")
+        keyword = RootCauseReport(thread_id="th-1", error_checkpoint_id="cp-1", error_message="m")
+        for report in (positional, keyword):
+            assert report.origin_argument is None
+            assert report.origin_node is None
+            assert report.origin_step is None
+            assert report.origin_hops is None
+        assert positional.root_tool_name == "search"
+
+        with_origin = RootCauseReport(
+            thread_id="th-1",
+            error_checkpoint_id="cp-1",
+            error_message="m",
+            origin_argument="url",
+            origin_node="planner",
+            origin_step=0,
+            origin_hops=2,
+        )
+        assert (with_origin.origin_argument, with_origin.origin_node) == ("url", "planner")
+        assert (with_origin.origin_step, with_origin.origin_hops) == (0, 2)
+
+    def test_argument_origin_is_a_frozen_record_ac_119(self) -> None:
+        """AC-119: ArgumentOrigin carries the argument, value, node, step, hops and checkpoint."""
+        origin = ArgumentOrigin(
+            argument="url", value="abc", node="planner", step=0, hops=2, checkpoint_id="cp-0"
+        )
+        assert origin.hops == 2
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            origin.node = "other"  # type: ignore[misc]
 
 
 class TestSchemaDDLAndConstraints:

@@ -298,6 +298,10 @@ class RootCauseReport:
     causal_path_length: int = 0
     diagnostic_summary: str = ""
     root_tool_name: str | None = None
+    origin_argument: str | None = None
+    origin_node: str | None = None
+    origin_step: int | None = None
+    origin_hops: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.thread_id, str) or not self.thread_id.strip():
@@ -312,6 +316,23 @@ class RootCauseReport:
             raise ValueError(
                 f"causal_path_length must be non-negative, got {self.causal_path_length!r}"
             )
+
+
+@dataclass(frozen=True)
+class ArgumentOrigin:
+    """The earliest write that held a failing tool call's argument (ADR-0018).
+
+    ``hops`` counts ``[:NEXT]`` steps from the checkpoint holding the write to the
+    checkpoint where the failure was found. ``node`` is ``<unknown>`` when the writing
+    node cannot be determined.
+    """
+
+    argument: str
+    value: str
+    node: str
+    step: int
+    hops: int
+    checkpoint_id: str
 
 
 @dataclass(frozen=True)
@@ -390,6 +411,7 @@ class ReplayResult:
 
 
 __all__ = [
+    "ArgumentOrigin",
     "ChannelChange",
     "CheckpointNode",
     "LoopReport",
