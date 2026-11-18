@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 from examples.build_demo_store import (
@@ -23,6 +24,7 @@ from examples.build_demo_store import (
     build_demo_store,
     main,
 )
+from examples.tool_agent import run_tool_agent
 from typer.testing import CliRunner
 
 from langgraph_checkpoint_relate.cli import app
@@ -224,17 +226,16 @@ def test_ac73_failed_build_cleanup_never_masks_the_original_error(
 ) -> None:
     """AC-73: a cleanup that fails is reported, and the build error still propagates."""
     out = tmp_path / "we[ird].rl"
-    leftover = tmp_path / "we[ird].building.rl-extra"
+    staging = tmp_path / "we[ird].building.rl"
     attempted: list[str] = []
 
     def failing_build(*_args: object, **_kwargs: object) -> None:
-        # Guarantee a leftover (on a name containing a glob character) for the cleanup to find.
-        leftover.write_bytes(b"x")
         raise RuntimeError("scripted failure")
 
     def failing_remove(path: Path) -> None:
-        # Only the cleanup of the leftover fails; the pre-build removal of a stale file is a no-op.
-        if path == leftover:
+        # Only the cleanup of the staging file the build created fails; removing a stale one
+        # before the build is a no-op.
+        if path == staging and path.exists():
             attempted.append(path.name)
             raise PermissionError("scripted cleanup failure")
 
@@ -242,8 +243,72 @@ def test_ac73_failed_build_cleanup_never_masks_the_original_error(
     monkeypatch.setattr("examples.build_demo_store._remove_if_exists", failing_remove)
     with pytest.raises(RuntimeError, match="scripted failure"):
         build_demo_store(out)
-    assert leftover.name in attempted
-    assert "Could not remove leftover" in capsys.readouterr().err
+    assert attempted == [staging.name]
+    err = capsys.readouterr().err
+    assert "[WARN] Could not remove leftover" in err
+    assert str(staging) in err
+
+
+def test_ac73_failed_build_removes_only_its_own_staging_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC-73: files and folders that merely share the staging name as a prefix survive."""
+    out = tmp_path / "demo.rl"
+    staging_name = "demo.building.rl"
+    unrelated_file = tmp_path / f"{staging_name}-mine"
+    unrelated_dir = tmp_path / f"{staging_name}.keep"
+    unrelated_wal_named = tmp_path / f"{staging_name}-wal"
+    unrelated_file.write_bytes(b"mine")
+    unrelated_wal_named.write_bytes(b"also mine")
+    unrelated_dir.mkdir()
+    (unrelated_dir / "notes.txt").write_bytes(b"keep me")
+    before = _listing(tmp_path)
+
+    def boom(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("scripted failure")
+
+    monkeypatch.setattr("examples.build_demo_store.run_research_workflow", boom)
+    with pytest.raises(RuntimeError, match="scripted failure"):
+        build_demo_store(out)
+
+    assert _listing(tmp_path) == before
+    assert not (tmp_path / staging_name).exists()
+    assert unrelated_file.read_bytes() == b"mine"
+    assert unrelated_wal_named.read_bytes() == b"also mine"
+    assert (unrelated_dir / "notes.txt").read_bytes() == b"keep me"
+
+
+def test_ac73_successful_build_leaves_unrelated_neighbours_alone(tmp_path: Path) -> None:
+    """AC-73: a build that succeeds adds only demo.rl and leaves its neighbours as they were."""
+    neighbour_dir = tmp_path / "demo.building.rl.keep"
+    neighbour_dir.mkdir()
+    (neighbour_dir / "notes.txt").write_bytes(b"keep me")
+    neighbour_file = tmp_path / "demo.building.rl-mine"
+    neighbour_file.write_bytes(b"mine")
+
+    build_demo_store(tmp_path / "demo.rl")
+
+    assert _listing(tmp_path) == ["demo.building.rl-mine", "demo.building.rl.keep", "demo.rl"]
+    assert neighbour_file.read_bytes() == b"mine"
+    assert (neighbour_dir / "notes.txt").read_bytes() == b"keep me"
+
+
+def test_ac73_single_file_store_creates_no_files_beside_itself(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC-73: while the saver is open and after it closes, only the one store file exists."""
+    seen: list[list[str]] = []
+    real_run_tool_agent = run_tool_agent
+
+    def spying_run_tool_agent(saver: RelateSaver, thread_id: str, *, fail: bool) -> dict[str, Any]:
+        result = real_run_tool_agent(saver, thread_id, fail=fail)
+        seen.append(_listing(tmp_path))
+        return result
+
+    monkeypatch.setattr("examples.build_demo_store.run_tool_agent", spying_run_tool_agent)
+    build_demo_store(tmp_path / "demo.rl")
+    assert seen == [["demo.building.rl"], ["demo.building.rl"]]
+    assert _listing(tmp_path) == ["demo.rl"]
 
 
 def test_ac69_committed_store_holds_the_three_threads() -> None:

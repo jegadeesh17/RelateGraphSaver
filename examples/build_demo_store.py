@@ -18,9 +18,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import glob
 import os
-import shutil
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -50,24 +48,20 @@ def _remove_if_exists(path: Path) -> None:
 
 
 def _cleanup_staging(staging: Path) -> None:
-    """Remove the staging file and any sidecar named after it, without ever raising.
+    """Remove the staging file after a build, without ever raising.
+
+    A single-file Relate store (``.rl``) writes nothing but that one file: opening, writing,
+    aborting and killing the process all leave no ``-wal``, ``-shm``, ``-journal`` or lock file
+    beside it. So the staging path is the only path the build can create, and the only one removed;
+    anything else in the directory is not ours, whatever its name.
 
     This runs in a ``finally`` block, so an exception here would replace the build error that is
     already propagating. A removal that fails is reported on stderr instead.
     """
     try:
-        leftovers = list(staging.parent.glob(glob.escape(staging.name) + "*"))
+        _remove_if_exists(staging)
     except OSError as exc:
-        print(f"[WARN] Could not look for leftover files of {staging}: {exc}", file=sys.stderr)
-        return
-    for leftover in leftovers:
-        try:
-            if leftover.is_dir():
-                shutil.rmtree(leftover)
-            else:
-                _remove_if_exists(leftover)
-        except OSError as exc:
-            print(f"[WARN] Could not remove leftover {leftover}: {exc}", file=sys.stderr)
+        print(f"[WARN] Could not remove leftover {staging}: {exc}", file=sys.stderr)
 
 
 def build_demo_store(out_path: Path | str = DEFAULT_OUT_PATH) -> Path:
@@ -78,7 +72,7 @@ def build_demo_store(out_path: Path | str = DEFAULT_OUT_PATH) -> Path:
             directories are created.
 
     Returns:
-        The destination path, holding a closed store with no sidecar files beside it.
+        The destination path, holding a closed store; the build leaves no other file beside it.
 
     Raises:
         ValueError: If ``out_path`` is empty or does not end in ``.rl``. Nothing is created.
@@ -108,7 +102,7 @@ def build_demo_store(out_path: Path | str = DEFAULT_OUT_PATH) -> Path:
             saver.close()
         os.replace(staging, destination)
     finally:
-        # Anything still named like the staging file (failed build) must not be left behind.
+        # After a failed build the staging file must not be left behind.
         _cleanup_staging(staging)
     return destination
 
