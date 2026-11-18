@@ -1,4 +1,4 @@
-"""End-to-end integration tests validating Milestone 3: Forensics & Polish.
+"""End-to-end integration tests for forensics: cycle detection, root-cause tracing and the research workflow.
 
 Verifies complete cross-module integration across the checkpointer stack:
 - Cycle and oscillation detection identifying repeating node sequences and state hashes (AC-25).
@@ -62,7 +62,7 @@ def runner() -> CliRunner:
 def temp_disk_db() -> Generator[str]:
     """Provide a temporary disk-backed database file path and clean up after the test."""
     temp_dir = tempfile.mkdtemp(prefix="relate_m3_qa_")
-    db_file = os.path.join(temp_dir, "milestone3_checkpoints.rl")
+    db_file = os.path.join(temp_dir, "forensics_checkpoints.rl")
     try:
         yield db_file
     finally:
@@ -91,8 +91,8 @@ class AgentPoisonState(TypedDict):
     status: str
 
 
-class TestMilestoneThreeForensicsAndPolish:
-    """End-to-end integration suite for Milestone 3 forensics, polish, and workflows."""
+class TestForensicsEndToEnd:
+    """End-to-end integration suite for forensics, packaging and workflow scenarios."""
 
     def test_agent_loop_detection_and_oscillation_threshold_ac_25(
         self, temp_disk_db: str, runner: CliRunner

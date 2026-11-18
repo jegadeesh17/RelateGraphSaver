@@ -1,4 +1,4 @@
-"""End-to-end integration tests validating Milestone 2: Core Flows and Time-Travel Debugger.
+"""End-to-end integration tests for pending writes, human-in-the-loop interrupts and time-travel replay.
 
 Verifies end-to-end workflows across the checkpointer stack:
 - Pending channel writes and human-in-the-loop interrupt persistence (AC-14, AC-15, AC-16).
@@ -110,8 +110,8 @@ class SubgraphWorkflowState(TypedDict):
     validation_status: str
 
 
-class TestMilestone2Integration:
-    """Milestone 2 integration test suite covering AC-14 through AC-24."""
+class TestTimeTravelIntegration:
+    """Integration test suite covering AC-14 through AC-24."""
 
     def test_human_in_the_loop_interrupt_and_resume_flow_ac_14_ac_15_ac_16(
         self, temp_disk_db: str
@@ -137,7 +137,7 @@ class TestMilestone2Integration:
         builder.add_edge("ask_human", "process")
         builder.add_edge("process", END)
 
-        thread_id = "thread-m2-hitl-001"
+        thread_id = "thread-hitl-001"
         config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
 
         # Stage 1: Run workflow until interrupt on disk-backed saver
@@ -212,7 +212,7 @@ class TestMilestone2Integration:
         - AC-17: Hierarchical subgraphs with varying checkpoint_ns persist attributes intact.
         - AC-18: list() filtering by checkpoint_ns yields only matching checkpoints.
         """
-        thread_id = "thread-m2-namespaces-002"
+        thread_id = "thread-namespaces-002"
         root_ns = ""
         subgraph_worker_ns = "worker_subgraph"
         subgraph_validator_ns = "validator_subgraph"
@@ -351,7 +351,7 @@ class TestMilestone2Integration:
         - AC-19: fork_in_memory() clones subgraph up to target checkpoint into :memory: saver.
         - AC-20: In-memory sandbox writes leave .rl disk file bitwise unmodified.
         """
-        thread_id = "thread-m2-timetravel-003"
+        thread_id = "thread-timetravel-003"
         checkpoint_ids = ["cp-base-00", "cp-base-01", "cp-base-02"]
 
         # 1. Establish durable lineage on disk
@@ -445,7 +445,7 @@ class TestMilestone2Integration:
         self, temp_disk_db: str, cli_runner: CliRunner
     ) -> None:
         """AC-21: Non-existent checkpoint raises CheckpointNotFoundError listing candidates."""
-        thread_id = "thread-m2-candidates-004"
+        thread_id = "thread-candidates-004"
         checkpoint_ids = ["cp-cand-01", "cp-cand-02", "cp-cand-03"]
 
         with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
@@ -488,7 +488,7 @@ class TestMilestone2Integration:
         - AC-23: Branches and pending writes annotated with status tags ([BRANCH], [INTERRUPT], [PENDING]).
         - AC-24: Non-existent thread exits with code 1.
         """
-        thread_id = "thread-m2-visualizer-005"
+        thread_id = "thread-visualizer-005"
 
         with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
             # Step 1: Root
@@ -564,7 +564,7 @@ class TestMilestone2Integration:
         assert "not found" in missing_result.output.lower()
 
     def test_complete_cross_journey_wiring(self, temp_disk_db: str, cli_runner: CliRunner) -> None:
-        """Full end-to-end integration journey combining all Milestone 2 capabilities.
+        """Full end-to-end journey combining interrupts, replay and visualization.
 
         Drives:
         1. LangGraph StateGraph pipeline running to a human-in-the-loop interrupt.
@@ -599,7 +599,7 @@ class TestMilestone2Integration:
         workflow.add_edge("review", "finalize")
         workflow.add_edge("finalize", END)
 
-        thread_id = "thread-m2-journey-full"
+        thread_id = "thread-journey-full"
         config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
 
         # Step 1: Run on disk until interrupt

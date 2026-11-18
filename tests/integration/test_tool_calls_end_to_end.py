@@ -1,4 +1,4 @@
-"""Cross-feature integration tests for the judge-readiness acceptance criteria.
+"""Cross-feature integration tests for tool call capture, forensics and quality gates.
 
 Covers the wiring between features that the per-module tests exercise only in isolation:
 - Static quality gates run exactly as the project defines them (AC-35, AC-36, AC-37, AC-38).
@@ -136,7 +136,7 @@ class TestToolCallsOnAsyncPath:
         self, memory_saver: RelateSaver
     ) -> None:
         """AC-41, AC-45, AC-51: aput/aput_writes capture the call and the failure is named."""
-        thread_id = "m4-async-fail"
+        thread_id = "async-fail"
         graph = create_tool_agent_graph(checkpointer=memory_saver)
 
         state: dict[str, Any] = asyncio.run(
@@ -163,7 +163,7 @@ class TestToolCallsOnAsyncPath:
         self, memory_saver: RelateSaver
     ) -> None:
         """AC-43, AC-52: astream yields every node step and the successful call stores a result."""
-        thread_id = "m4-async-stream-ok"
+        thread_id = "async-stream-ok"
         graph = create_tool_agent_graph(checkpointer=memory_saver)
 
         async def stream() -> list[dict[str, Any]]:
@@ -198,16 +198,16 @@ class TestToolCallsOnAsyncPath:
         async_state: dict[str, Any] = asyncio.run(
             graph.ainvoke(
                 {"messages": [HumanMessage(content=UNREACHABLE_URL)]},
-                _tool_config("m4-shape-async"),
+                _tool_config("shape-async"),
             )
         )
-        sync_state = run_tool_agent(memory_saver, "m4-shape-sync", fail=True)
+        sync_state = run_tool_agent(memory_saver, "shape-sync", fail=True)
 
         rows = {str(r["thread_id"]): r for r in _tool_call_rows(memory_saver)}
-        assert set(rows) == {"m4-shape-async", "m4-shape-sync"}
-        assert rows["m4-shape-async"]["call_id"] == _only_call_id(async_state)
-        assert rows["m4-shape-sync"]["call_id"] == _only_call_id(sync_state)
-        for thread_id in ("m4-shape-async", "m4-shape-sync"):
+        assert set(rows) == {"shape-async", "shape-sync"}
+        assert rows["shape-async"]["call_id"] == _only_call_id(async_state)
+        assert rows["shape-sync"]["call_id"] == _only_call_id(sync_state)
+        for thread_id in ("shape-async", "shape-sync"):
             assert rows[thread_id]["tool_name"] == TOOL_NAME
             assert "upstream unreachable" in str(rows[thread_id]["error"])
             assert rows[thread_id]["result_blob"] is None
@@ -216,9 +216,9 @@ class TestToolCallsOnAsyncPath:
         self, memory_saver: RelateSaver
     ) -> None:
         """AC-47, AC-54: a malformed entry through aput_writes is skipped without raising."""
-        thread_id = "m4-async-malformed"
+        thread_id = "async-malformed"
         checkpoint: Any = empty_checkpoint()
-        checkpoint["id"] = "m4-chk-malformed"
+        checkpoint["id"] = "chk-malformed"
         metadata: Any = {"source": "loop", "step": 0, "parents": {}}
         config = asyncio.run(memory_saver.aput(_tool_config(thread_id), checkpoint, metadata, {}))
 
@@ -236,10 +236,10 @@ class TestToolCallsOnAsyncPath:
         assert result is None
         rows = _tool_call_rows(memory_saver)
         assert [r["call_id"] for r in rows] == [good_id]
-        assert rows[0]["checkpoint_id"] == "m4-chk-malformed"
+        assert rows[0]["checkpoint_id"] == "chk-malformed"
         stored = memory_saver.proxy.execute_read(
             "MATCH (w:Write {checkpoint_id: $cid}) RETURN w.channel AS channel",
-            {"cid": "m4-chk-malformed"},
+            {"cid": "chk-malformed"},
         )
         assert sorted(str(r["channel"]) for r in stored) == ["counter", "messages"]
 
@@ -250,7 +250,7 @@ class TestConcurrentToolRuns:
     def test_concurrent_tool_runs_keep_each_call_on_its_own_thread_ac_42_ac_53(
         self, memory_saver: RelateSaver
     ) -> None:
-        thread_ids = [f"m4-conc-{idx}" for idx in range(6)]
+        thread_ids = [f"conc-{idx}" for idx in range(6)]
         urls = [UNREACHABLE_URL if idx % 2 == 0 else OK_URL for idx in range(len(thread_ids))]
         graph = create_tool_agent_graph(checkpointer=memory_saver)
 
@@ -291,7 +291,7 @@ class TestForkOfToolRun:
     """AC-19: fork_in_memory sandboxes a thread whose history includes tool calls."""
 
     def test_fork_is_an_isolated_replay_of_the_tool_run_ac_19(self, tmp_path: Path) -> None:
-        thread_id = "m4-fork-tools"
+        thread_id = "fork-tools"
         source_file = str(tmp_path / "source.rl")
         with RelateSaver(db_path=source_file) as source:
             run_tool_agent(source, thread_id, fail=True)
@@ -310,7 +310,7 @@ class TestForkOfToolRun:
                 assert len(list(fork.list(config))) == source_checkpoints
 
                 child: Any = empty_checkpoint()
-                child["id"] = "m4-fork-child"
+                child["id"] = "fork-child"
                 child_meta: Any = {"source": "loop", "step": 99, "parents": {}}
                 fork.put(_tool_config(thread_id, target_id), child, child_meta, {})
 
@@ -333,9 +333,9 @@ class TestForkOfToolRun:
                 fork.close()
 
     def test_fork_at_unknown_checkpoint_is_rejected_ac_19(self, memory_saver: RelateSaver) -> None:
-        run_tool_agent(memory_saver, "m4-fork-invalid", fail=True)
+        run_tool_agent(memory_saver, "fork-invalid", fail=True)
         with pytest.raises(CheckpointNotFoundError):
-            memory_saver.fork_in_memory("m4-fork-invalid", "no-such-checkpoint")
+            memory_saver.fork_in_memory("fork-invalid", "no-such-checkpoint")
 
 
 class TestBenchmarkScript:
