@@ -4,8 +4,10 @@ Embedded graph-native checkpointing, thread-affinity serialization, and time-tra
 
 Reference documents: [specification](SPEC.md), [decisions](DECISIONS.md), [overview](README.md).
 
-Date: 2026-11-17  
+Date: 2026-11-18  
 Status: FROZEN
+
+Change note (2026-11-18): inspection commands open the store read-only ([ADR-0015](DECISIONS.md#adr-0015-read-only-opening-for-inspection-commands)). Amended sections: [`RelateSaver` Interface](#1-relatesaver-interface) (new [Read-only mode](#read-only-mode)), [`fork_in_memory` contract](#fork_in_memory-contract) guarantees, [`RelateThreadProxy` Actor Protocol](#2-relatethreadproxy-actor-protocol), [CLI Command Interface](#4-cli-command-interface-relate-dag), [Expensive to change](#expensive-to-change).
 
 ---
 
@@ -273,6 +275,7 @@ class RelateSaver(BaseCheckpointSaver[str]):
         proxy: RelateThreadProxy | None = None,
         serde: RelateStateSerializer | SerializerProtocol | None = None,
         connection_factory: Any | None = None,
+        read_only: bool = False,   # see Read-only mode (ADR-0015)
     ) -> None: ...
 
     # --- synchronous (unchanged signatures) ---
@@ -326,6 +329,19 @@ class RelateSaver(BaseCheckpointSaver[str]):
 - No messages in the values means no statements, no `:ToolCall` nodes and no `[:INVOKED]` edges (AC-46).
 - Observable result: a save whose values contain only calls and outcomes this saver has already committed makes exactly one proxy submission (the checkpoint or write transaction). The graph after any sequence of saves is the same as with the earlier send-everything behavior, except for the cases under [Applied tool call record](#applied-tool-call-record).
 
+#### Read-only mode
+
+`RelateSaver(path, read_only=True)` opens a file store for inspection and leaves it byte-identical, with no sidecar files ([ADR-0015](DECISIONS.md#adr-0015-read-only-opening-for-inspection-commands)). The default `read_only=False` is unchanged.
+
+- **Opening:** the saver builds its proxy with `RelateThreadProxy(path, read_only=True)`, which connects with `relate.connect(database=path, read_only=True)`, creates no directories, and runs no schema setup. `wal_enabled` is ignored.
+- **Reads that work:** `get_tuple`, `list`, `aget_tuple`, `alist`, `detect_loops`, `trace_root_cause`, `fork_in_memory`, and `DAGVisualizer` / `RelateForensics` built on the saver.
+- **Writes that fail:** `put`, `put_writes`, `aput`, `aput_writes` raise `RelateReadOnlyError` (subclass of `RelateCheckpointError`, exported from the package) before serializing anything or contacting the proxy. The async forms raise it from the `await`.
+- **Flush and close:** `flush()` does nothing; `close()` closes the connection without flushing.
+- **Construction errors:** `ValueError` for `read_only=True` with `":memory:"`, and for `read_only=True` with a passed proxy whose `read_only` is false. With a passed proxy, `saver.read_only` equals `proxy.read_only`. A missing file raises `RelateConnectionError` and is not created.
+- **Connection factory:** a custom `connection_factory` is still called as `factory(db_path)`; it must open its driver read-only itself. Writes are refused by the saver and proxy either way, but the byte-identical guarantee covers only the default driver.
+- **Schema:** no constraint or index is created or upgraded. Inspection queries are plain `MATCH` reads and work on stores that lack them (scanning instead of using an index). A store without `:ToolCall` nodes reports no tool calls.
+- **Snapshot:** the store is loaded once at open; data saved afterwards by another process is visible only after reopening.
+
 #### `fork_in_memory` contract
 
 `fork_in_memory(thread_id, checkpoint_id, *, branch_thread_id=None)` delegates to `TimeTravelEngine.fork_in_memory` in `time_travel.py` ([ADR-0004](DECISIONS.md#adr-0004-in-memory-graph-cloning-for-zero-side-effect-time-travel-sandboxing), amended by [ADR-0010](DECISIONS.md#adr-0010-in-memory-forks-copy-tool-call-data)).
@@ -352,12 +368,12 @@ One row per edge. A `RelateCheckpointError` from this read propagates to the cal
 **Guarantees.**
 - For a fork taken at a checkpoint whose channel values already contain the failing tool's result message (for example the thread's latest checkpoint), `trace_root_cause(thread_id)` on the fork returns the same `error_checkpoint_id`, `error_message`, `root_tool_call_id` and `root_tool_name` as on the source.
 - For a fork taken before that result, the call is present with no `result_blob` and no `error`; resuming the graph in the fork with the tool succeeding records `result_blob` on that node, and `error` stays absent.
-- The source is only read. Its file is not written, and its node and relationship counts are unchanged. The test compares the sha256 of the source `.rl` file before and after the fork; if relate-db proves to modify the main file on read-only access, the test compares node and relationship counts instead and says why in a comment.
+- The source is only read, through `execute_read`; every statement, including the optional branch `[:FORKED_TO]` edge, goes to the fork's own `:memory:` saver. A writable source saver still rewrites part of its file on open and close, so a caller who needs the source file unchanged opens it with `read_only=True` ([Read-only mode](#read-only-mode)); the fork works the same on either. The fork itself is always writable and never inherits `read_only`. The test opens the source read-only and compares the sha256 of the source `.rl` file before and after the fork and close.
 - The population batch goes straight to the fork's proxy, not through `put()`, so the fork's `AppliedToolCalls` record starts empty. The first `put()` in a replay rescans and resends what it sees; `MERGE`, the per-thread edge condition and the first-outcome-wins guard make that a no-op for data already copied.
 
 ### 2. `RelateThreadProxy` Actor Protocol
 
-Embedded databases require strict thread affinity for file writing. The `RelateThreadProxy` encapsulates all direct database driver calls inside an isolated worker actor thread. Tool call capture and the async methods only add callers; the one interface change is the `flush` keyword on `execute_batch` ([ADR-0014](DECISIONS.md#adr-0014-tool-call-capture-commits-without-its-own-flush)).
+Embedded databases require strict thread affinity for file writing. The `RelateThreadProxy` encapsulates all direct database driver calls inside an isolated worker actor thread. Tool call capture and the async methods only add callers; the interface changes are the `flush` keyword on `execute_batch` ([ADR-0014](DECISIONS.md#adr-0014-tool-call-capture-commits-without-its-own-flush)) and the `read_only` constructor keyword ([ADR-0015](DECISIONS.md#adr-0015-read-only-opening-for-inspection-commands)).
 
 ```python
 import concurrent.futures
@@ -372,7 +388,11 @@ class DbCommand:
     future: concurrent.futures.Future[Any]
 
 class RelateThreadProxy:
-    def __init__(self, db_path: str, wal_enabled: bool = True) -> None: ...
+    def __init__(self, db_path: str = ":memory:", wal_enabled: bool = True,
+                 connection_factory: Callable[..., Any] | None = None,
+                 auto_init_schema: bool = True, default_timeout: float | None = 30.0,
+                 *, read_only: bool = False) -> None: ...
+    read_only: bool   # set from the constructor, never changed
     def execute_write(self, cypher: str, params: dict[str, Any]) -> Any: ...
     def execute_read(self, cypher: str, params: dict[str, Any]) -> Any: ...
     def execute_batch(self, statements: list[tuple[str, dict[str, Any]]], timeout: float | None = None,
@@ -384,6 +404,12 @@ class RelateThreadProxy:
 Callers on any thread (LangGraph worker threads, `asyncio.to_thread` workers) block on the command future; the proxy's single worker thread is the only thread that touches the driver.
 
 **`flush` keyword ([ADR-0014](DECISIONS.md#adr-0014-tool-call-capture-commits-without-its-own-flush)).** `BatchCommand` gains `flush: bool = True`, and `_handle_batch_command` calls `conn.flush()` after the commit only when `self.wal_enabled and cmd.flush`. With `flush=False` the batch still commits (or rolls back) as one transaction before the future resolves; only the per-write flush is skipped. The default keeps every existing caller flushing: `execute_write`, `put()`, `put_writes()`, `transaction()`, the dict `transaction` message and the fork population batch do not pass the keyword. Only `RelateSaver._capture_tool_calls` passes `flush=False`. `close()` flushes explicitly: on shutdown the worker calls `conn.flush()` (when `wal_enabled` and the connection has `flush`) before `conn.close()`; a flush error is logged at WARNING and the connection is still closed. `abort()` does not flush. With `wal_enabled=False` the keyword changes nothing.
+
+**`read_only` keyword ([ADR-0015](DECISIONS.md#adr-0015-read-only-opening-for-inspection-commands)).** With `read_only=True`, still on the single worker thread:
+- `_open_connection` skips `os.makedirs` and calls `relate.connect(database=db_path, read_only=True)`; a custom `connection_factory` is called unchanged as `factory(db_path)`. `":memory:"` with `read_only=True` raises `ValueError` in the constructor.
+- `_worker_loop` skips `initialize_schema` regardless of `auto_init_schema`.
+- No flush ever runs: not in the command handlers, not in `flush()` (which returns immediately), and not in `_cleanup_connection`, which only closes the connection.
+- `execute_write`, `execute`, `execute_batch` and `transaction` raise `RelateReadOnlyError` in the caller's thread before queuing. The worker fails any write-flagged item that still arrives (`DbCommand` with `is_write=True`, `BatchCommand`, the 4-tuple form, dict `execute` with `is_write` true, dict `transaction`) with `RelateReadOnlyError` without touching the driver. `execute_read` is unchanged.
 
 ### 3. Forensic Data Models
 
@@ -425,6 +451,8 @@ The CLI provides an interactive terminal interface for workflow exploration:
   Traverses backward causal paths to print root-cause analysis for failed threads. The report panel gains a `Root Tool Name:` line (shows `None` when unknown) next to `Root Tool Call ID:`.
 
 `relate-dag --help` must work in a fresh environment with only the declared dependencies installed (AC-33).
+
+**Read-only store access ([ADR-0015](DECISIONS.md#adr-0015-read-only-opening-for-inspection-commands)).** `tree`, `forensics` (the combined summary), `forensics loops`, `forensics trace-error` and the source side of `replay` open the store with `RelateSaver(db, read_only=True)`. They pass that saver to `DAGVisualizer`, `RelateForensics` or `TimeTravelEngine.fork_in_memory` and close it in a `finally` or `with` block. The `DAGVisualizer` and `RelateForensics` constructors are unchanged; given a saver, they do not own or close it. The existing "Database file not found" check runs before opening, so a missing path still exits 1 with that message and is not created. `RelateReadOnlyError` is a `RelateCheckpointError`, so it is reported by the existing "Database error" handler. When `--db` is `:memory:`, the commands keep a writable saver, because an empty in-memory store has nothing to protect. After any of these commands, a closed file store is byte-identical and has no sidecar files.
 
 ### 5. In-Memory Fakes for Testing
 
@@ -796,3 +824,6 @@ None. All graph storage is managed in-process via single-file `.rl` databases or
 9. **What an in-memory fork contains:**
    - *Components:* the copied set of `fork_in_memory()`: lineage checkpoints, their writes, and the tool calls they invoked, with the edges between them and only the outcomes already visible at the fork point ([ADR-0010](DECISIONS.md#adr-0010-in-memory-forks-copy-tool-call-data)).
    - *Why expensive:* Users run forensics and `relate-dag replay` on forks and expect the same answer as on the original run. Dropping a node type from the copy, narrowing which tool calls are included, or changing which outcomes are kept silently changes those answers without any error.
+10. **Read-only inspection leaves the store byte-identical:**
+    - *Components:* the `read_only` keyword on `RelateSaver` and `RelateThreadProxy`, `RelateReadOnlyError`, the rule that every `relate-dag` inspection command opens the store read-only, and the `relate-db>=1.0.2` floor ([ADR-0015](DECISIONS.md#adr-0015-read-only-opening-for-inspection-commands)).
+    - *Why expensive:* The committed demo store and anyone inspecting a shared or archived `.rl` file rely on inspection never changing it. Adding a write, a schema setup step or a flush to any inspection path, or opening one command writable again, makes every clone show a modified file with no error. `read_only` and `RelateReadOnlyError` are public API.

@@ -276,6 +276,16 @@ AC-78: Given `README.md`, When it is read, Then it contains a "Where the data li
 AC-79: Given `README.md`, When its explore-the-committed-store commands are run in order from a fresh clone after installation, without running any agent first, Then `relate-dag tree`, `relate-dag forensics trace-error` and `relate-dag replay` each exit with code 0 against `examples/data/demo.rl`.
 AC-80: Given the `relate-dag replay` command shown in `README.md`, When its checkpoint id is compared with the output of `relate-dag tree` for the same thread on the committed store, Then that id appears in the tree output.
 
+#### Read-only inspection
+These criteria cover opening a store read-only for inspection ([ADR-0015](DECISIONS.md#adr-0015-read-only-opening-for-inspection-commands)).
+AC-81: Given a closed file store, When `RelateSaver(path, read_only=True)` is opened and closed with no queries, Then the file's sha256 is unchanged and no sidecar file exists beside it.
+AC-82: Given a read-only saver on a file store, When `put`, `put_writes`, `aput` or `aput_writes` is called, Then `RelateReadOnlyError` is raised and the file's sha256 is unchanged after close.
+AC-83: Given a file store with checkpoints and tool calls, When `get_tuple`, `list`, `detect_loops`, `trace_root_cause` and `fork_in_memory` run on a read-only saver, Then the results equal those from a writable saver on a copy of the same store.
+AC-84: Given a closed file store, When `relate-dag tree`, `relate-dag forensics`, `relate-dag forensics loops`, `relate-dag forensics trace-error` or `relate-dag replay` runs against it, Then the exit code is the same as against a writable copy of the store, and the file's sha256 and the directory listing are unchanged.
+AC-85: Given a path that does not exist, When `RelateSaver(path, read_only=True)` is constructed, Then `RelateConnectionError` is raised and no file or directory is created.
+AC-86: Given `read_only=True` with `":memory:"` or with a passed writable proxy, When the saver is constructed, Then `ValueError` is raised.
+AC-87: Given `RelateSaver(path)` without `read_only`, When a graph runs and the saver is closed and reopened, Then schema setup, saves and flush-on-close behave as before and the saved checkpoints are readable after reopening.
+
 ---
 
 ## 4. Non-Goals
@@ -332,7 +342,7 @@ AC-80: Given the `relate-dag replay` command shown in `README.md`, When its chec
 
 9. **Judge-run fixes: Read-only use of the committed store:**
    - *Question:* Opening a single-file Relate store may create WAL or lock sidecars or touch the file; does that dirty the clone?
-   - *Assumption:* The CLI's read paths leave the tracked file unmodified and remove sidecars on close (AC-75). If Relate cannot guarantee this, the README tells evaluators to copy the store before exploring it, and AC-75 is revisited.
+   - *Assumption:* Inspection commands open the store read-only ([ADR-0015](DECISIONS.md#adr-0015-read-only-opening-for-inspection-commands)); verified byte-identical with no sidecars (AC-75, AC-81, AC-84).
 
 10. **Judge-run fixes: Replay id in the README:**
     - *Question:* Checkpoint ids change when the store is regenerated; how does the README stay correct?

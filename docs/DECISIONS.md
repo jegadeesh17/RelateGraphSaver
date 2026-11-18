@@ -26,6 +26,7 @@ Reference documents:
 | [ADR-0012](#adr-0012-fair-ancestry-query-and-exact-file-cleanup-in-the-benchmark) | Fair Ancestry Query and Exact File Cleanup in the Benchmark | Accepted | 2026-11-17 |
 | [ADR-0013](#adr-0013-clean-install-test-skips-only-when-the-package-index-is-unreachable) | Clean-Install Test Skips Only When the Package Index Is Unreachable | Accepted | 2026-11-17 |
 | [ADR-0014](#adr-0014-tool-call-capture-commits-without-its-own-flush) | Tool Call Capture Commits Without Its Own Flush | Accepted | 2026-11-17 |
+| [ADR-0015](#adr-0015-read-only-opening-for-inspection-commands) | Read-Only Opening for Inspection Commands | Accepted | 2026-11-18 |
 
 ---
 
@@ -64,7 +65,7 @@ The engine writes graph data into a single `.rl` file on disk with Write-Ahead L
 
 Date: 2026-11-12  
 Status: Accepted  
-Amended by: [ADR-0014](#adr-0014-tool-call-capture-commits-without-its-own-flush)
+Amended by: [ADR-0014](#adr-0014-tool-call-capture-commits-without-its-own-flush), [ADR-0015](#adr-0015-read-only-opening-for-inspection-commands)
 
 ### Context
 
@@ -129,7 +130,7 @@ We decided to adopt a hybrid graph-blob data schema:
 
 Date: 2026-11-12  
 Status: Accepted  
-Amended by: [ADR-0010](#adr-0010-in-memory-forks-copy-tool-call-data)
+Amended by: [ADR-0010](#adr-0010-in-memory-forks-copy-tool-call-data), [ADR-0015](#adr-0015-read-only-opening-for-inspection-commands)
 
 ### Context
 
@@ -485,3 +486,51 @@ This amends [ADR-0002](#adr-0002-dedicated-actor-proxy-for-thread-affinity-and-s
 - **Negative:** After the last save of a run, its tool call data is not flushed until `close()` or another write. A program that never closes the saver relies on the operating system to write it out, which held for a process kill in our tests but is unverified for power loss.
 - **Negative:** Save time still grows with file size, because the checkpoint's own flush remains; this decision removes one flush, not the underlying cost.
 - **Negative:** Another process reading the file between the capture commit and the next flush depends on relate-db making committed but unflushed data visible; we have not verified that.
+
+---
+
+## ADR-0015: Read-Only Opening for Inspection Commands
+
+Date: 2026-11-18  
+Status: Accepted
+
+### Context
+
+The repository commits a demo store, `examples/data/demo.rl`, so people can explore it with `relate-dag` right after cloning (AC-69 to AC-75). Every `relate-dag` command opened the file the same way a running agent does: a writable connection, the schema setup statements (`CREATE CONSTRAINT ... IF NOT EXISTS`, `CREATE INDEX ... IF NOT EXISTS`), and a flush on close. We measured that opening and closing a saver on a file without running any query rewrites about 8 KB of it (byte offsets 16 to 110591); the size stays the same and no sidecar files remain. So every inspection command left the committed store modified in `git status`, and AC-75 failed. It also means the claim in [ADR-0004](#adr-0004-in-memory-graph-cloning-for-zero-side-effect-time-travel-sandboxing) that the source file stays bitwise untouched did not hold for `relate-dag replay`, because the command opened the source writable before forking.
+
+relate-db offers `relate.connect(path, read_only=True)`, which loads the store once and refuses writes and checkpoints. We checked it on relate-db 1.0.2: a `MATCH` query works, a `CREATE` raises `OperationalError`, the file's sha256 is unchanged after close, no sidecar files appear, and a missing store is not created.
+
+The inspection code only reads. The tree view, loop detection, root-cause tracing and the fork all go through `RelateThreadProxy.execute_read`; the fork writes only into its own new `:memory:` saver, including the optional `[:FORKED_TO]` branch edge. No inspection path writes to the source today, so a read-only open needs no change to their queries.
+
+### Decision
+
+This amends [ADR-0002](#adr-0002-dedicated-actor-proxy-for-thread-affinity-and-single-writer-concurrency) (the proxy gains a read-only mode) and [ADR-0004](#adr-0004-in-memory-graph-cloning-for-zero-side-effect-time-travel-sandboxing) (the replay source is opened read-only, so its untouched-source consequence now holds). Neither decision is reversed.
+
+1. **Public interface.** `RelateSaver` and `RelateThreadProxy` each gain a keyword-only argument `read_only: bool = False`. The default keeps today's writable behavior for every library user. A new exception, `RelateReadOnlyError`, subclass of `RelateCheckpointError`, is exported from the package.
+2. **Opening.** A read-only proxy opens the file with `relate.connect(database=path, read_only=True)` on its single worker thread, as before. It does not create parent directories, and it never runs schema setup, whatever `auto_init_schema` says. `wal_enabled` has no effect in read-only mode.
+3. **Never flushing.** A read-only proxy never flushes: not after a statement, not on `flush()` (which returns without doing anything), and not on `close()`, which only closes the connection.
+4. **Refusing writes, loudly.** On a read-only proxy, `execute_write`, `execute`, `execute_batch` and `transaction` raise `RelateReadOnlyError` in the caller's thread before anything is queued. Write-flagged items that reach the queue another way (the dict and tuple message forms) are failed with the same error and never reach the driver. The driver's own refusal stays as a last line of defense. On a read-only saver, `put()` and `put_writes()` raise `RelateReadOnlyError` before serializing anything, and `aput()` and `aput_writes()` raise the same error from the `await`. Nothing is dropped silently. `get_tuple`, `list`, `aget_tuple`, `alist`, `detect_loops`, `trace_root_cause` and `fork_in_memory` work as before. `RelateSaver.flush()` does nothing, and `close()` closes without flushing.
+5. **Invalid combinations fail at construction with `ValueError`.** These are `read_only=True` with `":memory:"` (an empty in-memory store has nothing to inspect) and `read_only=True` with a passed proxy that is writable. A saver built on a passed proxy takes its read-only state from that proxy. When a `connection_factory` is given, it is still called as `factory(db_path)` and must open the store read-only itself. The proxy and saver still refuse writes, but the byte-identical guarantee covers only the default driver.
+6. **Stores without the current schema.** A read-only open neither adds nor upgrades constraints or indexes. All inspection queries are plain `MATCH` reads, which work without them; the engine scans instead of using an index. A store written before `:ToolCall` nodes existed returns no tool calls, so forensics reports no tool failure, as it would after a writable open. To add the current schema, open the store writable once (any `RelateSaver(path)`). A missing file raises `RelateConnectionError` from the constructor and is not created. The CLI keeps its existing "Database file not found" check before opening.
+7. **Forks.** `fork_in_memory` keeps reading the source through `execute_read` only, so it works unchanged on a read-only source. The fork is always a writable `:memory:` saver and never inherits `read_only`.
+8. **CLI.** `relate-dag tree`, `relate-dag forensics` (the combined summary), `forensics loops`, `forensics trace-error` and the source side of `relate-dag replay` construct `RelateSaver(db, read_only=True)`. They pass that saver to `DAGVisualizer`, `RelateForensics` and `TimeTravelEngine`, whose constructors are unchanged, and close it themselves. When `--db` is `:memory:`, they keep a writable saver, because an empty in-memory store has nothing to protect. No `relate-dag` command writes to the store.
+9. **Dependency floor.** The declared requirement becomes `relate-db>=1.0.2`, the version on which we verified `read_only`.
+10. **How we check it.** For each CLI command above, a test builds a closed file store, records its sha256 and the directory listing, runs the command, and requires both to be unchanged. Saver and proxy tests require each refused method to raise `RelateReadOnlyError` and the file hash to be unchanged afterwards. A fork test opens the source read-only and compares the source file's sha256 from before the open to after the close, so the open and the close are covered too, not only the fork.
+
+### Alternatives considered
+
+1. **A separate read-only reader class:** Rejected. `DAGVisualizer`, `RelateForensics` and the fork all take a `RelateSaver`. A second type would need either a shared protocol across three modules or a copy of the read queries, which is a larger change for the same guarantee.
+2. **Copy the store to a temporary file and open the copy:** Rejected for the same reasons as in ADR-0004: input/output proportional to file size, and temporary files left behind if the process is killed.
+3. **Keep the writable open but skip schema setup and the close flush:** Rejected. A writable open and close changes bytes even with no queries, and we could not show which step writes. Only the engine's read-only mode is verified to leave the file identical.
+4. **Open read-only by default whenever the file already exists:** Rejected. It would break every program that reopens an existing store to continue a run.
+5. **Tell evaluators to copy the store before exploring it:** Rejected by the project owner. The committed store should stay clean without extra steps.
+
+### Consequences
+
+- **Positive:** Inspection commands leave the store byte-identical with no sidecar files, so a committed store stays unmodified, and `relate-dag replay` now meets ADR-0004's untouched-source claim.
+- **Positive:** The library default is unchanged. The change is one keyword, one exception type and a higher dependency floor.
+- **Positive:** Writing through a read-only saver fails with a typed error instead of being lost or reaching the file.
+- **Negative:** A read-only saver sees the store as it was when opened ("load once"). Runs saved later by another process appear only after reopening, and how a read-only open behaves while another process holds the file open for writing is not verified.
+- **Negative:** Per relate-db's description, the read-only open loads the store once at open time. We have not measured the time or memory this takes on large stores.
+- **Negative:** Inspection never adds missing indexes, so queries against an old store scan instead of using an index until the store is opened writable once.
+- **Negative:** A custom `connection_factory` gets no read-only signal through its call. Callers who inject a driver must open it read-only themselves to keep the file unchanged.
