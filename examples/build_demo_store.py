@@ -18,7 +18,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import glob
 import os
+import shutil
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -36,6 +38,7 @@ TOOL_FAIL_THREAD = "demo-tool-fail"
 TOOL_OK_THREAD = "demo-tool-ok"
 RESEARCH_THREAD = "demo-research"
 DEMO_THREADS = (TOOL_FAIL_THREAD, TOOL_OK_THREAD, RESEARCH_THREAD)
+STORE_SUFFIX = ".rl"
 
 
 def _remove_if_exists(path: Path) -> None:
@@ -46,18 +49,45 @@ def _remove_if_exists(path: Path) -> None:
         pass
 
 
+def _cleanup_staging(staging: Path) -> None:
+    """Remove the staging file and any sidecar named after it, without ever raising.
+
+    This runs in a ``finally`` block, so an exception here would replace the build error that is
+    already propagating. A removal that fails is reported on stderr instead.
+    """
+    try:
+        leftovers = list(staging.parent.glob(glob.escape(staging.name) + "*"))
+    except OSError as exc:
+        print(f"[WARN] Could not look for leftover files of {staging}: {exc}", file=sys.stderr)
+        return
+    for leftover in leftovers:
+        try:
+            if leftover.is_dir():
+                shutil.rmtree(leftover)
+            else:
+                _remove_if_exists(leftover)
+        except OSError as exc:
+            print(f"[WARN] Could not remove leftover {leftover}: {exc}", file=sys.stderr)
+
+
 def build_demo_store(out_path: Path | str = DEFAULT_OUT_PATH) -> Path:
     """Build the three-thread demo store at ``out_path``, replacing any existing file.
 
     Args:
-        out_path: Destination of the single-file store. Parent directories are created.
+        out_path: Destination of the single-file store; it must end in ``.rl``. Parent
+            directories are created.
 
     Returns:
         The destination path, holding a closed store with no sidecar files beside it.
+
+    Raises:
+        ValueError: If ``out_path`` is empty or does not end in ``.rl``. Nothing is created.
     """
     destination = Path(out_path)
     if not str(out_path).strip():
         raise ValueError("out_path must be a non-empty path")
+    if destination.suffix != STORE_SUFFIX:
+        raise ValueError(f'out_path "{out_path}" must end in "{STORE_SUFFIX}"')
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     # Relate picks single-file mode from the ``.rl`` suffix, so the staging name must keep it.
@@ -79,8 +109,7 @@ def build_demo_store(out_path: Path | str = DEFAULT_OUT_PATH) -> Path:
         os.replace(staging, destination)
     finally:
         # Anything still named like the staging file (failed build) must not be left behind.
-        for leftover in staging.parent.glob(staging.name + "*"):
-            _remove_if_exists(leftover)
+        _cleanup_staging(staging)
     return destination
 
 

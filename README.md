@@ -216,6 +216,8 @@ Rebuild it, offline and without an API key, with:
 python examples/build_demo_store.py
 ```
 
+A rebuild writes new checkpoint ids, so the replay checkpoint id and the sample output shown in [Explore the demo store](#explore-the-demo-store) will change. After a rebuild, take the id from the output of the `tree` command.
+
 The demo agents write to `checkpoints.rl` (`examples/research_agent.py`) or `tool_agent.rl` (`examples/tool_agent.py`) unless you pass `--db`; those files are not committed. Only `examples/data/demo.rl` is.
 
 ## Benchmark

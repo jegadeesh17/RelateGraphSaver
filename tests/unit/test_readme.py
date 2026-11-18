@@ -121,6 +121,18 @@ def test_where_the_data_lives_names_store_and_threads_ac_78() -> None:
     assert DEMO_STORE.is_file(), "the committed demo store is missing"
 
 
+def test_rebuild_warning_follows_the_rebuild_command_ac_78() -> None:
+    """AC-78: beside the rebuild command, the README says a rebuild changes ids and sample output."""
+    section = _section("Where the data lives")
+    command_at = section.index("python examples/build_demo_store.py")
+    after = " ".join(section[command_at:].split())
+    assert "new checkpoint ids" in after
+    assert "replay checkpoint id" in after and "sample output" in after
+    assert "output of the `tree` command" in after
+    # The warning sits before the next paragraph about the other demo agents' files.
+    assert after.index("new checkpoint ids") < after.index("checkpoints.rl")
+
+
 def _readme_demo_commands() -> list[list[str]]:
     """Return the `relate-dag` commands the README runs against the committed store."""
     text = README_PATH.read_text(encoding="utf-8")

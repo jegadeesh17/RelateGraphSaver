@@ -199,6 +199,53 @@ def test_ac73_main_rejects_empty_output_path(capsys: pytest.CaptureFixture[str])
     assert "out_path" in capsys.readouterr().err
 
 
+def test_ac73_non_rl_output_is_rejected_and_nothing_is_created(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """AC-73 (invalid input): a --out without the .rl suffix exits 1 and creates nothing."""
+    target_dir = tmp_path / "new_parent"
+    for name in ("demo", "demo.db", "demo.rl.bak"):
+        out = target_dir / name
+        assert main(["--out", str(out)]) == 1
+        err = capsys.readouterr().err
+        assert str(out) in err and ".rl" in err
+        assert len(err.strip().splitlines()) == 1
+    assert not target_dir.exists()
+    assert _listing(tmp_path) == []
+    with pytest.raises(ValueError, match=r'must end in "\.rl"'):
+        build_demo_store(tmp_path / "demo.db")
+    assert _listing(tmp_path) == []
+
+
+def test_ac73_failed_build_cleanup_never_masks_the_original_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC-73: a cleanup that fails is reported, and the build error still propagates."""
+    out = tmp_path / "we[ird].rl"
+    leftover = tmp_path / "we[ird].building.rl-extra"
+    attempted: list[str] = []
+
+    def failing_build(*_args: object, **_kwargs: object) -> None:
+        # Guarantee a leftover (on a name containing a glob character) for the cleanup to find.
+        leftover.write_bytes(b"x")
+        raise RuntimeError("scripted failure")
+
+    def failing_remove(path: Path) -> None:
+        # Only the cleanup of the leftover fails; the pre-build removal of a stale file is a no-op.
+        if path == leftover:
+            attempted.append(path.name)
+            raise PermissionError("scripted cleanup failure")
+
+    monkeypatch.setattr("examples.build_demo_store.run_research_workflow", failing_build)
+    monkeypatch.setattr("examples.build_demo_store._remove_if_exists", failing_remove)
+    with pytest.raises(RuntimeError, match="scripted failure"):
+        build_demo_store(out)
+    assert leftover.name in attempted
+    assert "Could not remove leftover" in capsys.readouterr().err
+
+
 def test_ac69_committed_store_holds_the_three_threads() -> None:
     """AC-69/AC-72: the committed store contains exactly the three demo threads."""
     counts = _checkpoint_counts(COMMITTED_STORE)
