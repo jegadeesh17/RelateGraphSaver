@@ -314,11 +314,92 @@ class RootCauseReport:
             )
 
 
+@dataclass(frozen=True)
+class ToolCallRecord:
+    """One tool call found in a run's messages (AC-104, AC-105).
+
+    ``call_id`` and ``detail`` are excluded from comparison because provider call ids are
+    random per run and result text is not diffed.
+    """
+
+    tool_name: str
+    ordinal: int
+    args: Any
+    status: str
+    call_id: str = field(compare=False)
+    detail: str | None = field(compare=False)
+
+
+@dataclass(frozen=True)
+class RunSnapshot:
+    """The comparable content of one checkpoint of a run (AC-104)."""
+
+    thread_id: str
+    checkpoint_id: str
+    step: int
+    messages: tuple[Any, ...]
+    channels: dict[str, Any]
+    tool_calls: tuple[ToolCallRecord, ...]
+
+
+@dataclass(frozen=True)
+class ChannelChange:
+    """A difference in one channel, or in one message (``messages[<index>]``)."""
+
+    channel: str
+    kind: str
+    before: str | None
+    after: str | None
+
+
+@dataclass(frozen=True)
+class ToolCallChange:
+    """A difference in one tool call matched by tool name and ordinal."""
+
+    tool_name: str
+    ordinal: int
+    kind: str
+    before: ToolCallRecord | None
+    after: ToolCallRecord | None
+
+
+@dataclass(frozen=True)
+class RunDiff:
+    """Differences between a recorded run and its replay; holds no checkpoint ids."""
+
+    tool_calls: tuple[ToolCallChange, ...]
+    messages: tuple[ChannelChange, ...]
+    channels: tuple[ChannelChange, ...]
+
+    @property
+    def is_empty(self) -> bool:
+        """True when the replay matches the recording in every compared respect."""
+        return not (self.tool_calls or self.messages or self.channels)
+
+
+@dataclass(frozen=True)
+class ReplayResult:
+    """Outcome of replaying a thread from a checkpoint in an in-memory sandbox (AC-98)."""
+
+    fork_checkpoint_id: str
+    updated_checkpoint_id: str
+    final_checkpoint_id: str
+    interrupted: bool
+    diff: RunDiff
+    recorded_checkpoint_id: str
+
+
 __all__ = [
+    "ChannelChange",
     "CheckpointNode",
     "LoopReport",
+    "ReplayResult",
     "RootCauseReport",
+    "RunDiff",
+    "RunSnapshot",
     "ThreadNode",
+    "ToolCallChange",
     "ToolCallNode",
+    "ToolCallRecord",
     "WriteNode",
 ]

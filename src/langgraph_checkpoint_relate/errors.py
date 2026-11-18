@@ -36,6 +36,13 @@ class RelateReadOnlyError(RelateCheckpointError):
     """Raised when a write is attempted through a read-only saver or proxy."""
 
 
+class GraphSpecError(ValueError):
+    """Raised when a graph spec cannot be loaded or does not yield a usable graph.
+
+    The message always contains the offending spec.
+    """
+
+
 # Specification parity aliases
 CheckpointSerializationError = RelateSerializationError
 CheckpointNotFoundError = RelateCheckpointNotFoundError
@@ -43,6 +50,7 @@ CheckpointNotFoundError = RelateCheckpointNotFoundError
 __all__ = [
     "CheckpointNotFoundError",
     "CheckpointSerializationError",
+    "GraphSpecError",
     "RelateCheckpointError",
     "RelateCheckpointNotFoundError",
     "RelateConcurrencyError",
