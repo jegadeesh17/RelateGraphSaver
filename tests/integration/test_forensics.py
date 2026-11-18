@@ -401,6 +401,50 @@ class TestRelateForensics:
             report.diagnostic_summary
         )
 
+    def _record_failed_tool_call(self, db_path: str, thread_id: str, error_text: str) -> None:
+        """Persist one failed tool call (AI request plus error ToolMessage) for a thread."""
+        with RelateSaver(db_path=db_path, wal_enabled=True) as saver:
+            cfg: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+            cp: Any = dict(empty_checkpoint())
+            cp["id"] = "cp-suffix-001"
+            saved_cfg = saver.put(cfg, cp, {"step": 1, "source": "loop", "parents": {}}, {})
+            ai = AIMessage(
+                content="",
+                tool_calls=[{"id": "call-sfx-1", "name": "fetch_source", "args": {}}],
+            )
+            saver.put_writes(saved_cfg, [("messages", [ai])], task_id="task-ai")
+            tool_msg = ToolMessage(content=error_text, tool_call_id="call-sfx-1", status="error")
+            saver.put_writes(saved_cfg, [("messages", [tool_msg])], task_id="task-tool")
+
+    def test_trace_root_cause_drops_trailing_langgraph_suffix_ac_65(
+        self, temp_disk_db: str
+    ) -> None:
+        """AC-65: the displayed error loses the trailing suffix; the stored error is unchanged."""
+        stored = "Error: ValueError('boom')\n Please fix your mistakes."
+        self._record_failed_tool_call(temp_disk_db, "thread-sfx-trim", stored)
+
+        with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
+            report = saver.trace_root_cause("thread-sfx-trim")
+            rows = saver.proxy.execute_read(
+                "MATCH (tc:ToolCall {call_id: 'call-sfx-1'}) RETURN tc.error AS error", {}
+            )
+
+        assert report.error_message == "Error: ValueError('boom')"
+        assert "Please fix your mistakes" not in report.diagnostic_summary
+        assert rows[0]["error"] == stored
+
+    def test_trace_root_cause_keeps_error_without_trailing_suffix_ac_66(
+        self, temp_disk_db: str
+    ) -> None:
+        """AC-66: an error that only contains the phrase mid-text is displayed exactly."""
+        stored = "Please fix your mistakes. The upstream API rejected the request"
+        self._record_failed_tool_call(temp_disk_db, "thread-sfx-keep", stored)
+
+        with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
+            report = saver.trace_root_cause("thread-sfx-keep")
+
+        assert report.error_message == stored
+
     def test_trace_root_cause_long_next_chain_is_fast_ac_27(self, temp_disk_db: str) -> None:
         """AC-27: root cause on a 300-checkpoint NEXT chain finds the first antecedent quickly."""
         thread_id = "thread-long-chain-001"

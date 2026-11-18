@@ -7,12 +7,18 @@ and boundary error handling (AC-24, AC-32).
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
+import sys
 import tempfile
 from collections.abc import Generator
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.base import empty_checkpoint
 from typer.testing import CliRunner
 
 from langgraph_checkpoint_relate.cli import app
@@ -151,6 +157,30 @@ def seeded_loop_db() -> Generator[tuple[str, str]]:
         os.rmdir(temp_dir)
     except OSError:
         pass
+
+
+@pytest.fixture
+def seeded_tool_error_db(tmp_path: Path) -> tuple[str, str]:
+    """Fixture providing a database whose thread holds one failed tool call."""
+    db_file = str(tmp_path / "cli_tool_error.rl")
+    thread_id = "tool-fail-thread"
+    with RelateSaver(db_path=db_file) as saver:
+        cfg: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+        cp: Any = dict(empty_checkpoint())
+        cp["id"] = "1f1e314c-8a21-6b3e-8000-000000000001"
+        saved_cfg = saver.put(cfg, cp, {"step": 1, "source": "loop", "parents": {}}, {})
+        ai = AIMessage(
+            content="",
+            tool_calls=[{"id": "call-fetch-1", "name": "fetch_source", "args": {}}],
+        )
+        saver.put_writes(saved_cfg, [("messages", [ai])], task_id="task-ai")
+        tool_msg = ToolMessage(
+            content="Error: ConnectionError('down')\n Please fix your mistakes.",
+            tool_call_id="call-fetch-1",
+            status="error",
+        )
+        saver.put_writes(saved_cfg, [("messages", [tool_msg])], task_id="task-tool")
+    return db_file, thread_id
 
 
 @pytest.fixture
@@ -567,3 +597,147 @@ class TestCliForensicsCommand:
         result_diag = runner.invoke(app, ["forensics", "   ", "--db", db_file])
         assert result_diag.exit_code == 1
         assert "thread_id must be a non-empty string" in result_diag.output
+
+
+class TestCliForensicsToolName:
+    """The combined forensics summary names the failing tool (AC-67, AC-68)."""
+
+    def test_forensics_summary_shows_root_tool_name_ac_67(
+        self, runner: CliRunner, seeded_tool_error_db: tuple[str, str]
+    ) -> None:
+        """AC-67: the combined summary shows tool_name alongside call_id."""
+        db_file, thread_id = seeded_tool_error_db
+        result = runner.invoke(app, ["forensics", thread_id, "--db", db_file])
+        assert result.exit_code == 0
+        assert "Root Tool Call ID:" in result.output
+        assert "call-fetch-1" in result.output
+        assert "Root Tool Name:" in result.output
+        assert "fetch_source" in result.output
+
+    def test_forensics_summary_without_failure_has_no_root_tool_ac_68(
+        self, runner: CliRunner, seeded_db: tuple[str, str, list[str]]
+    ) -> None:
+        """AC-68: a thread with no failing tool call shows no root tool name or call id."""
+        db_file, thread_id, _ = seeded_db
+        result = runner.invoke(app, ["forensics", thread_id, "--db", db_file])
+        assert result.exit_code == 0
+        assert "Root Tool" not in result.output
+        assert "Status:            OK" in result.output
+
+
+def _console_script() -> str | None:
+    """Return the relate-dag console script installed next to the running interpreter."""
+    scripts_dir = str(Path(sys.executable).parent)
+    return shutil.which("relate-dag", path=scripts_dir) or shutil.which("relate-dag")
+
+
+def _run_cli_cp1252(args: list[str]) -> subprocess.CompletedProcess[bytes]:
+    """Run relate-dag in a subprocess whose stdout and stderr are cp1252 pipes.
+
+    Uses the installed console script, which calls the Typer app directly; falls back to
+    ``python -m`` only when the script is not installed.
+    """
+    env = {**os.environ, "PYTHONIOENCODING": "cp1252", "COLUMNS": "200"}
+    env.pop("PYTHONUTF8", None)
+    script = _console_script()
+    command = (
+        [script, *args]
+        if script
+        else [sys.executable, "-m", "langgraph_checkpoint_relate.cli", *args]
+    )
+    return subprocess.run(command, capture_output=True, env=env, timeout=120, check=False)
+
+
+class TestCliCp1252Output:
+    """Every relate-dag command prints only text a cp1252 stdout can encode (AC-59..AC-61)."""
+
+    def test_all_commands_exit_zero_on_cp1252_stdout_ac_59_ac_60(
+        self,
+        seeded_db: tuple[str, str, list[str]],
+        seeded_loop_db: tuple[str, str],
+        seeded_tool_error_db: tuple[str, str],
+    ) -> None:
+        """AC-59, AC-60: each command exits 0 with its expected text on a cp1252 pipe."""
+        clean_db, clean_thread, clean_ids = seeded_db
+        loop_db, loop_thread = seeded_loop_db
+        tool_db, tool_thread = seeded_tool_error_db
+
+        cases: list[tuple[list[str], str]] = [
+            (["--help"], "RelateGraphSaver CLI"),
+            (["tree", clean_thread, "--db", clean_db], clean_thread),
+            (["tree", clean_thread, "--db", clean_db], clean_ids[0]),
+            (["replay", clean_thread, clean_ids[1], "--db", clean_db], clean_ids[1]),
+            (["forensics", clean_thread, "--db", clean_db], "Total Checkpoints: 3"),
+            (["forensics", tool_thread, "--db", tool_db], "fetch_source"),
+            (["forensics", "loops", loop_thread, "--db", loop_db], "Detected Loops"),
+            (["forensics", "loops", clean_thread, "--db", clean_db], "No loops"),
+            (["forensics", "trace-error", tool_thread, "--db", tool_db], "fetch_source"),
+            (["forensics", "trace-error", clean_thread, "--db", clean_db], "No error detected"),
+        ]
+        for args, expected in cases:
+            proc = _run_cli_cp1252(args)
+            stdout = proc.stdout.decode("cp1252")
+            stderr = proc.stderr.decode("cp1252")
+            assert proc.returncode == 0, f"{args}: {stderr}"
+            assert "UnicodeEncodeError" not in stderr, args
+            assert expected in stdout, f"{args}: {stdout}"
+
+    def test_no_finding_messages_are_ascii_ac_60(
+        self,
+        seeded_db: tuple[str, str, list[str]],
+    ) -> None:
+        """AC-60: the no-finding messages use ASCII only."""
+        db_file, thread_id, _ = seeded_db
+        for args in (
+            ["forensics", "trace-error", thread_id, "--db", db_file],
+            ["forensics", "loops", thread_id, "--db", db_file],
+        ):
+            proc = _run_cli_cp1252(args)
+            assert proc.returncode == 0, proc.stderr.decode("cp1252")
+            assert proc.stdout.decode("cp1252").isascii(), args
+
+    def test_cp1252_suite_uses_installed_console_script_ac_59(self) -> None:
+        """AC-59: the subprocess checks exercise the console script, not only ``python -m``."""
+        script = _console_script()
+        assert script is not None, "relate-dag console script is not installed in this venv"
+        assert Path(script).resolve().parent == Path(sys.executable).resolve().parent
+
+    def test_stored_non_cp1252_text_does_not_crash_tree_ac_59(self, tmp_path: Path) -> None:
+        """AC-59: a stored node name outside cp1252 is replaced, not raised, on output."""
+        db_file = str(tmp_path / "emoji.rl")
+        thread_id = "emoji-thread"
+        with RelateSaver(db_path=db_file) as saver:
+            cfg: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+            cp: Any = dict(empty_checkpoint())
+            cp["id"] = "1f1e314c-8a21-6b3e-8000-000000000001"
+            saver.put(cfg, cp, {"step": 1, "source": "loop", "node": "\U0001f916 worker"}, {})  # type: ignore[typeddict-unknown-key]
+
+        proc = _run_cli_cp1252(["tree", thread_id, "--db", db_file])
+        stderr = proc.stderr.decode("cp1252")
+        assert proc.returncode == 0, stderr
+        assert "UnicodeEncodeError" not in stderr
+        stdout = proc.stdout.decode("cp1252")
+        assert thread_id in stdout
+        assert "worker" in stdout
+
+    def test_cli_source_is_ascii_ac_61(self) -> None:
+        """AC-61: the CLI module contains only ASCII characters."""
+        import langgraph_checkpoint_relate.cli as cli_module
+
+        source = Path(cli_module.__file__).read_text(encoding="utf-8")
+        assert source.isascii()
+
+    def test_replay_accepts_full_id_copied_from_tree_ac_64(
+        self,
+        runner: CliRunner,
+        seeded_db: tuple[str, str, list[str]],
+    ) -> None:
+        """AC-64: an id shown by tree is accepted by replay on the same store."""
+        db_file, thread_id, checkpoint_ids = seeded_db
+        tree_result = runner.invoke(app, ["tree", thread_id, "--db", db_file])
+        assert tree_result.exit_code == 0
+        for cid in checkpoint_ids:
+            assert cid in tree_result.output
+            replay_result = runner.invoke(app, ["replay", thread_id, cid, "--db", db_file])
+            assert replay_result.exit_code == 0
+            assert cid in replay_result.output

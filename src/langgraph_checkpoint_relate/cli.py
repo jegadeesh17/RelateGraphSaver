@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from typing import Any
 
 import typer
@@ -35,6 +36,29 @@ app = typer.Typer(
 
 console = Console()
 err_console = Console(stderr=True)
+
+
+def _make_output_streams_lossy() -> None:
+    """Replace unencodable characters instead of raising on stdout and stderr (AC-59).
+
+    Stored data (node names, messages) can hold characters the terminal encoding lacks;
+    the stream keeps its encoding and only its error handler changes.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(errors="replace")
+        except (ValueError, OSError):
+            logger.debug("Could not reconfigure %r to replace unencodable characters", stream)
+
+
+@app.callback()
+def _configure_output() -> None:
+    # No docstring: Typer would use it as the root help text instead of ``help=`` above.
+    # Runs before every command, including when the installed script calls ``app`` directly.
+    _make_output_streams_lossy()
 
 
 @app.command(name="tree", help="Visualize execution DAG for a thread.")
@@ -246,7 +270,7 @@ def forensics_loops(
                 console.print(table)
             else:
                 console.print(
-                    f"[green]✓[/green] No loops or repeating cycles detected in thread '{thread_id}' (threshold: {threshold})."
+                    f"[green]OK[/green] No loops or repeating cycles detected in thread '{thread_id}' (threshold: {threshold})."
                 )
     except typer.Exit:
         raise
@@ -289,7 +313,7 @@ def forensics_trace_error(
             report = forensics_engine.trace_root_cause(thread_id)
             if report.error_message == "No error detected" and not report.error_checkpoint_id:
                 console.print(
-                    f"[green]✓[/green] No error detected in execution thread '{thread_id}'. Workflow completed cleanly."
+                    f"[green]OK[/green] No error detected in execution thread '{thread_id}'. Workflow completed cleanly."
                 )
             else:
                 panel_content = (
@@ -403,6 +427,7 @@ def forensics_diagnose(
                     f"[bold cyan]Error Checkpoint ID:[/bold cyan] {root_cause.error_checkpoint_id}\n"
                     f"[bold red]Error Message:[/bold red]       {root_cause.error_message}\n"
                     f"[bold yellow]Root Tool Call ID:[/bold yellow]   {root_cause.root_tool_call_id or 'None'}\n"
+                    f"[bold yellow]Root Tool Name:[/bold yellow]      {root_cause.root_tool_name or 'None'}\n"
                     f"[bold yellow]Root Channel Write:[/bold yellow]  {root_cause.root_channel_write or 'None'}\n"
                     f"[bold green]Causal Path Length:[/bold green]  {root_cause.causal_path_length}\n"
                     f"[bold white]Diagnostic Summary:[/bold white]  {root_cause.diagnostic_summary}"

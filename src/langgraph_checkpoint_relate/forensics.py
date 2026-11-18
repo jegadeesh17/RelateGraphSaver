@@ -16,6 +16,9 @@ from langgraph_checkpoint_relate.saver import RelateSaver, _extract_bytes
 
 logger = logging.getLogger(__name__)
 
+# Suffix LangGraph's ToolNode appends to tool error messages; hidden from reports (AC-65).
+_LANGGRAPH_ERROR_SUFFIX = " Please fix your mistakes."
+
 
 def _is_primitive(pattern: Sequence[Any]) -> bool:
     """Return True if sequence pattern cannot be divided into smaller repeating sub-units."""
@@ -429,6 +432,9 @@ class RelateForensics:
                     )
             except Exception:
                 pass
+
+        if error_message.endswith(_LANGGRAPH_ERROR_SUFFIX):
+            error_message = error_message.removesuffix(_LANGGRAPH_ERROR_SUFFIX).rstrip()
 
         if not error_message:
             error_message = f"Execution error at checkpoint {error_checkpoint_id}"
