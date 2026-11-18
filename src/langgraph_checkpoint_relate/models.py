@@ -336,6 +336,21 @@ class ArgumentOrigin:
 
 
 @dataclass(frozen=True)
+class ToolFailureSummary:
+    """Failures of one tool across every thread in a store (AC-123).
+
+    ``threads`` holds the sorted ids of threads where the tool failed and
+    ``origin_nodes`` the sorted distinct nodes that first wrote a failed call's argument.
+    """
+
+    tool_name: str
+    failures: int
+    total_calls: int
+    threads: tuple[str, ...]
+    origin_nodes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class ToolCallRecord:
     """One tool call found in a run's messages (AC-104, AC-105).
 
@@ -423,5 +438,6 @@ __all__ = [
     "ToolCallChange",
     "ToolCallNode",
     "ToolCallRecord",
+    "ToolFailureSummary",
     "WriteNode",
 ]

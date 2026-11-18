@@ -1269,3 +1269,77 @@ def test_trace_error_demo_tool_fail_still_names_the_tool_rc_05(runner: CliRunner
     assert result.exit_code == 0
     assert "fetch_source" in result.output
     assert re.search(r"call_[0-9a-f]{32}", result.output)
+
+
+def test_failures_prints_table_for_failing_tools_ac_123(runner: CliRunner, tmp_path: Path) -> None:
+    """AC-123: the table lists each failing tool with its counts, threads and origin nodes."""
+    db_file = str(tmp_path / "failures.rl")
+    _run_origin_graph(db_file, "origin-fail", "pkg-alpha-9000")
+
+    result = runner.invoke(app, ["forensics", "failures", "--db", db_file])
+
+    assert result.exit_code == 0
+    for column in ("Tool", "Failures", "Calls", "Threads", "Origin nodes"):
+        assert column in result.output
+    row = next(line for line in result.output.splitlines() if "fetch_package" in line)
+    assert [cell.strip() for cell in row.strip("|").split("|")] == [
+        "fetch_package",
+        "1",
+        "1",
+        "origin-fail",
+        "planner",
+    ]
+
+
+def test_failures_on_demo_store_lists_fetch_source_ac_124(runner: CliRunner) -> None:
+    """AC-124: the committed demo store shows a fetch_source row."""
+    result = runner.invoke(app, ["forensics", "failures", "--db", str(DEMO_STORE)])
+
+    assert result.exit_code == 0
+    assert "fetch_source" in result.output
+
+
+def test_failures_leaves_demo_store_unchanged_ac_124(runner: CliRunner) -> None:
+    """ADR-0015: inspecting the committed store with failures does not modify it."""
+    before = DEMO_STORE.read_bytes()
+
+    runner.invoke(app, ["forensics", "failures", "--db", str(DEMO_STORE)])
+
+    assert DEMO_STORE.read_bytes() == before
+
+
+def test_failures_without_failing_calls_prints_message_ac_125(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """AC-125: a store with no failing tool call prints the message and exits 0."""
+    db_file = str(tmp_path / "no_failures.rl")
+    _run_origin_graph(db_file, "origin-ok", "pkg-ok")
+
+    result = runner.invoke(app, ["forensics", "failures", "--db", db_file])
+
+    assert result.exit_code == 0
+    assert "No failing tool calls found." in result.output
+
+
+def test_failures_missing_database_fails_without_creating_it_ac_125(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """The missing-file check runs before opening, so the path is not created."""
+    missing = tmp_path / "missing.rl"
+
+    result = runner.invoke(app, ["forensics", "failures", "--db", str(missing)])
+
+    assert result.exit_code == 1
+    assert "Database file not found" in result.output
+    assert not missing.exists()
+
+
+def test_failures_is_not_read_as_a_thread_id_rc_04(runner: CliRunner, tmp_path: Path) -> None:
+    """RC-04: 'forensics failures' routes to its own command, not the thread diagnostics."""
+    db_file = str(tmp_path / "no_failures.rl")
+    _run_origin_graph(db_file, "origin-ok", "pkg-ok")
+
+    result = runner.invoke(app, ["forensics", "failures", "--db", db_file])
+
+    assert "Thread 'failures'" not in result.output
+    assert "not found" not in result.output

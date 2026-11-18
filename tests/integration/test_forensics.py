@@ -645,3 +645,86 @@ class TestArgumentProvenance:
         assert report.origin_node is None
         assert report.origin_step is None
         assert report.origin_hops is None
+
+
+@tool
+def parse_manifest(url: str) -> str:
+    """Parse a manifest; always fails."""
+    raise RuntimeError(f"cannot parse manifest at {url}")
+
+
+@tool
+def alpha_check(url: str) -> str:
+    """Check a package; always fails."""
+    raise RuntimeError(f"check failed for {url}")
+
+
+@tool
+def echo_value(url: str) -> str:
+    """Echo the url; never fails."""
+    return f"echo {url}"
+
+
+SUMMARY_TOOLS = [fetch_package, parse_manifest, alpha_check, echo_value]
+
+
+def _run_summary_thread(
+    saver: RelateSaver, thread_id: str, call_id: str, tool_name: str, target: str
+) -> None:
+    """Run planner -> agent -> tools where the agent calls ``tool_name`` with the planned target."""
+
+    def planner(state: ProvenanceState) -> dict[str, Any]:
+        return {"target": target}
+
+    def agent(state: ProvenanceState) -> dict[str, Any]:
+        call = {"id": call_id, "name": tool_name, "args": {"url": state["target"]}}
+        return {"messages": [AIMessage(content="", tool_calls=[call])]}
+
+    builder = StateGraph(ProvenanceState)
+    builder.add_node("planner", planner)
+    builder.add_node("agent", agent)
+    builder.add_node("tools", ToolNode(SUMMARY_TOOLS, handle_tool_errors=True))
+    builder.add_edge(START, "planner")
+    builder.add_edge("planner", "agent")
+    builder.add_edge("agent", "tools")
+    builder.add_edge("tools", END)
+    builder.compile(checkpointer=saver).invoke(
+        {"messages": [HumanMessage(content="please look it up")], "target": ""},
+        {"configurable": {"thread_id": thread_id}},
+    )
+
+
+class TestFailureSummary:
+    """Tool failures summarized across every thread of a store (AC-123)."""
+
+    def test_summary_counts_threads_origins_and_order_ac_123(self) -> None:
+        """AC-123: one entry per failing tool, ordered by failures then name, ok tools omitted."""
+        with RelateSaver(":memory:") as saver:
+            _run_summary_thread(saver, "t-a", "call-a", "fetch_package", "pkg-alpha-9000")
+            _run_summary_thread(saver, "t-b", "call-b", "fetch_package", "pkg-beta-9000")
+            _run_summary_thread(saver, "t-c", "call-c", "fetch_package", "pkg-ok")
+            _run_summary_thread(saver, "t-d", "call-d", "parse_manifest", "manifest-url-1")
+            _run_summary_thread(saver, "t-e", "call-e", "alpha_check", "check-target-1")
+            _run_summary_thread(saver, "t-f", "call-f", "echo_value", "echo-target-1")
+
+            with RelateForensics(saver) as forensics:
+                summary = forensics.failure_summary()
+
+        assert [s.tool_name for s in summary] == ["fetch_package", "alpha_check", "parse_manifest"]
+        fetch, alpha, manifest = summary
+        assert (fetch.failures, fetch.total_calls) == (2, 3)
+        assert fetch.threads == ("t-a", "t-b")
+        assert fetch.origin_nodes == ("planner",)
+        assert (alpha.failures, alpha.total_calls, alpha.threads) == (1, 1, ("t-e",))
+        assert alpha.origin_nodes == ("planner",)
+        assert (manifest.failures, manifest.total_calls, manifest.threads) == (1, 1, ("t-d",))
+        assert manifest.origin_nodes == ("planner",)
+
+    def test_summary_is_empty_without_failures_ac_123(self) -> None:
+        """AC-123: a store whose tool calls all succeed, and an empty store, give no entries."""
+        with RelateSaver(":memory:") as saver:
+            with RelateForensics(saver) as forensics:
+                assert forensics.failure_summary() == []
+            _run_summary_thread(saver, "t-ok", "call-ok", "echo_value", "echo-target-1")
+            with RelateForensics(saver) as forensics:
+                assert forensics.failure_summary() == []

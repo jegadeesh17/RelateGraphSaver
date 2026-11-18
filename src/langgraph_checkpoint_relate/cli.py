@@ -605,6 +605,55 @@ forensics_app.command(
 
 
 @forensics_app.command(
+    name="failures",
+    help="Summarize failing tool calls across every thread in the store.",
+)
+def forensics_failures(
+    db: str = typer.Option(
+        "checkpoints.rl",
+        "--db",
+        "-d",
+        "--file",
+        "-f",
+        help="Path to the Relate graph database file.",
+    ),
+) -> None:
+    """Print one row per tool that failed, with counts, threads and origin nodes (AC-123..AC-125)."""
+    if db != ":memory:" and not os.path.exists(db):
+        raise _fail(f"Database file not found: {db}")
+
+    try:
+        with _open_inspection_saver(db) as saver, RelateForensics(saver) as forensics_engine:
+            summaries = forensics_engine.failure_summary()
+    except typer.Exit:
+        raise
+    except RelateCheckpointError as exc:
+        raise _fail(f"Database error: {exc}") from exc
+    except Exception as exc:
+        raise _fail(f"Unexpected error: {exc}") from exc
+
+    if not summaries:
+        console.print("No failing tool calls found.")
+        return
+
+    table = Table(title="Tool failures", box=box.ASCII)
+    table.add_column("Tool", style="cyan", no_wrap=True)
+    table.add_column("Failures", justify="right", style="magenta", no_wrap=True)
+    table.add_column("Calls", justify="right", no_wrap=True)
+    table.add_column("Threads", overflow="fold")
+    table.add_column("Origin nodes", overflow="fold")
+    for summary in summaries:
+        table.add_row(
+            escape(summary.tool_name),
+            str(summary.failures),
+            str(summary.total_calls),
+            escape(", ".join(summary.threads)),
+            escape(", ".join(summary.origin_nodes) or "-"),
+        )
+    _print_wide(table)
+
+
+@forensics_app.command(
     name="diagnose",
     hidden=True,
     help="Default forensic diagnostics combining loop detection and root-cause analysis.",

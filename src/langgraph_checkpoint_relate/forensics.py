@@ -13,7 +13,12 @@ from typing import Any
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 
 from langgraph_checkpoint_relate.errors import CheckpointNotFoundError
-from langgraph_checkpoint_relate.models import ArgumentOrigin, LoopReport, RootCauseReport
+from langgraph_checkpoint_relate.models import (
+    ArgumentOrigin,
+    LoopReport,
+    RootCauseReport,
+    ToolFailureSummary,
+)
 from langgraph_checkpoint_relate.saver import RelateSaver, _extract_bytes
 
 logger = logging.getLogger(__name__)
@@ -476,13 +481,73 @@ class RelateForensics:
             "MATCH (tc:ToolCall {call_id: $call_id}) RETURN tc.args_blob AS args_blob",
             {"call_id": tool_call_id},
         )
-        if not rows or not rows[0].get("args_blob"):
+        if not rows:
             return None
-        args = self._loads_blob(rows[0]["args_blob"], f"arguments of call '{tool_call_id}'")
+        return self._trace_call_args_origin(
+            thread_id, error_checkpoint_id, tool_call_id, rows[0].get("args_blob")
+        )
+
+    def _trace_call_args_origin(
+        self, thread_id: str, error_checkpoint_id: str, tool_call_id: str, args_blob: Any
+    ) -> ArgumentOrigin | None:
+        """Trace stored arguments from the checkpoint where the tool's result was written."""
+        if not args_blob:
+            return None
+        args = self._loads_blob(args_blob, f"arguments of call '{tool_call_id}'")
         if not isinstance(args, dict):
             return None
         start = self._failure_checkpoint_id(thread_id, error_checkpoint_id, tool_call_id)
         return self.trace_argument_origin(thread_id, start, args)
+
+    def failure_summary(self) -> list[ToolFailureSummary]:
+        """Summarize failing tool calls across every thread in the store (AC-123).
+
+        Counts distinct ``(thread_id, call_id)`` pairs per tool and traces each failed call's
+        argument origin as ``trace_root_cause`` does. Runs one trace per failed call, so it
+        suits demo-sized stores. Tools that never failed are omitted; the result is ordered
+        by failures descending, then tool name.
+        """
+        rows = self._saver.proxy.execute_read(
+            "MATCH (c:Checkpoint)-[:INVOKED]->(tc:ToolCall) "
+            "RETURN c.thread_id AS thread_id, c.checkpoint_id AS checkpoint_id, "
+            "       tc.call_id AS call_id, tc.tool_name AS tool_name, "
+            "       tc.error AS error, tc.args_blob AS args_blob"
+        )
+        # One entry per (thread, call); the earliest invoking checkpoint is the error checkpoint.
+        calls: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in sorted(rows, key=lambda r: str(r.get("checkpoint_id") or "")):
+            thread_id = str(row.get("thread_id") or "")
+            call_id = str(row.get("call_id") or "")
+            calls.setdefault((thread_id, call_id), row)
+
+        totals: dict[str, int] = {}
+        failed_threads: dict[str, set[str]] = {}
+        failures: dict[str, int] = {}
+        origin_nodes: dict[str, set[str]] = {}
+        for (thread_id, call_id), row in sorted(calls.items()):
+            tool_name = str(row.get("tool_name") or "<unknown>")
+            totals[tool_name] = totals.get(tool_name, 0) + 1
+            if not row.get("error"):
+                continue
+            failures[tool_name] = failures.get(tool_name, 0) + 1
+            failed_threads.setdefault(tool_name, set()).add(thread_id)
+            origin = self._trace_call_args_origin(
+                thread_id, str(row["checkpoint_id"]), call_id, row.get("args_blob")
+            )
+            if origin is not None:
+                origin_nodes.setdefault(tool_name, set()).add(origin.node)
+
+        summaries = [
+            ToolFailureSummary(
+                tool_name=name,
+                failures=count,
+                total_calls=totals[name],
+                threads=tuple(sorted(failed_threads[name])),
+                origin_nodes=tuple(sorted(origin_nodes.get(name, ()))),
+            )
+            for name, count in failures.items()
+        ]
+        return sorted(summaries, key=lambda s: (-s.failures, s.tool_name))
 
     def trace_root_cause(self, thread_id: str) -> RootCauseReport:
         """Trace causal antecedent edges from an error checkpoint to offending write or tool call.
