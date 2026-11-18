@@ -324,8 +324,12 @@ class DAGVisualizer:
         self,
         info: dict[str, Any],
         writes: list[dict[str, Any]],
+        has_successor: bool,
     ) -> tuple[str, str]:
         """Determine checkpoint status tag and rich markup.
+
+        The first matching rule wins: error, interrupt, a completed step (it has a
+        [:NEXT] child), stored writes on a leaf, else OK (ADR-0016).
 
         Returns:
             Tuple of (plain_tag, rich_markup_tag).
@@ -351,11 +355,15 @@ class DAGVisualizer:
         ):
             return "[INTERRUPT]", "[bold magenta][INTERRUPT][/bold magenta]"
 
-        # 3. Pending status (pending writes exist)
+        # 3. A checkpoint with a [:NEXT] child already ran to completion
+        if has_successor:
+            return "[OK]", "[bold green][OK][/bold green]"
+
+        # 4. Pending status (a leaf with stored writes)
         if writes or metadata.get("status") == "pending" or metadata.get("pending") is True:
             return "[PENDING]", "[bold yellow][PENDING][/bold yellow]"
 
-        # 4. OK status
+        # 5. OK status
         return "[OK]", "[bold green][OK][/bold green]"
 
     def _format_checkpoint_label(
@@ -401,30 +409,32 @@ class DAGVisualizer:
 
         info = parsed_checkpoints[cid]
         writes = writes_by_cid.get(cid, [])
-        _, status_markup = self._determine_status(info, writes)
+        children = list(children_map.get(cid, []))
+        has_successor = any(rel == "NEXT" for _, rel in children)
+        _, status_markup = self._determine_status(info, writes, has_successor)
         label = self._format_checkpoint_label(info, status_markup)
 
         current_node = tree_node.add(label)
 
-        # Annotate pending writes
+        # Annotate writes: on a leaf they are still pending, under a completed step they are not
+        write_label = "write:" if has_successor else "pending write:"
         for w in writes:
             channel = escape(str(w.get("channel", "")))
             task_id = escape(str(w.get("task_id", "")))
             if channel == "__error__":
                 current_node.add(
-                    f"[bold red]pending write:[/bold red] channel='{channel}', task_id='{task_id}'"
+                    f"[bold red]{write_label}[/bold red] channel='{channel}', task_id='{task_id}'"
                 )
             elif channel == "__interrupt__":
                 current_node.add(
-                    f"[bold magenta]pending write:[/bold magenta] channel='{channel}', task_id='{task_id}'"
+                    f"[bold magenta]{write_label}[/bold magenta] channel='{channel}', task_id='{task_id}'"
                 )
             else:
                 current_node.add(
-                    f"[yellow]pending write:[/yellow] channel='{channel}', task_id='{task_id}'"
+                    f"[yellow]{write_label}[/yellow] channel='{channel}', task_id='{task_id}'"
                 )
 
         # Recurse for children
-        children = list(children_map.get(cid, []))
         children.sort(
             key=lambda item: (
                 1 if item[1] == "FORKED_TO" else 0,

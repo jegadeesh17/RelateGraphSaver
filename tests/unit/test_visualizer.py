@@ -376,3 +376,143 @@ class TestFullCheckpointIds:
                 console.print(root)
 
         assert f"cycle detected: {cid}" in capture.get()
+
+
+def _put_write(
+    saver: RelateSaver, thread_id: str, checkpoint_id: str, channel: str, task: str
+) -> None:
+    """Helper to store one write under a checkpoint."""
+    saver.put_writes(
+        {"configurable": {"thread_id": thread_id, "checkpoint_id": checkpoint_id}},
+        [(channel, {"value": "x"})],
+        task_id=task,
+    )
+
+
+def _line_with(output: str, checkpoint_id: str) -> str:
+    """Return the rendered checkpoint line that names checkpoint_id."""
+    return next(line for line in output.splitlines() if f"(id: {checkpoint_id})" in line)
+
+
+class TestTreeStatusRule:
+    """Status tags follow ADR-0016: a step with a successor is complete, only leaves are pending."""
+
+    def test_checkpoint_with_successor_is_ok_not_pending(self) -> None:
+        """AC-88: a checkpoint with writes and a NEXT child is [OK] and never [PENDING]."""
+        thread = "thread-status-successor"
+        with RelateSaver(db_path=":memory:") as saver:
+            _create_checkpoint(saver, thread, "cp-s-01", step=1, node="a")
+            _put_write(saver, thread, "cp-s-01", "messages", "task-s-01")
+            _create_checkpoint(
+                saver, thread, "cp-s-02", step=2, node="b", parent_checkpoint_id="cp-s-01"
+            )
+            output = DAGVisualizer(saver).render_to_string(thread)
+
+        assert "[OK]" in _line_with(output, "cp-s-01")
+        assert "[PENDING]" not in output
+
+    def test_leaf_with_writes_is_pending(self) -> None:
+        """AC-89: a leaf checkpoint with stored writes is [PENDING]."""
+        thread = "thread-status-leaf"
+        with RelateSaver(db_path=":memory:") as saver:
+            _create_checkpoint(saver, thread, "cp-l-01", step=1, node="a")
+            _create_checkpoint(
+                saver, thread, "cp-l-02", step=2, node="b", parent_checkpoint_id="cp-l-01"
+            )
+            _put_write(saver, thread, "cp-l-02", "messages", "task-l-02")
+            output = DAGVisualizer(saver).render_to_string(thread)
+
+        assert "[PENDING]" in _line_with(output, "cp-l-02")
+        assert "[PENDING]" not in _line_with(output, "cp-l-01")
+
+    def test_error_with_writes_and_successor_is_error(self) -> None:
+        """AC-90: an error checkpoint with writes and a NEXT child is [ERROR]."""
+        thread = "thread-status-error"
+        with RelateSaver(db_path=":memory:") as saver:
+            _create_checkpoint(saver, thread, "cp-e-01", step=1, node="a")
+            _put_write(saver, thread, "cp-e-01", "__error__", "task-e-01")
+            _put_write(saver, thread, "cp-e-01", "messages", "task-e-02")
+            _create_checkpoint(
+                saver, thread, "cp-e-02", step=2, node="b", parent_checkpoint_id="cp-e-01"
+            )
+            output = DAGVisualizer(saver).render_to_string(thread)
+
+        line = _line_with(output, "cp-e-01")
+        assert "[ERROR]" in line
+        assert "[OK]" not in line
+        assert "[PENDING]" not in line
+
+    def test_error_outranks_interrupt(self) -> None:
+        """AC-90: when both error and interrupt writes exist the tag is [ERROR]."""
+        thread = "thread-status-error-interrupt"
+        with RelateSaver(db_path=":memory:") as saver:
+            _create_checkpoint(saver, thread, "cp-ei-01", step=1, node="a")
+            _put_write(saver, thread, "cp-ei-01", "__interrupt__", "task-ei-01")
+            _put_write(saver, thread, "cp-ei-01", "__error__", "task-ei-02")
+            output = DAGVisualizer(saver).render_to_string(thread)
+
+        line = _line_with(output, "cp-ei-01")
+        assert "[ERROR]" in line
+        assert "[INTERRUPT]" not in line
+
+    def test_interrupt_with_writes_and_successor_is_interrupt(self) -> None:
+        """AC-91: an interrupted checkpoint with writes and a NEXT child is [INTERRUPT]."""
+        thread = "thread-status-interrupt"
+        with RelateSaver(db_path=":memory:") as saver:
+            _create_checkpoint(saver, thread, "cp-i-01", step=1, node="a")
+            _put_write(saver, thread, "cp-i-01", "__interrupt__", "task-i-01")
+            _put_write(saver, thread, "cp-i-01", "messages", "task-i-02")
+            _create_checkpoint(
+                saver, thread, "cp-i-02", step=2, node="b", parent_checkpoint_id="cp-i-01"
+            )
+            output = DAGVisualizer(saver).render_to_string(thread)
+
+        line = _line_with(output, "cp-i-01")
+        assert "[INTERRUPT]" in line
+        assert "[OK]" not in line
+        assert "[PENDING]" not in line
+
+    def test_forked_to_only_child_does_not_count_as_successor(self) -> None:
+        """AC-92: a checkpoint whose only child is a FORKED_TO branch, with writes, is [PENDING]."""
+        parent_thread = "thread-status-fork-parent"
+        child_thread = "thread-status-fork-child"
+        with RelateSaver(db_path=":memory:") as saver:
+            _create_checkpoint(saver, parent_thread, "cp-f-01", step=1, node="a")
+            _put_write(saver, parent_thread, "cp-f-01", "messages", "task-f-01")
+            _create_checkpoint(
+                saver,
+                child_thread,
+                "cp-f-02",
+                step=2,
+                node="forked",
+                parent_checkpoint_id="cp-f-01",
+            )
+            # Only the FORKED_TO edge may leave cp-f-01, so no NEXT child exists.
+            rows = saver.proxy.execute_read(
+                "MATCH (p:Checkpoint {checkpoint_id: 'cp-f-01'})-[r]->(c:Checkpoint) "
+                "RETURN type(r) AS rel, c.checkpoint_id AS child",
+                {},
+            )
+            output = DAGVisualizer(saver).render_to_string(parent_thread)
+
+        assert "NEXT" not in {str(r["rel"]) for r in rows}
+        assert "[BRANCH]" in output
+        assert "[PENDING]" in _line_with(output, "cp-f-01")
+
+    def test_write_labels_distinguish_completed_steps_from_leaves(self) -> None:
+        """AC-93: writes under a checkpoint with a NEXT child read 'write:', leaf writes 'pending write:'."""
+        thread = "thread-status-labels"
+        with RelateSaver(db_path=":memory:") as saver:
+            _create_checkpoint(saver, thread, "cp-w-01", step=1, node="a")
+            _put_write(saver, thread, "cp-w-01", "alpha", "task-w-01")
+            _create_checkpoint(
+                saver, thread, "cp-w-02", step=2, node="b", parent_checkpoint_id="cp-w-01"
+            )
+            _put_write(saver, thread, "cp-w-02", "beta", "task-w-02")
+            output = DAGVisualizer(saver).render_to_string(thread)
+
+        alpha = next(line for line in output.splitlines() if "channel='alpha'" in line)
+        beta = next(line for line in output.splitlines() if "channel='beta'" in line)
+        assert "write: channel=" in alpha
+        assert "pending write:" not in alpha
+        assert "pending write: channel=" in beta
