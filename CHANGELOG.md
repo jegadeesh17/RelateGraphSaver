@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.4
 ## [Unreleased]
 
 ### Added
+- `replay_from_checkpoint()` and `relate-dag replay --graph`: re-run a user graph from a historical checkpoint in an isolated sandbox, with `--update`, `--set-message` and `--as-node` edits, and print the tool-call and final-state diff against the recorded run (ADR-0017).
+- `trace_argument_origin()` and the `Bad argument origin` line in `relate-dag forensics trace-error`: trace a failing tool argument back to the step that first wrote it.
+- `failure_summary()` and `relate-dag forensics failures`: summarize failing tool calls across every thread in the store.
 - Tool-call capture: `RelateSaver.put()` and `put_writes()` record each tool call and its outcome as a `:ToolCall` node; `fork_in_memory()` copies tool calls only up to the fork point (ADR-0010).
 - `root_tool_name` on `RootCauseReport`, `trace_root_cause()` and the `relate-dag forensics trace-error` panel, naming the tool behind a failure.
 - Key-free tool-calling demo (`examples/tool_agent.py`) with an end-to-end forensics test.
@@ -34,10 +37,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.4
 - Integration test suite validating end-to-end checkpointing, pagination, history retrieval, and multi-threaded execution.
 
 ### Changed
+- `relate-dag forensics trace-error` and `forensics` explain what `Causal Path Length` and the origin hop count measure.
+- Replay message previews longer than 120 characters end with `...`; the marker is display-only and never affects the diff.
 - Variable-length ancestry queries start from the target checkpoint instead of scanning the whole chain.
 - Tool-call capture sends only new statements per saver (ADR-0011) and commits without its own flush; the store is flushed on close (ADR-0014).
 
 ### Fixed
+- `relate-dag tree` marks completed steps `[OK]` and reserves `PENDING` for leaves with writes.
+- `relate-dag replay` rejects `--as-node` without an edit and a repeated `--set-message` index instead of ignoring them.
 - `click` and `langchain-core` are declared as runtime dependencies, so a clean install runs the CLI.
 - `ruff check`, `ruff format --check` and `mypy src tests` pass.
 - `put()` latency no longer grows with the length of the checkpoint chain.
