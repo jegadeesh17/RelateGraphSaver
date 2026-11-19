@@ -121,10 +121,28 @@ def test_ac141_demo_llm_store_is_not_ignored_by_git() -> None:
     assert kept.returncode == 1, "examples/data/demo-llm.rl must not be ignored"
 
 
-def test_ac141_builder_never_mentions_the_llm_store() -> None:
-    """AC-141: build_demo_store.py neither reads nor writes demo-llm.rl."""
-    source = (REPO_ROOT / "examples" / "build_demo_store.py").read_text(encoding="utf-8")
-    assert "demo-llm" not in source
+def test_ac141_builder_refuses_the_llm_store_path_and_leaves_its_bytes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """AC-141: build_demo_store.py refuses ``demo-llm.rl`` as a target and changes nothing."""
+    llm_store = tmp_path / "demo-llm.rl"
+    with RelateSaver(str(llm_store)) as saver:
+        run_tool_agent(saver, "demo-llm", fail=False)
+    before = llm_store.read_bytes()
+    capsys.readouterr()
+
+    code = main(["--out", str(llm_store)])
+
+    err = capsys.readouterr().err
+    assert code == 1
+    assert err.startswith("Error: refusing to write demo-llm.rl")
+    assert llm_store.read_bytes() == before
+    assert _listing(tmp_path) == ["demo-llm.rl"]
+
+    with pytest.raises(ValueError, match="demo-llm.rl"):
+        build_demo_store(llm_store, fetch_json=FakePyPI())
+    assert llm_store.read_bytes() == before
+    assert _listing(tmp_path) == ["demo-llm.rl"]
 
 
 def test_ac73_script_builds_closed_single_file_store_with_four_threads(built_store: Path) -> None:

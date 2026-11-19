@@ -325,3 +325,76 @@ def test_main_builds_the_chat_model_from_the_key_and_writes_a_cli_readable_store
     code, output = _invoke("tree", "llm-cli", "--db", str(db))
     assert code == 0, output
     assert "[OK]" in output
+
+
+@pytest.fixture
+def recorded_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A store in tmp_path that already holds a finished run on ``LLM_THREAD``."""
+    monkeypatch.setattr(openrouter_agent, "fetch_pypi_json", FakePyPI())
+    store = tmp_path / "recorded.rl"
+    with RelateSaver(db_path=str(store)) as saver:
+        run_llm_agent(_ScriptedModel(), saver, LLM_THREAD)
+    return store
+
+
+def test_ac141_existing_thread_is_refused_before_model_import_or_network(
+    recorded_store: Path,
+) -> None:
+    """AC-141: a thread that already holds a run is refused with an ``Error:`` line.
+
+    The langchain_openai import and every network route are blocked, so a refusal that came
+    after them would exit 99. The store file must be byte-identical afterwards.
+    """
+    before = _sha256(recorded_store)
+    env = _env_without_key(**{API_KEY_ENV: "placeholder-for-test-only"})
+
+    result = _run_guarded(
+        env,
+        recorded_store.parent,
+        "--model",
+        "vendor/model",
+        "--db",
+        str(recorded_store),
+        "--thread-id",
+        LLM_THREAD,
+    )
+
+    assert result.returncode == 1, result.stderr
+    assert "FORBIDDEN" not in result.stderr
+    error_lines = [line for line in result.stderr.splitlines() if line.startswith("Error:")]
+    assert len(error_lines) == 1, result.stderr
+    assert "already holds a recorded run" in error_lines[0]
+    assert "--thread-id" in error_lines[0]
+    assert "--db" in error_lines[0]
+    assert _sha256(recorded_store) == before
+    assert [p.name for p in recorded_store.parent.iterdir()] == ["recorded.rl"]
+
+
+def test_ac141_fresh_thread_on_a_recorded_store_is_not_refused(
+    recorded_store: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC-141: a new thread id on the same store passes the guard and records its own run."""
+    monkeypatch.setenv(API_KEY_ENV, "placeholder-for-test-only")
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        def bind_tools(self, tools: Sequence[Any]) -> _ScriptedModel:
+            return _ScriptedModel().bind_tools(tools)
+
+    fake_module: Any = types.ModuleType("langchain_openai")
+    fake_module.ChatOpenAI = FakeChatOpenAI
+    monkeypatch.setitem(sys.modules, "langchain_openai", fake_module)
+    argv = ["--model", "vendor/model", "--db", str(recorded_store), "--thread-id", "second-run"]
+
+    assert main(argv) == 0
+
+    assert "Error:" not in capsys.readouterr().err
+    with RelateSaver(db_path=str(recorded_store), read_only=True) as saver:
+        rows = saver.proxy.execute_read(
+            "MATCH (c:Checkpoint) RETURN DISTINCT c.thread_id AS tid", {}
+        )
+    assert {str(r["tid"]) for r in rows} == {LLM_THREAD, "second-run"}

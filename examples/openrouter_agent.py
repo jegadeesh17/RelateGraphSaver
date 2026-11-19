@@ -157,6 +157,20 @@ def _fail(message: str) -> int:
     return 1
 
 
+def _thread_has_checkpoints(db_path: str, thread_id: str) -> bool:
+    """True when the store at ``db_path`` already holds a checkpoint for ``thread_id``.
+
+    The store is opened read-only, so it is never created or changed. A path with no file has
+    no thread.
+    """
+    if not Path(db_path).is_file():
+        return False
+    with RelateSaver(db_path=db_path, read_only=True) as saver:
+        return (
+            next(saver.list({"configurable": {"thread_id": thread_id}}, limit=1), None) is not None
+        )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI entry point: record one run and print the answer."""
     args = parse_args(argv)
@@ -172,6 +186,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     thread_id = args.thread_id.strip()
     if not thread_id:
         return _fail("--thread-id must be a non-empty string")
+
+    # A second run on the same thread would append to the recorded one, so refuse it before
+    # the model is created and any paid call can happen.
+    try:
+        already_recorded = _thread_has_checkpoints(args.db, thread_id)
+    except Exception as exc:
+        return _fail(f"could not open {args.db} to check thread {thread_id!r}: {exc}")
+    if already_recorded:
+        return _fail(
+            f"thread {thread_id!r} in {args.db} already holds a recorded run. "
+            "Pass a new --thread-id or another --db."
+        )
 
     try:
         from langchain_openai import ChatOpenAI

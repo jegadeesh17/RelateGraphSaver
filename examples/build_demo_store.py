@@ -47,6 +47,13 @@ REAL_API_THREAD = "demo-real-api"
 DEMO_THREADS = (TOOL_FAIL_THREAD, TOOL_OK_THREAD, RESEARCH_THREAD, REAL_API_THREAD)
 MISSING_PACKAGE = "relategraphsaver"
 STORE_SUFFIX = ".rl"
+# The recorded LLM run lives in its own store; this script must never replace it (AC-141).
+PROTECTED_STORE_NAME = "demo-llm.rl"
+
+
+def _is_protected(out_path: Path | str) -> bool:
+    """True when ``out_path`` names the recorded LLM store, ignoring letter case."""
+    return Path(out_path).name.casefold() == PROTECTED_STORE_NAME.casefold()
 
 
 def _remove_if_exists(path: Path) -> None:
@@ -128,7 +135,8 @@ def build_demo_store(
         The destination path, holding a closed store; the build leaves no other file beside it.
 
     Raises:
-        ValueError: If ``out_path`` is empty or does not end in ``.rl``. Nothing is created.
+        ValueError: If ``out_path`` is empty, does not end in ``.rl`` or is named
+            ``demo-llm.rl``, the recorded LLM store. Nothing is created or changed.
         PyPIUnreachableError: If the lookups do not hold the expected 404 and results. The
             existing store, if any, is left unchanged and no staging file remains.
     """
@@ -137,6 +145,11 @@ def build_demo_store(
         raise ValueError("out_path must be a non-empty path")
     if destination.suffix != STORE_SUFFIX:
         raise ValueError(f'out_path "{out_path}" must end in "{STORE_SUFFIX}"')
+    if _is_protected(destination):
+        raise ValueError(
+            f'out_path "{out_path}" is the recorded LLM store "{PROTECTED_STORE_NAME}"; '
+            "this script builds demo.rl only"
+        )
     fetcher = fetch_json if fetch_json is not None else dependency_agent.fetch_pypi_json
     destination.parent.mkdir(parents=True, exist_ok=True)
 
@@ -182,6 +195,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI entry point: build the store and report where it was written."""
     args = parse_args(argv)
+    if _is_protected(args.out):
+        print(
+            f"Error: refusing to write {PROTECTED_STORE_NAME}, the recorded LLM store; "
+            "this script builds demo.rl only. Choose another --out path.",
+            file=sys.stderr,
+        )
+        return 1
     try:
         written = build_demo_store(args.out)
     except PyPIUnreachableError as exc:
