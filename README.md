@@ -1,6 +1,8 @@
 # RelateGraphSaver
 
-Embedded graph-native checkpoint and time-travel persistence engine for LangGraph, powered by Relate by Neo4j.
+Your LangGraph agent failed at step 9. Find the tool call and the step that caused it, from one file, offline.
+
+RelateGraphSaver is a LangGraph checkpointer built on Relate by Neo4j, an embedded graph database. It keeps checkpoints, writes and tool calls as a graph in one `.rl` file, and a bundled command-line tool queries that file.
 
 ## Use case
 
@@ -23,6 +25,19 @@ It is for engineers building LangGraph agents who want durable checkpoints, a re
 - **Human-in-the-Loop Interruption:** Native persistence for LangGraph `interrupt()` checkpoints and pending writes, supporting seamless execution pauses and resumptions.
 - **Thread-Affinity Actor Concurrency:** Dedicated actor thread proxy (`RelateThreadProxy`) eliminates thread-affinity violations and database file lock collisions across concurrent worker threads.
 
+## Why not X?
+
+Other tools cover part of this. The table says what each one does and where RelateGraphSaver differs.
+
+| Alternative | What it gives you | What it does not |
+| :--- | :--- | :--- |
+| Neo4jSaver (`langchain-neo4j`) | Checkpoints and branches stored as a graph (`Thread`, `Checkpoint`, `PREVIOUS`, `Branch` nodes) | Needs a Neo4j server: it connects through a Neo4j driver, for example to `bolt://localhost:7687`. Its graph model has no tool-call or error nodes and it ships no root-cause query |
+| SqliteSaver (`langgraph-checkpoint-sqlite`) | A single-file checkpointer that is faster than RelateSaver in our benchmark (see [Benchmark](#benchmark)) | Stores checkpoints and writes in two tables, `checkpoints` and `writes`; it has no graph and no tool-call records |
+| LangGraph built-in time travel | Replay or fork from a prior checkpoint; the original history stays intact | It is a way to re-run history, not a diagnostic: it does not itself trace a failure to the step or tool call behind it |
+| Tracing tools (for example LangSmith) | Records of steps and tool calls as traces | The trace is kept apart from the checkpoint state, so it is not the state a replay forks from |
+
+RelateGraphSaver aims at the combination: no server, tool calls stored as graph nodes, a root-cause query (`relate-dag forensics trace-error`) and a sandboxed replay, all from one file. If you need speed or a multi-process server, see the limits below and the Benchmark.
+
 ## Quick start
 
 ### Prerequisites
@@ -44,56 +59,88 @@ pip install -e ".[dev]"
 
 This installs the `relate-dag` command and the example agents' dependencies. No API key, server or container is needed.
 
-Or install via `pip`:
-
-```bash
-pip install langgraph-checkpoint-relate
-```
-
 ### Explore the demo store
 
-The repository commits a populated store, `examples/data/demo.rl`, so you can see the graph before running any agent. These commands only read it:
+The repository commits a populated store, `examples/data/demo.rl`, so you can see the graph before running any agent. None of them changes the file: `tree` and `forensics` read it, and `replay` works on an in-memory copy. Run them from the repository root with the virtual environment active:
 
 ```bash
-# The multi-agent run as a tree: steps, pending writes and the human-review pause
-relate-dag tree demo-research --db examples/data/demo.rl
+# A run that called a real API (pypi.org): every step and pending write as a tree
+relate-dag tree demo-real-api --db examples/data/demo.rl
 
-# Trace the failed tool call back to its root cause
-relate-dag forensics trace-error demo-tool-fail --db examples/data/demo.rl
+# Trace the failed tool call back to the step that produced its bad argument
+relate-dag forensics trace-error demo-real-api --db examples/data/demo.rl
 
-# The same agent, succeeding: no error to trace
-relate-dag forensics trace-error demo-tool-ok --db examples/data/demo.rl
+# Which tools failed, how often, and which node first wrote the bad argument
+relate-dag forensics failures --db examples/data/demo.rl
 
-# Fork the history at the human-review pause (step 2) into an in-memory sandbox
-relate-dag replay demo-research 1f1e3dcc-a305-627f-8002-d2faef9c70e2 --db examples/data/demo.rl
+# Re-run the failed run from its first step with a corrected message, in an in-memory sandbox
+relate-dag replay demo-tool-fail 1f1e3dcc-9e79-6ab8-8000-7d30cc461d0e --graph examples/tool_agent.py:create_tool_agent_graph --set-message 0=https://example.org/report --db examples/data/demo.rl
 ```
 
-`trace-error` on `demo-tool-fail` ends in the tool that failed:
+`tree` prints one thread as a tree (excerpt; each checkpoint line carries its id and step, and the tree continues to the last step):
 
 ```text
-+-------------------- Root Cause Analysis: demo-tool-fail --------------------+
-| Error Checkpoint ID: 1f1e3dcc-9e79-6ab8-8000-7d30cc461d0e                   |
-| Error Message:       Error: RuntimeError('upstream unreachable: could not   |
-| fetch https://unreachable.invalid/report')                                  |
-| Root Tool Call ID:   call_9210ac7b64e14f49a288074a4829c677                  |
-| Root Tool Name:      fetch_source                                           |
+Thread: demo-real-api
+`-- [OK] Step -1: source: input (id: 1f1e3dcc-a6d6-6162-bfff-4124dcf80f96) - 
+    2026-11-19T05:48:05.367692+00:00
+    +-- write: channel='messages', 
+    |   task_id='ea4ddc7a-fa40-7938-a4e1-0bb9d5c4f9c6'
+    +-- write: channel='branch:to:intake', 
+    |   task_id='ea4ddc7a-fa40-7938-a4e1-0bb9d5c4f9c6'
+    `-- [OK] Step 0: source: loop (id: 1f1e3dcc-a6d9-674a-8000-f4e0be68ceae) - 
+        2026-11-19T05:48:05.401817+00:00
+        ...
+```
+
+`trace-error` on `demo-real-api` names the tool call that failed and the node that wrote its bad argument (excerpt):
+
+```text
++-------------------- Root Cause Analysis: demo-real-api ---------------------+
+| Error Checkpoint ID: 1f1e3dcc-a72b-64b5-8003-0defe1e26835                   |
+| Error Message:       Error: LookupError("PyPI returned HTTP 404: package    |
+| 'relategraphsaver' does not exist")                                         |
+| Root Tool Call ID:   call_2d0e1eb170874c5cb93ee9b8497560fe                  |
+| Root Tool Name:      lookup_pypi_package                                    |
+| Bad argument origin: name came from node planner (step 1, 2 hops before     |
+| failure)                                                                    |
 | ...                                                                         |
-| Causal Path Length:  1 (checkpoint steps from the offending write to the    |
+| Causal Path Length:  4 (checkpoint steps from the offending write to the    |
 | error checkpoint)                                                           |
 ```
 
-`replay` forks the history up to the chosen checkpoint:
+`forensics failures` summarizes every failed tool across the store:
 
 ```text
-Sandboxed replay initialized successfully.
-  Source Thread:    demo-research
-  Replay Thread:    demo-research
-  Checkpoint ID:    1f1e3dcc-a305-627f-8002-d2faef9c70e2
-  Replay Step:      2
-  Isolation:        Isolated :memory: sandbox (source database unchanged)
+                              Tool failures                               
++------------------------------------------------------------------------+
+| Tool                | Failures | Calls | Threads        | Origin nodes |
+|---------------------+----------+-------+----------------+--------------|
+| fetch_source        |        1 |     2 | demo-tool-fail | __start__    |
+| lookup_pypi_package |        1 |     8 | demo-real-api  | planner      |
++------------------------------------------------------------------------+
 ```
 
-The tree output also shows the checkpoint ids on that thread, so you can replay any other step by passing its id.
+`replay` with `--graph` and `--set-message` forks `demo-tool-fail` at its first step (the checkpoint whose state holds the human message, step 0), replaces message 0 and runs the agent again in an isolated `:memory:` sandbox. The checkpoint ids on the `Updated checkpoint` and `New final` lines are generated on every run (excerpt):
+
+```text
+Graph replay completed in an isolated sandbox.
+Replay result
+  Source Thread:        demo-tool-fail
+  Fork checkpoint:      1f1e3dcc-9e79-6ab8-8000-7d30cc461d0e
+  Updated checkpoint:   1f1e3fdc-256c-6227-8001-b13b251f990e
+  New final:            1f1e3fdc-25a3-6a30-8004-b45ac624e0b2
+  Recorded final:       1f1e3dcc-9ee7-6b2d-8003-82de96b17915
+  Stopped at interrupt: no
+  Isolation:            Isolated :memory: sandbox (source database unchanged)
+                                                    Tool calls                                                     
++-----------------------------------------------------------------------------------------------------------------+
+| Tool call       | Change  | Result      | Arguments                                                             |
+|-----------------+---------+-------------+-----------------------------------------------------------------------|
+| fetch_source #1 | changed | error -> ok | url: https://unreachable.invalid/report -> https://example.org/report |
++-----------------------------------------------------------------------------------------------------------------+
+```
+
+To find the id of a checkpoint on any thread, run `relate-dag tree <thread> --db examples/data/demo.rl`. The step -1 checkpoint holds no messages yet, so use step 0 or later with `--set-message`.
 
 ## Usage
 
@@ -205,19 +252,20 @@ RelateSaver is a single-process engine. Use one `RelateSaver` per process and pe
 
 ## Where the data lives
 
-The persistent store in this repository is `examples/data/demo.rl`, a single Relate file with three threads:
+The persistent store in this repository is `examples/data/demo.rl`, a single Relate file with four threads:
 
 - `demo-tool-fail`: a tool agent whose `fetch_source` call fails.
 - `demo-tool-ok`: the same agent, succeeding.
 - `demo-research`: a multi-agent research run (Planner, Researcher, Human Review, Critic) with a human review pause.
+- `demo-real-api`: a dependency audit (`examples/dependency_agent.py`) that makes real `pypi.org` calls. One lookup, for the package `relategraphsaver`, returns HTTP 404, and `relate-dag forensics trace-error demo-real-api` names the `planner` node as the origin of the bad argument.
 
-Rebuild it, offline and without an API key, with:
+Rebuild it with the command below. It needs no API key, but the `demo-real-api` thread calls `pypi.org`, so it needs network access (ADR-0019):
 
 ```bash
 python examples/build_demo_store.py
 ```
 
-A rebuild writes new checkpoint ids, so the replay checkpoint id and the sample output shown in [Explore the demo store](#explore-the-demo-store) will change. After a rebuild, take the id from the output of the `tree` command.
+A rebuild writes new checkpoint ids, so the replay checkpoint id and the sample output shown in [Explore the demo store](#explore-the-demo-store) will change. After a rebuild, take the step 0 id of `demo-tool-fail` from the output of the `tree` command.
 
 The demo agents write to `checkpoints.rl` (`examples/research_agent.py`) or `tool_agent.rl` (`examples/tool_agent.py`) unless you pass `--db`; those files are not committed. Only `examples/data/demo.rl` is.
 
@@ -300,8 +348,9 @@ RelateGraphSaver/
 │   └── bench_checkpointers.py  # RelateSaver vs SqliteSaver benchmark
 ├── examples/
 │   ├── data/
-│   │   └── demo.rl             # Committed demo Relate store with three threads
+│   │   └── demo.rl             # Committed demo Relate store with four threads
 │   ├── build_demo_store.py     # Rebuilds the committed demo store offline
+│   ├── dependency_agent.py     # Key-free dependency audit that calls the real PyPI API
 │   ├── research_agent.py       # Multi-agent research pipeline demo
 │   └── tool_agent.py           # Key-free tool-calling demo with a failing tool
 ├── docs/                       # Living architectural documentation
