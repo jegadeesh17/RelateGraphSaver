@@ -49,6 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.4
 - Tool-call capture sends only new statements per saver (ADR-0011) and commits without its own flush; the store is flushed on close (ADR-0014).
 
 ### Fixed
+- `trace_root_cause()` reports the same error checkpoint and origin hop count on every run for a failed tool call, whichever step the tool call is attached to (ADR-0021).
 - `mypy src tests` passes on a `dev`-only install, without the optional `llm` extra.
 - `examples/build_demo_store.py` refuses to overwrite the recorded LLM store, and `examples/openrouter_agent.py` refuses to add a second run to a thread that already holds one.
 - `relate-dag tree` marks completed steps `[OK]` and reserves `PENDING` for leaves with writes.
