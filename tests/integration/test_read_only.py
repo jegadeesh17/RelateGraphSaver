@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import hashlib
+import re
 import shutil
 import threading
 from importlib.metadata import version
@@ -347,11 +348,13 @@ class TestWritableUnchanged:
             assert len(list(ro.list(CONFIG))) == 2
 
     def test_dependency_floor_is_declared_and_installed_ac_81(self) -> None:
-        """The declared floor is relate-db>=1.0.2, the version read_only was verified on."""
+        """The declared floor is at or above 1.0.2, the version read_only was verified on."""
         pyproject = (Path(__file__).resolve().parents[2] / "pyproject.toml").read_text(
             encoding="utf-8"
         )
-        assert '"relate-db>=1.0.2"' in pyproject
+        match = re.search(r'"relate-db>=(\d+)\.(\d+)\.(\d+)', pyproject)
+        assert match is not None
+        assert tuple(int(p) for p in match.groups()) >= (1, 0, 2)
         installed = tuple(int(p) for p in version("relate-db").split(".")[:3])
         assert installed >= (1, 0, 2)
 

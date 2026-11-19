@@ -281,3 +281,121 @@ def test_llm_extra_check_rejects_runtime_declaration_ac_139() -> None:
 
     assert "langchain-openai" in _runtime_dependency_names(config)
     assert "langchain-openai" not in _llm_extra_names(config)
+
+
+_REPOSITORY_URL = "https://github.com/jegadeesh17/RelateGraphSaver"
+
+
+def _project_urls(data: dict[str, Any]) -> dict[str, str]:
+    return dict(data.get("project", {}).get("urls", {}))
+
+
+def _urls_problems(urls: dict[str, str]) -> list[str]:
+    """Return a description of every URL that does not point at the real repository."""
+    problems = [
+        f"{key}: {url!r} does not start with {_REPOSITORY_URL}"
+        for key, url in urls.items()
+        if not url.startswith(_REPOSITORY_URL)
+    ]
+    issues = urls.get("Issues")
+    if issues is None or not issues.endswith("/issues"):
+        problems.append(f"Issues: {issues!r} must end with '/issues'")
+    return problems
+
+
+def test_pyproject_urls_point_to_real_repo() -> None:
+    """AC-142: every project URL is under the real repository and Issues ends with /issues."""
+    with open(_REPO_ROOT / "pyproject.toml", "rb") as f:
+        urls = _project_urls(tomllib.load(f))
+
+    assert {"Homepage", "Repository", "Issues"} <= set(urls)
+    assert _urls_problems(urls) == []
+
+
+def test_url_check_rejects_placeholder_repository_ac_142() -> None:
+    """AC-142: the check flags a placeholder organisation and an Issues URL without /issues."""
+    urls = {
+        "Homepage": "https://github.com/relate-langgraph/langgraph-checkpoint-relate",
+        "Issues": f"{_REPOSITORY_URL}/bugs",
+    }
+
+    problems = _urls_problems(urls)
+
+    assert any(problem.startswith("Homepage") for problem in problems)
+    assert any("must end with '/issues'" in problem for problem in problems)
+    assert _urls_problems({"Homepage": _REPOSITORY_URL}) != []
+
+
+# The relate-db requirement is one of these two forms (ADR-0020). The README benchmark's
+# "relate-db" line must report a version that satisfies the requirement.
+_RELATE_DB_FLOOR = ">=1.1.0"
+_RELATE_DB_CAPPED = ">=1.0.2,<1.1"
+
+
+def _relate_db_specifier(data: dict[str, Any]) -> str:
+    """Return the version specifier of the relate-db runtime requirement, without spaces."""
+    matches = [
+        requirement
+        for requirement in data.get("project", {}).get("dependencies", [])
+        if _requirement_name(requirement) == "relate-db"
+    ]
+    assert len(matches) == 1, f"Expected exactly one relate-db requirement, found {matches}"
+    return re.sub(r"^\s*relate[-_.]db\s*", "", matches[0]).replace(" ", "")
+
+
+def _version_tuple(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in version.split("."))
+
+
+def _readme_relate_db_version(readme: str) -> str:
+    """Return the version on the README benchmark environment line '- relate-db: X.Y.Z'."""
+    match = re.search(r"^- relate-db: (\d+\.\d+\.\d+)\s*$", readme, flags=re.MULTILINE)
+    assert match is not None, "README benchmark environment has no '- relate-db: X.Y.Z' line"
+    return match.group(1)
+
+
+def _version_satisfies(version: str, specifier: str) -> bool:
+    """Check a version against the two allowed specifiers."""
+    parsed = _version_tuple(version)
+    if specifier == _RELATE_DB_FLOOR:
+        return parsed >= (1, 1, 0)
+    if specifier == _RELATE_DB_CAPPED:
+        return (1, 0, 2) <= parsed < (1, 1, 0)
+    raise AssertionError(f"relate-db requirement {specifier!r} is not an allowed form")
+
+
+def test_relate_db_requirement_matches_readme_ac_143() -> None:
+    """AC-143: the requirement is one of the two allowed forms and the README agrees with it."""
+    with open(_REPO_ROOT / "pyproject.toml", "rb") as f:
+        specifier = _relate_db_specifier(tomllib.load(f))
+    readme = (_REPO_ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert specifier in {_RELATE_DB_FLOOR, _RELATE_DB_CAPPED}
+    benchmark_version = _readme_relate_db_version(readme)
+    assert _version_satisfies(benchmark_version, specifier)
+    if specifier == _RELATE_DB_FLOOR:
+        # Numbers measured on 1.1.0 and a flush-cost statement that names 1.1.0, not 1.0.
+        assert benchmark_version == "1.1.0"
+        assert "In relate-db 1.1.0 the cost of that flush" in readme
+        assert "In relate-db 1.0 the cost" not in readme
+    else:
+        assert "In relate-db 1.0 the cost" in readme
+
+
+def test_relate_db_check_rejects_unlisted_forms_and_stale_readme_ac_143() -> None:
+    """AC-143: other specifiers and a README version outside the requirement are rejected."""
+    config: dict[str, Any] = {"project": {"dependencies": ["relate-db>=1.0.2"]}}
+
+    assert _relate_db_specifier(config) == ">=1.0.2"
+    assert _relate_db_specifier({"project": {"dependencies": ["relate_db >= 1.1.0"]}}) == (
+        _RELATE_DB_FLOOR
+    )
+    with pytest.raises(AssertionError):
+        _version_satisfies("1.1.0", ">=1.0.2")
+    assert not _version_satisfies("1.0.2", _RELATE_DB_FLOOR)
+    assert not _version_satisfies("1.1.0", _RELATE_DB_CAPPED)
+    assert _version_satisfies("1.0.2", _RELATE_DB_CAPPED)
+    with pytest.raises(AssertionError):
+        _relate_db_specifier({"project": {"dependencies": ["typer>=0.12.0"]}})
+    with pytest.raises(AssertionError):
+        _readme_relate_db_version("- relate-db: unknown\n")

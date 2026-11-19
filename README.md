@@ -236,23 +236,23 @@ These are the values that command printed, unedited. They are one run on one mac
 - OS: Windows-11-10.0.26340-SP0
 - CPU: AMD64 Family 23 Model 24 Stepping 1, AuthenticAMD
 - Python: 3.13.2
-- relate-db: 1.0.2
+- relate-db: 1.1.0
 - langgraph-checkpoint: 4.3.2
 - langgraph-checkpoint-sqlite: 3.1.3
 - SQLite: 3.45.3
 
 | Metric | RelateSaver (flush per write, default) | RelateSaver (wal_enabled=False) | SqliteSaver |
 | :--- | ---: | ---: | ---: |
-| Put throughput (checkpoints/s) | 14.5 | 309.1 | 1204.1 |
-| Get p50 (ms) | 1.208 | 1.442 | 0.036 |
-| Get p95 (ms) | 1.773 | 1.792 | 0.040 |
-| On-disk size (KiB) | 1648.0 | 11532.0 | 724.0 |
-| Ancestry query, median of 5 (ms) | 6.210 | 6.200 | 0.920 |
+| Put throughput (checkpoints/s) | 14.8 | 290.6 | 1292.8 |
+| Get p50 (ms) | 1.261 | 1.209 | 0.051 |
+| Get p95 (ms) | 1.884 | 1.856 | 0.058 |
+| On-disk size (KiB) | 1692.0 | 11540.0 | 724.0 |
+| Ancestry query, median of 5 (ms) | 6.102 | 6.214 | 0.764 |
 
 What the numbers say:
 
 - SqliteSaver is faster than RelateSaver on every speed metric here: writes, point reads (`get_tuple`) and the ancestry query. Its file is also smaller. Each saver's queries are written in the best form we know for its engine (ADR-0012): the ancestry query is anchored on the branch tip in Relate and walks parents by primary key in SQLite, and both return the same count.
-- With the default settings RelateSaver flushes after every write, which is what makes a committed checkpoint durable. In relate-db 1.0 the cost of that flush grows with the size of the database file, so save latency grows as a run gets longer. We keep it as the default because it is the safe choice (ADR-0001).
+- With the default settings RelateSaver flushes after every write, which is what makes a committed checkpoint durable. In relate-db 1.1.0 the cost of that flush still grows with the size of the database file: in a separate timing run of 1000 puts on 1.1.0, the median put took about four times longer for the last 100 checkpoints than for the first 100. Save latency therefore grows as a run gets longer. We keep it as the default because it is the safe choice (ADR-0001).
 - `wal_enabled=False` skips the per-write flush and keeps put latency flat, but its file is larger, and we have not verified that it survives power loss without the flush. It is not recommended for data you cannot lose.
 - Absolute numbers will differ on your machine. Run the command above to get your own.
 

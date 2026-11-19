@@ -31,7 +31,7 @@ Reference documents:
 | [ADR-0017](#adr-0017-replay-runs-user-graph-code-only-against-an-in-memory-sandbox) | Replay Runs User Graph Code Only Against an In-Memory Sandbox | Accepted | 2026-11-18 |
 | [ADR-0018](#adr-0018-argument-provenance-by-string-containment-earliest-write-wins) | Argument Provenance by String Containment, Earliest Write Wins | Accepted | 2026-11-18 |
 | [ADR-0019](#adr-0019-the-demo-store-holds-a-real-api-thread-and-its-build-needs-network-access) | The Demo Store Holds a Real-API Thread and Its Build Needs Network Access | Accepted | 2026-11-18 |
-| [ADR-0020](#adr-0020-relate-db-version-policy-decided-by-the-test-result) | relate-db Version Policy Decided by the Test Result | Proposed | 2026-11-18 |
+| [ADR-0020](#adr-0020-relate-db-version-policy-decided-by-the-test-result) | relate-db Version Policy Decided by the Test Result | Accepted | 2026-11-19 |
 
 ---
 
@@ -674,21 +674,23 @@ This replaces the offline-build assumption for the demo store in the specificati
 
 ## ADR-0020: relate-db Version Policy Decided by the Test Result
 
-Date: 2026-11-18  
-Status: Proposed
+Date: 2026-11-19  
+Status: Accepted
 
 ### Context
 
-The package requires `relate-db>=1.0.2`, the version on which we verified read-only opening ([ADR-0015](#adr-0015-read-only-opening-for-inspection-commands)). relate-db 1.1.0 is available. The README's benchmark numbers and the sentence that the flush cost grows with file size were measured on 1.0. Declaring a floor we have not tested, or keeping an open upper range we have not tested, can both mislead users.
+The package required `relate-db>=1.0.2`, the version on which we verified read-only opening ([ADR-0015](#adr-0015-read-only-opening-for-inspection-commands)). relate-db 1.1.0 is available. The README's benchmark numbers and the sentence that the flush cost grows with file size were measured on 1.0. Declaring a floor we have not tested, or keeping an open upper range we have not tested, can both mislead users.
 
 ### Decision
 
-Pending. We run the full test suite and `python benchmarks/bench_checkpointers.py --checkpoints 1000` in a fresh environment with relate-db 1.1.0, and the result decides:
+We ran the full test suite and `python benchmarks/bench_checkpointers.py --checkpoints 1000` in a fresh environment with relate-db 1.1.0, and the result decides:
 
 1. **If everything passes:** the requirement becomes `relate-db>=1.1.0`, the README benchmark table is replaced with numbers measured on 1.1.0, and the statement about flush cost is re-checked against them.
 2. **If anything fails:** the requirement becomes `relate-db>=1.0.2,<1.1`, and the README numbers and statements stay as they are.
 
-This ADR becomes Accepted, with the outcome recorded here, when that run is done. Either outcome keeps the README's version statements matching the requirement (AC-143).
+Outcome (2026-11-19): everything passed, so the requirement is now `relate-db>=1.1.0`. In a fresh virtual environment with relate-db 1.1.0 installed, the full suite passed (604 tests) and the benchmark ran to completion. The one suite failure, the mypy gate, came from the environment lacking the `llm` extra and passed once the extra was installed. The README benchmark block and table were replaced with the output of that run. The flush cost still grows with the size of the database file on 1.1.0: in a separate timing run of 1000 puts, the median put took about four times longer for the last 100 checkpoints (about 109 ms) than for the first 100 (about 26 ms), and 1.0.2 behaved the same (about 114 ms and 26 ms). The README statement was reworded to say this on 1.1.0.
+
+Either outcome keeps the README's version statements matching the requirement (AC-143).
 
 ### Alternatives considered
 
@@ -699,5 +701,5 @@ This ADR becomes Accepted, with the outcome recorded here, when that run is done
 ### Consequences
 
 - **Positive:** The declared range is always one we have run the suite on.
-- **Negative:** Until the run is done, the version policy is open; whoever records the result must update this ADR, the requirement and the README together.
-- **Negative:** With the upper bound, users who already need relate-db 1.1 cannot install this package until it is tested.
+- **Negative:** Users on relate-db 1.0.x can no longer install this package; the floor moved to 1.1.0 because that is the version the suite and benchmark ran on.
+- **Negative:** Future relate-db releases are not covered by this decision; whoever raises the floor or adds an upper bound must update this ADR, the requirement and the README together.
