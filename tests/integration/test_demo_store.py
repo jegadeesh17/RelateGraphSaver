@@ -98,9 +98,28 @@ def test_ac69_committed_store_is_not_ignored_by_git() -> None:
 
 
 def test_ac69_committed_store_is_a_single_file_without_sidecars() -> None:
-    """AC-69: the working tree holds demo.rl as a file, with no sidecar beside it."""
+    """AC-69, AC-141: examples/data holds demo.rl and at most the optional demo-llm.rl.
+
+    Passes with or without demo-llm.rl; any sidecar or other file beside them fails.
+    """
     assert COMMITTED_STORE.is_file()
-    assert _listing(COMMITTED_STORE.parent) == ["demo.rl"]
+    listing = _listing(COMMITTED_STORE.parent)
+    assert "demo.rl" in listing
+    assert set(listing) <= {"demo.rl", "demo-llm.rl"}
+
+
+def test_ac141_demo_llm_store_is_not_ignored_by_git() -> None:
+    """AC-141: demo-llm.rl has its own gitignore negation while other .rl files stay ignored."""
+    kept = subprocess.run(
+        ["git", "check-ignore", "-q", "examples/data/demo-llm.rl"], cwd=REPO_ROOT, check=False
+    )
+    assert kept.returncode == 1, "examples/data/demo-llm.rl must not be ignored"
+
+
+def test_ac141_builder_never_mentions_the_llm_store() -> None:
+    """AC-141: build_demo_store.py neither reads nor writes demo-llm.rl."""
+    source = (REPO_ROOT / "examples" / "build_demo_store.py").read_text(encoding="utf-8")
+    assert "demo-llm" not in source
 
 
 def test_ac73_script_builds_closed_single_file_store_with_four_threads(built_store: Path) -> None:

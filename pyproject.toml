@@ -60,6 +60,9 @@ dev = [
     "mypy>=1.11.0",
     "langgraph-checkpoint-sqlite>=2.0.0",
 ]
+llm = [
+    "langchain-openai>=1.8.3",
+]
 
 [project.scripts]
 relate-dag = "langgraph_checkpoint_relate.cli:app"

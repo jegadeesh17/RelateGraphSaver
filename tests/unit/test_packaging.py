@@ -254,3 +254,30 @@ def test_sqlite_dev_only_check_rejects_runtime_declaration_ac_57() -> None:
 
     assert "langgraph-checkpoint-sqlite" in _runtime_dependency_names(config)
     assert "langgraph-checkpoint-sqlite" not in _dev_extra_names(config)
+
+
+def _llm_extra_names(data: dict[str, Any]) -> set[str]:
+    llm = data.get("project", {}).get("optional-dependencies", {}).get("llm", [])
+    return {_requirement_name(requirement) for requirement in llm}
+
+
+def test_langchain_openai_is_llm_extra_only_ac_139() -> None:
+    """AC-139: the llm extra declares langchain-openai and runtime dependencies do not."""
+    with open(_REPO_ROOT / "pyproject.toml", "rb") as f:
+        data = tomllib.load(f)
+
+    assert "langchain-openai" in _llm_extra_names(data)
+    assert "langchain-openai" not in _runtime_dependency_names(data)
+
+
+def test_llm_extra_check_rejects_runtime_declaration_ac_139() -> None:
+    """AC-139: the check tells a runtime declaration apart from an llm-extra one."""
+    config: dict[str, Any] = {
+        "project": {
+            "dependencies": ["langchain_openai>=1.0.0"],
+            "optional-dependencies": {"dev": ["pytest>=8.3.0"]},
+        }
+    }
+
+    assert "langchain-openai" in _runtime_dependency_names(config)
+    assert "langchain-openai" not in _llm_extra_names(config)

@@ -51,4 +51,5 @@ htmlcov/
 *.rl.wal
 *.rl.lock
 !examples/data/demo.rl
+!examples/data/demo-llm.rl
 checkpoints/
