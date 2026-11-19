@@ -31,10 +31,10 @@ Other tools cover part of this. The table says what each one does and where Rela
 
 | Alternative | What it gives you | What it does not |
 | :--- | :--- | :--- |
-| Neo4jSaver (`langchain-neo4j`) | Checkpoints and branches stored as a graph (`Thread`, `Checkpoint`, `PREVIOUS`, `Branch` nodes) | Needs a Neo4j server: it connects through a Neo4j driver, for example to `bolt://localhost:7687`. Its graph model has no tool-call or error nodes and it ships no root-cause query |
+| Neo4jSaver (`langchain-neo4j`) | Checkpoints and branches stored as a graph (`Thread`, `Checkpoint`, `Branch` and `PendingWrite` nodes; checkpoints linked by `PREVIOUS`) | Needs a Neo4j server: it connects through a Neo4j driver, for example to `bolt://localhost:7687`. Its graph model has no tool-call or error nodes and it ships no root-cause query |
 | SqliteSaver (`langgraph-checkpoint-sqlite`) | A single-file checkpointer that is faster than RelateSaver in our benchmark (see [Benchmark](#benchmark)) | Stores checkpoints and writes in two tables, `checkpoints` and `writes`; it has no graph and no tool-call records |
 | LangGraph built-in time travel | Replay or fork from a prior checkpoint; the original history stays intact | It is a way to re-run history, not a diagnostic: it does not itself trace a failure to the step or tool call behind it |
-| Tracing tools (for example LangSmith) | Records of steps and tool calls as traces | The trace is kept apart from the checkpoint state, so it is not the state a replay forks from |
+| Tracing tools (for example LangSmith) | Records of steps and tool calls as traces | Traces are stored separately from the checkpoints, so linking a failed trace back to the saved state is manual |
 
 RelateGraphSaver aims at the combination: no server, tool calls stored as graph nodes, a root-cause query (`relate-dag forensics trace-error`) and a sandboxed replay, all from one file. If you need speed or a multi-process server, see the limits below and the Benchmark.
 
@@ -300,7 +300,7 @@ These are the values that command printed, unedited. They are one run on one mac
 What the numbers say:
 
 - SqliteSaver is faster than RelateSaver on every speed metric here: writes, point reads (`get_tuple`) and the ancestry query. Its file is also smaller. Each saver's queries are written in the best form we know for its engine (ADR-0012): the ancestry query is anchored on the branch tip in Relate and walks parents by primary key in SQLite, and both return the same count.
-- With the default settings RelateSaver flushes after every write, which is what makes a committed checkpoint durable. In relate-db 1.1.0 the cost of that flush still grows with the size of the database file: in a separate timing run of 1000 puts on 1.1.0, the median put took about four times longer for the last 100 checkpoints than for the first 100. Save latency therefore grows as a run gets longer. We keep it as the default because it is the safe choice (ADR-0001).
+- With the default settings RelateSaver flushes after every write, which is what makes a committed checkpoint durable. In relate-db 1.1.0 the cost of that flush still grows with the size of the database file: timing 1000 consecutive `put()` calls with the default flush gave a median of about 26 ms for the first 100 and about 109 ms for the last 100 (relate-db 1.0.2 behaved the same). That was a separate measurement, and the Benchmark table does not show this growth. Save latency therefore grows as a run gets longer. We keep it as the default because it is the safe choice (ADR-0001).
 - `wal_enabled=False` skips the per-write flush and keeps put latency flat, but its file is larger, and we have not verified that it survives power loss without the flush. It is not recommended for data you cannot lose.
 - Absolute numbers will differ on your machine. Run the command above to get your own.
 

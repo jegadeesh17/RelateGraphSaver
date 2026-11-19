@@ -246,6 +246,18 @@ def test_why_not_x_table_has_four_rows_ac_146() -> None:
     assert "Needs a Neo4j server" in neo4j_row
 
 
+def test_why_not_x_rows_state_graph_labels_and_trace_gap_ac_146() -> None:
+    """AC-146: PREVIOUS is described as a relationship and the tracing row names the manual link."""
+    lines = _section("Why not X?").splitlines()
+    neo4j_row = next(line for line in lines if line.startswith("| Neo4jSaver"))
+    assert "`Thread`, `Checkpoint`, `Branch` and `PendingWrite` nodes" in neo4j_row
+    assert "checkpoints linked by `PREVIOUS`" in neo4j_row
+    assert "`PREVIOUS`, `Branch` nodes" not in neo4j_row
+    tracing_row = next(line for line in lines if line.startswith("| Tracing tools"))
+    assert "Traces are stored separately from the checkpoints" in tracing_row
+    assert "linking a failed trace back to the saved state is manual" in tracing_row
+
+
 def test_explore_block_holds_exactly_the_four_commands_ac_147() -> None:
     """AC-147: the explore block has the four documented commands, every flag before --db."""
     commands = [" ".join(args) for args in _readme_demo_commands()]

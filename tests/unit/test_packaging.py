@@ -378,6 +378,9 @@ def test_relate_db_requirement_matches_readme_ac_143() -> None:
         assert benchmark_version == "1.1.0"
         assert "In relate-db 1.1.0 the cost of that flush" in readme
         assert "In relate-db 1.0 the cost" not in readme
+        # The figures come from a separate measurement, not from the Benchmark table.
+        assert "That was a separate measurement" in readme
+        assert "about 26 ms for the first 100 and about 109 ms for the last 100" in readme
     else:
         assert "In relate-db 1.0 the cost" in readme
 
