@@ -99,7 +99,7 @@ def _parse_update(raw: str) -> dict[str, Any]:
 
 
 def _parse_set_messages(raw_items: list[str]) -> dict[int, str]:
-    """Parse repeated ``--set-message INDEX=TEXT`` values (AC-114)."""
+    """Parse repeated ``--set-message INDEX=TEXT`` values; an index may appear once (AC-114, AC-153)."""
     parsed: dict[int, str] = {}
     for item in raw_items:
         index_text, separator, text = item.partition("=")
@@ -111,6 +111,8 @@ def _parse_set_messages(raw_items: list[str]) -> dict[int, str]:
             raise _fail(f"--set-message index must be an integer, got: {index_text!r}") from exc
         if index < 0:
             raise _fail(f"--set-message index must not be negative, got: {index}")
+        if index in parsed:
+            raise _fail(f"--set-message index {index} is given more than once.")
         parsed[index] = text
     return parsed
 
@@ -384,6 +386,8 @@ def replay(
             raise _fail("--branch cannot be combined with --graph.")
         update_value = _parse_update(update) if update is not None else None
         set_messages = _parse_set_messages(set_message) if set_message else None
+        if as_node is not None and not update_value and not set_messages:
+            raise _fail("--as-node needs an edit: pass --update or --set-message with it.")
         _replay_with_graph(
             db, thread_id, effective_checkpoint_id, graph, update_value, set_messages, as_node
         )

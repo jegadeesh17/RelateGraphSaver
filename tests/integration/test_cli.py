@@ -961,23 +961,50 @@ class TestCliReplayGraph:
     def test_set_message_repeats_and_short_graph_flag_works_ac_110(
         self, runner: CliRunner, demo_copy: tuple[str, dict[int, str]]
     ) -> None:
-        """AC-110, AC-114: --set-message may repeat and -g is accepted before --db."""
+        """AC-110, AC-114: --set-message may repeat with distinct indexes; -g precedes --db."""
+        db_file, steps = demo_copy
+        result = runner.invoke(
+            app,
+            _replay_args(
+                db_file,
+                steps[1],
+                "-g",
+                GRAPH_SPEC,
+                "--set-message",
+                f"0={OK_URL}",
+                "--set-message",
+                "1=edited reply",
+            ),
+        )
+        assert result.exit_code == 0, result.output
+        assert "Replay result" in result.output
+        assert "messages[0]" in result.output
+        assert "messages[1]" in result.output
+
+    def test_duplicate_set_message_index_is_rejected_ac_153(
+        self, runner: CliRunner, demo_copy: tuple[str, dict[int, str]]
+    ) -> None:
+        """AC-153: a repeated --set-message INDEX exits 1, names the index and runs no graph."""
         db_file, steps = demo_copy
         result = runner.invoke(
             app,
             _replay_args(
                 db_file,
                 steps[0],
-                "-g",
+                "--graph",
                 GRAPH_SPEC,
                 "--set-message",
                 f"0={OK_URL}",
                 "--set-message",
-                f"0={OK_URL}",
+                "0=another text",
             ),
         )
-        assert result.exit_code == 0, result.output
-        assert "error -> ok" in result.output
+        assert result.exit_code == 1
+        output = _squash(result.output)
+        assert "Error:" in output
+        assert "--set-message index 0" in output
+        assert "Replay result" not in output
+        assert "Traceback" not in output
 
     def test_unedited_replay_reports_no_changes_ac_111(
         self, runner: CliRunner, demo_copy: tuple[str, dict[int, str]]
@@ -1005,6 +1032,25 @@ class TestCliReplayGraph:
         assert "--graph" in result.output
         assert flag in result.output
         assert "Sandboxed replay initialized" not in result.output
+
+    @pytest.mark.parametrize("update_args", [[], ["--update", "{}"]])
+    def test_as_node_without_an_edit_is_rejected_ac_152(
+        self, runner: CliRunner, demo_copy: tuple[str, dict[int, str]], update_args: list[str]
+    ) -> None:
+        """AC-152: --as-node with no effective edit exits 1 and runs no graph."""
+        db_file, steps = demo_copy
+        result = runner.invoke(
+            app,
+            _replay_args(
+                db_file, steps[0], "--graph", GRAPH_SPEC, "--as-node", "agent", *update_args
+            ),
+        )
+        assert result.exit_code == 1
+        output = _squash(result.output)
+        assert "Error:" in output
+        assert "--as-node needs an edit" in output
+        assert "Replay result" not in output
+        assert "Traceback" not in output
 
     @pytest.mark.parametrize("bad_update", ["{not json", "[1, 2]", '"text"', "42", ""])
     def test_update_must_be_a_json_object_ac_113(

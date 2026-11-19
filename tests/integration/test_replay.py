@@ -469,23 +469,25 @@ def test_ac101_update_with_as_node_creates_a_new_checkpoint_and_the_run_continue
 ) -> None:
     fork = _checkpoint_before_human_review(research_source)
 
+    # Writing as "planner" makes "researcher" the next node, so the run has a node to execute.
     result = replay_from_checkpoint(
         research_source,
         RESEARCH_THREAD_ID,
         fork,
         create_research_graph,
-        update={"research_notes": ["edited note"]},
-        as_node="researcher",
+        update={"plan": ["edited plan"]},
+        as_node="planner",
     )
 
     assert result.fork_checkpoint_id == fork
     assert result.updated_checkpoint_id != fork
-    # The run pauses at human_review, which saves no checkpoint beyond the edited one.
-    assert result.final_checkpoint_id != fork
+    # The run executed "researcher" after the update, so it saved a checkpoint beyond the
+    # updated one, and then paused at "human_review".
+    assert result.final_checkpoint_id not in {fork, result.updated_checkpoint_id}
     assert result.interrupted
-    notes = [c for c in result.diff.channels if c.channel == "research_notes"]
-    assert len(notes) == 1
-    assert notes[0].after == repr(["edited note"])
+    plan = [c for c in result.diff.channels if c.channel == "plan"]
+    assert len(plan) == 1
+    assert plan[0].after == repr(["edited plan"])
 
 
 def test_ac102_research_replay_from_before_human_review_reports_an_interrupt(
