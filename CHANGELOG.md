@@ -39,6 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.4
 - Integration test suite validating end-to-end checkpointing, pagination, history retrieval, and multi-threaded execution.
 
 ### Changed
+- Project URLs point to the public repository, and the `relate-db` requirement is now `>=1.1.0` after the full suite and the benchmark passed on 1.1.0 (ADR-0020).
+- README: a plain tagline, a "Why not X?" comparison with Neo4jSaver, SqliteSaver, built-in time travel and tracing tools, install from source, four explore commands with real output, and the benchmark rerun on relate-db 1.1.0.
 - `examples/data/demo.rl` holds a fourth thread, `demo-real-api`, recorded against pypi.org, with one failed lookup to trace; the builder leaves the existing store in place when pypi.org cannot be reached (ADR-0019).
 - The research agent's notes make no latency or speed claims.
 - `relate-dag forensics trace-error` and `forensics` explain what `Causal Path Length` and the origin hop count measure.
@@ -47,6 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.4
 - Tool-call capture sends only new statements per saver (ADR-0011) and commits without its own flush; the store is flushed on close (ADR-0014).
 
 ### Fixed
+- `mypy src tests` passes on a `dev`-only install, without the optional `llm` extra.
 - `examples/build_demo_store.py` refuses to overwrite the recorded LLM store, and `examples/openrouter_agent.py` refuses to add a second run to a thread that already holds one.
 - `relate-dag tree` marks completed steps `[OK]` and reserves `PENDING` for leaves with writes.
 - `relate-dag replay` rejects `--as-node` without an edit and a repeated `--set-message` index instead of ignoring them.
