@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.4
 ## [Unreleased]
 
 ### Added
+- Key-free dependency agent (`examples/dependency_agent.py`) that looks up the project's runtime dependencies on the PyPI JSON API and records each `lookup_pypi_package` call; tests that reach pypi.org carry a `network` marker and are deselected by default.
+- Optional recorded LLM run: `examples/openrouter_agent.py` behind an `llm` extra (`langchain-openai`), and `examples/data/demo-llm.rl` holding one run recorded with `mistralai/mistral-small-3.2-24b-instruct` through OpenRouter. The key is read only from the process environment.
 - `replay_from_checkpoint()` and `relate-dag replay --graph`: re-run a user graph from a historical checkpoint in an isolated sandbox, with `--update`, `--set-message` and `--as-node` edits, and print the tool-call and final-state diff against the recorded run (ADR-0017).
 - `trace_argument_origin()` and the `Bad argument origin` line in `relate-dag forensics trace-error`: trace a failing tool argument back to the step that first wrote it.
 - `failure_summary()` and `relate-dag forensics failures`: summarize failing tool calls across every thread in the store.
@@ -17,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.4
 - Async checkpointer methods (`aget_tuple`, `alist`, `aput`, `aput_writes`).
 - Benchmark script comparing `RelateSaver` with LangGraph's `SqliteSaver` (`benchmarks/bench_checkpointers.py`, ADR-0008, ADR-0012).
 - Read-only mode, `RelateSaver(read_only=True)`, used by the inspection commands so they leave a store byte-identical (ADR-0015).
-- Committed demo store (`examples/data/demo.rl`) with three threads, and `examples/build_demo_store.py` to rebuild it offline.
+- Committed demo store (`examples/data/demo.rl`) and `examples/build_demo_store.py` to rebuild it.
 - README sections: use case, how we use Relate and why, where the data lives, exploring the demo store, measured benchmark results and the single-process limit.
 - Cypher forensic diagnostic engine (`RelateForensics`, `detect_loops()`, `trace_root_cause()`) detecting state oscillations, repeating node cycles, and backward causal failure root-cause analysis.
 - CLI forensic diagnostic subcommands (`relate-dag forensics loops` and `relate-dag forensics trace-error`) with rich tabular rendering.
@@ -37,12 +39,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.4
 - Integration test suite validating end-to-end checkpointing, pagination, history retrieval, and multi-threaded execution.
 
 ### Changed
+- `examples/data/demo.rl` holds a fourth thread, `demo-real-api`, recorded against pypi.org, with one failed lookup to trace; the builder leaves the existing store in place when pypi.org cannot be reached (ADR-0019).
+- The research agent's notes make no latency or speed claims.
 - `relate-dag forensics trace-error` and `forensics` explain what `Causal Path Length` and the origin hop count measure.
 - Replay message previews longer than 120 characters end with `...`; the marker is display-only and never affects the diff.
 - Variable-length ancestry queries start from the target checkpoint instead of scanning the whole chain.
 - Tool-call capture sends only new statements per saver (ADR-0011) and commits without its own flush; the store is flushed on close (ADR-0014).
 
 ### Fixed
+- `examples/build_demo_store.py` refuses to overwrite the recorded LLM store, and `examples/openrouter_agent.py` refuses to add a second run to a thread that already holds one.
 - `relate-dag tree` marks completed steps `[OK]` and reserves `PENDING` for leaves with writes.
 - `relate-dag replay` rejects `--as-node` without an edit and a repeated `--set-message` index instead of ignoring them.
 - `click` and `langchain-core` are declared as runtime dependencies, so a clean install runs the CLI.
