@@ -6,25 +6,39 @@ removed from the environment, and the in-process run uses a fake chat model.
 
 from __future__ import annotations
 
+import hashlib
 import os
+import shutil
 import subprocess
 import sys
 import textwrap
+import types
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 import pytest
 from examples import openrouter_agent
+from examples.build_demo_store import build_demo_store
 from examples.dependency_agent import TOOL_NAME
-from examples.openrouter_agent import API_KEY_ENV, create_llm_graph, run_llm_agent
+from examples.openrouter_agent import (
+    API_KEY_ENV,
+    OPENROUTER_BASE_URL,
+    create_llm_graph,
+    main,
+    run_llm_agent,
+)
 from langchain_core.messages import AIMessage, BaseMessage
 from tests.fakes.fake_pypi import FakePyPI
+from typer.testing import CliRunner
 
+from langgraph_checkpoint_relate.cli import app
 from langgraph_checkpoint_relate.saver import RelateSaver
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "examples" / "openrouter_agent.py"
+COMMITTED_LLM_STORE = REPO_ROOT / "examples" / "data" / "demo-llm.rl"
+LLM_THREAD = "demo-llm"
 
 # Runs the script with every route to the network, and the langchain_openai import, replaced
 # by a hard exit. Exit code 99 and a FORBIDDEN line on stderr mean the script tried one.
@@ -172,3 +186,142 @@ def test_run_rejects_empty_thread_id(tmp_path: Path) -> None:
 def test_graph_compiles_without_a_checkpointer() -> None:
     """The graph can be built without a saver, for inspection."""
     assert create_llm_graph(_ScriptedModel()) is not None
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _invoke(*args: str) -> tuple[int, str]:
+    result = CliRunner().invoke(app, list(args))
+    return result.exit_code, result.output
+
+
+@pytest.fixture
+def llm_store_copy(tmp_path: Path) -> Path:
+    """A copy of the committed recorded run; skipped when the optional store is not committed."""
+    if not COMMITTED_LLM_STORE.is_file():
+        pytest.skip("examples/data/demo-llm.rl is not committed (optional recorded run, AC-141)")
+    store = tmp_path / "demo-llm.rl"
+    shutil.copyfile(COMMITTED_LLM_STORE, store)
+    return store
+
+
+def test_ac141_committed_llm_store_holds_one_recorded_run() -> None:
+    """AC-141: the recorded store holds only the demo-llm thread, eight lookups, one 404 failure."""
+    if not COMMITTED_LLM_STORE.is_file():
+        pytest.skip("examples/data/demo-llm.rl is not committed (optional recorded run, AC-141)")
+    with RelateSaver(str(COMMITTED_LLM_STORE), read_only=True) as saver:
+        threads = saver.proxy.execute_read(
+            "MATCH (c:Checkpoint) RETURN DISTINCT c.thread_id AS tid", {}
+        )
+        rows = saver.proxy.execute_read(
+            "MATCH (c:Checkpoint)-[:INVOKED]->(tc:ToolCall) "
+            "RETURN tc.tool_name AS name, tc.args_blob AS args, tc.error AS error",
+            {},
+        )
+        calls = [
+            (str(r["name"]), str(saver.serde.loads(bytes(r["args"]))["name"]), r["error"])
+            for r in rows
+        ]
+
+    assert {str(t["tid"]) for t in threads} == {LLM_THREAD}
+    assert len(calls) == 8
+    assert {name for name, _, _ in calls} == {TOOL_NAME}
+    failures = [(package, error) for _, package, error in calls if error is not None]
+    assert [package for package, _ in failures] == ["relategraphsaver"]
+    assert "404" in failures[0][1]
+
+
+def test_ac141_committed_llm_store_is_read_only_inspectable(llm_store_copy: Path) -> None:
+    """AC-141: the read-only commands answer on the recorded store and leave its bytes alone."""
+    store = llm_store_copy
+    before = _sha256(store)
+    commands = [
+        ["tree", LLM_THREAD],
+        ["forensics", "failures"],
+        ["forensics", "loops", LLM_THREAD],
+        ["forensics", "trace-error", LLM_THREAD],
+    ]
+    outputs: dict[str, str] = {}
+    for command in commands:
+        code, output = _invoke(*command, "--db", str(store))
+        assert code == 0, (command, output)
+        assert _sha256(store) == before, command
+        assert [p.name for p in store.parent.iterdir()] == ["demo-llm.rl"], command
+        outputs[" ".join(command)] = output
+
+    assert "[OK]" in outputs[f"tree {LLM_THREAD}"]
+    assert "lookup_pypi_package" in outputs["forensics failures"]
+    flat = " ".join(outputs[f"forensics trace-error {LLM_THREAD}"].replace("|", " ").split())
+    assert "Root Tool Name: lookup_pypi_package" in flat
+    assert "'relategraphsaver' does not exist" in flat
+    assert "404" in flat
+
+
+def test_ac141_unknown_thread_on_llm_store_exits_1(llm_store_copy: Path) -> None:
+    """AC-141 (invalid input): asking for a thread the recorded store does not hold exits 1."""
+    code, output = _invoke("tree", "no-such-thread", "--db", str(llm_store_copy))
+    assert code == 1
+    assert "not found" in output
+    assert _sha256(llm_store_copy) == _sha256(COMMITTED_LLM_STORE)
+
+
+def test_llm_run_leaves_a_sibling_demo_store_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC-141: running the recorded-run path beside demo.rl leaves demo.rl byte-identical."""
+    data = tmp_path / "data"
+    data.mkdir()
+    demo = data / "demo.rl"
+    build_demo_store(demo, fetch_json=FakePyPI())
+    before = _sha256(demo)
+    monkeypatch.setattr(openrouter_agent, "fetch_pypi_json", FakePyPI())
+
+    with RelateSaver(db_path=str(data / "demo-llm.rl")) as saver:
+        run_llm_agent(_ScriptedModel(), saver, LLM_THREAD)
+
+    assert _sha256(demo) == before
+    assert sorted(p.name for p in data.iterdir()) == ["demo-llm.rl", "demo.rl"]
+
+
+def test_main_builds_the_chat_model_from_the_key_and_writes_a_cli_readable_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Wiring: main() passes the key and OpenRouter URL to ChatOpenAI, and the store it writes
+    is read back by the CLI. The chat model is a stand-in; no request leaves the process.
+    """
+    placeholder = "placeholder-for-test-only"
+    monkeypatch.setenv(API_KEY_ENV, placeholder)
+    captured: dict[str, Any] = {}
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        def bind_tools(self, tools: Sequence[Any]) -> _ScriptedModel:
+            return _ScriptedModel().bind_tools(tools)
+
+    fake_module: Any = types.ModuleType("langchain_openai")
+    fake_module.ChatOpenAI = FakeChatOpenAI
+    monkeypatch.setitem(sys.modules, "langchain_openai", fake_module)
+    monkeypatch.setattr(openrouter_agent, "fetch_pypi_json", FakePyPI())
+    db = tmp_path / "llm.rl"
+
+    assert main(["--model", "vendor/model", "--db", str(db), "--thread-id", "llm-cli"]) == 0
+
+    assert captured["base_url"] == OPENROUTER_BASE_URL
+    assert captured["model"] == "vendor/model"
+    assert captured["api_key"].get_secret_value() == placeholder
+    out = capsys.readouterr().out
+    assert f"relate-dag tree llm-cli --db {db}" in out
+    assert [p.name for p in tmp_path.iterdir()] == ["llm.rl"]
+
+    code, output = _invoke("forensics", "failures", "--db", str(db))
+    assert code == 0, output
+    assert "lookup_pypi_package" in output
+    code, output = _invoke("tree", "llm-cli", "--db", str(db))
+    assert code == 0, output
+    assert "[OK]" in output

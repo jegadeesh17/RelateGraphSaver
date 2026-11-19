@@ -10,17 +10,22 @@ which changes with the live package index.
 from __future__ import annotations
 
 import hashlib
+import io
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import urllib.error
 from pathlib import Path
 from typing import Any
 
 import pytest
+from examples import dependency_agent
 from examples.build_demo_store import (
     DEMO_THREADS,
+    MISSING_PACKAGE,
     REAL_API_THREAD,
     RESEARCH_THREAD,
     TOOL_FAIL_THREAD,
@@ -495,3 +500,124 @@ def test_ac75_cli_leaves_committed_store_bytes_and_directory_unchanged(tmp_path:
         assert code == 0, (command, output)
         assert _sha256(store) == before, command
         assert _listing(work) == ["demo.rl"], command
+
+
+LATENCY_PHRASES = (
+    "sub-millisecond",
+    "instantaneous",
+    "eliminate branch-tracking ambiguities",
+    "millisecond",
+    "latency",
+    "instant",
+    "fast",
+    "faster",
+    "real-time",
+    "zero-latency",
+)
+
+
+def _real_api_lookups(db_path: Path) -> list[tuple[str, str | None, bool]]:
+    """(package, error, has a result) for each demo-real-api lookup, read from a store."""
+    with RelateSaver(str(db_path), read_only=True) as saver:
+        rows = saver.proxy.execute_read(
+            "MATCH (c:Checkpoint {thread_id: $tid})-[:INVOKED]->(tc:ToolCall) "
+            "RETURN tc.args_blob AS args, tc.error AS error, tc.result_blob AS result",
+            {"tid": REAL_API_THREAD},
+        )
+        return [
+            (
+                str(saver.serde.loads(bytes(r["args"]))["name"]),
+                r["error"],
+                r["result"] is not None,
+            )
+            for r in rows
+        ]
+
+
+class _PyPIJsonResponse(io.BytesIO):
+    """A ``urlopen`` response body that ``json.load`` can read."""
+
+
+def _stub_pypi_urlopen(monkeypatch: pytest.MonkeyPatch, requested: list[str]) -> None:
+    """Stub only the network boundary: pypi.org answers 404 for the missing name, else JSON."""
+
+    def fake_urlopen(request: Any, timeout: float | None = None) -> _PyPIJsonResponse:
+        url = str(request.full_url)
+        requested.append(url)
+        name = url.split("/")[-2]
+        if name == MISSING_PACKAGE:
+            raise urllib.error.HTTPError(url, 404, "Not Found", None, None)  # type: ignore[arg-type]
+        info = {"name": name, "version": "1.2.3", "summary": f"summary of {name}"}
+        return _PyPIJsonResponse(json.dumps({"info": info}).encode())
+
+    monkeypatch.setattr("examples.dependency_agent.urlopen", fake_urlopen)
+
+
+def test_ac126_committed_research_thread_carries_no_latency_claims() -> None:
+    """AC-126: the research thread in the committed store holds the revised notes only."""
+    with RelateSaver(str(COMMITTED_STORE), read_only=True) as saver:
+        checkpoint = saver.get_tuple({"configurable": {"thread_id": RESEARCH_THREAD}})
+    assert checkpoint is not None
+    notes = checkpoint.checkpoint["channel_values"]["research_notes"]
+    assert notes
+    text = "\n".join(notes).lower()
+    for phrase in LATENCY_PHRASES:
+        assert phrase not in text, phrase
+
+
+def test_ac134_ac135_main_builds_through_the_real_fetcher_and_urlopen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC-134/AC-135: with only urlopen stubbed, main() runs the real fetcher end to end."""
+    requested: list[str] = []
+    _stub_pypi_urlopen(monkeypatch, requested)
+    out = tmp_path / "demo.rl"
+
+    assert main(["--out", str(out)]) == 0
+
+    packages = [*dependency_agent.RUNTIME_DEPENDENCIES, MISSING_PACKAGE]
+    assert sorted(requested) == sorted(f"https://pypi.org/pypi/{p}/json" for p in packages)
+    lookups = _real_api_lookups(out)
+    assert sorted(name for name, _, _ in lookups) == sorted(packages)
+    failed = [(name, error) for name, error, _ in lookups if error is not None]
+    assert [name for name, _ in failed] == [MISSING_PACKAGE]
+    assert failed[0][1] is not None and "404" in failed[0][1]
+    assert all(has_result for name, error, has_result in lookups if error is None)
+    assert _listing(tmp_path) == ["demo.rl"]
+
+
+def test_ac136_main_with_urlopen_failing_exits_1_and_keeps_the_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """AC-136: a real URLError from urlopen names the network failure and changes nothing."""
+    out = tmp_path / "demo.rl"
+    build_demo_store(out, fetch_json=FakePyPI())
+    before = _sha256(out)
+
+    def offline(request: Any, timeout: float | None = None) -> None:
+        raise urllib.error.URLError("[Errno 11001] getaddrinfo failed")
+
+    monkeypatch.setattr("examples.dependency_agent.urlopen", offline)
+    capsys.readouterr()
+    assert main(["--out", str(out)]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("Error: could not reach pypi.org:")
+    assert "getaddrinfo failed" in err
+    assert _sha256(out) == before
+    assert _listing(tmp_path) == ["demo.rl"]
+
+
+def test_ac141_builder_leaves_a_sibling_llm_store_untouched(tmp_path: Path) -> None:
+    """AC-141: building demo.rl beside demo-llm.rl neither reads nor changes the LLM store."""
+    data = tmp_path / "data"
+    data.mkdir()
+    llm_store = data / "demo-llm.rl"
+    with RelateSaver(str(llm_store)) as saver:
+        run_tool_agent(saver, "demo-llm", fail=False)
+    before = _sha256(llm_store)
+
+    build_demo_store(data / "demo.rl", fetch_json=FakePyPI())
+
+    assert _sha256(llm_store) == before
+    assert _listing(data) == ["demo-llm.rl", "demo.rl"]
+    assert set(_checkpoint_counts(llm_store)) == {"demo-llm"}

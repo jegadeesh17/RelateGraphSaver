@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tomllib
@@ -274,3 +275,15 @@ def test_ac127_main_prints_thread_id_and_root_cause_lines(
     assert "Root Tool Name:      lookup_pypi_package" in out
     assert "from node 'planner'" in out
     assert Path(db_file).exists()
+
+
+def test_ac127_planner_package_names_match_pyproject_runtime_dependencies() -> None:
+    """AC-127: the planner's package list is the runtime dependencies declared in pyproject.toml."""
+    config = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    declared = []
+    for spec in config["project"]["dependencies"]:
+        match = re.match(r"[A-Za-z0-9._-]+", spec)
+        assert match is not None, spec
+        declared.append(match.group(0).lower().replace("_", "-"))
+
+    assert list(dependency_agent.RUNTIME_DEPENDENCIES) == declared
