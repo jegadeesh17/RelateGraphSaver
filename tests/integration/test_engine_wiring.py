@@ -285,6 +285,47 @@ def test_argument_written_in_the_prompt_traces_to_the_input_write(tmp_path: Path
     assert report.origin_node == "__start__"
 
 
+@pytest.mark.parametrize("invoking_step", [2, 3], ids=["edge-on-request", "edge-on-result"])
+def test_root_cause_origin_does_not_depend_on_where_the_invoked_edge_sits(
+    tmp_path: Path, invoking_step: int
+) -> None:
+    """AC-121, AC-129: the saver may attach the failing call's [:INVOKED] edge to the checkpoint
+    that requested the call (step 2) or to the next one (step 3), depending on which save lands
+    first. Both placements give the same error checkpoint, and the report's origin hops equal
+    trace_argument_origin from that checkpoint.
+    """
+    failing_url = "pkg-alpha-9000"
+    call_id = "fetch-t-fail"
+    with RelateSaver(db_path=str(tmp_path / "edge.rl")) as saver:
+        _run_probe_then_fetch(saver, "t-fail", failing_url)
+        saver.proxy.execute_write(
+            "MATCH (:Checkpoint {thread_id: $thread_id})-[r:INVOKED]->(:ToolCall {call_id: $call}) "
+            "DELETE r",
+            {"thread_id": "t-fail", "call": call_id},
+        )
+        saver.proxy.execute_write(
+            "MATCH (c:Checkpoint {thread_id: $thread_id, step: $step}), "
+            "(tc:ToolCall {call_id: $call}) MERGE (c)-[:INVOKED]->(tc)",
+            {"thread_id": "t-fail", "step": invoking_step, "call": call_id},
+        )
+
+        with RelateForensics(saver) as forensics:
+            report = forensics.trace_root_cause("t-fail")
+            origin = forensics.trace_argument_origin(
+                "t-fail", report.error_checkpoint_id, {"url": failing_url}
+            )
+        failed_step = saver.proxy.execute_read(
+            "MATCH (c:Checkpoint {checkpoint_id: $id}) RETURN c.step AS step",
+            {"id": report.error_checkpoint_id},
+        )[0]["step"]
+
+    assert report.root_tool_call_id == call_id
+    assert failed_step == 3
+    assert origin is not None
+    assert (report.origin_step, report.origin_hops) == (origin.step, origin.hops)
+    assert report.origin_hops == 3
+
+
 # ---------------------------------------------------------------------------
 # Tree branch label and unknown thread (RC-01)
 # ---------------------------------------------------------------------------

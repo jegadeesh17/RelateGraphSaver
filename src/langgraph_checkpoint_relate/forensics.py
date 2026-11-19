@@ -652,6 +652,15 @@ class RelateForensics:
         # Failure identified; extract error details
         err_rec = error_records[0]
         error_checkpoint_id = str(err_rec["checkpoint_id"])
+        failed_call_id = err_rec.get("tool_call_id")
+        if failed_call_id:
+            # The saver attaches [:INVOKED] to whichever of the requesting step's writes or the
+            # next checkpoint it saves first, and LangGraph saves them on different threads, so
+            # the edge can sit on either. Anchor on the checkpoint where the tool failed, which
+            # is the same in both cases, so the report does not depend on that race.
+            error_checkpoint_id = self._failure_checkpoint_id(
+                thread_id, error_checkpoint_id, str(failed_call_id)
+            )
 
         error_message = ""
         if "write_blob" in err_rec and err_rec["write_blob"]:
