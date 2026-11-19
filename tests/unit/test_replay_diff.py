@@ -168,3 +168,16 @@ def test_ac106_a_difference_inside_the_first_120_characters_is_reported() -> Non
     replayed = _snapshot(messages=(HumanMessage(content="a" * 119 + "y"),))
 
     assert len(diff_runs(recorded, replayed).messages) == 1
+
+
+def test_ac106_message_text_over_the_preview_limit_ends_with_three_dots() -> None:
+    long_text = "a" * 130
+    exact_text = "b" * 120
+
+    diff = diff_runs(
+        _snapshot(messages=(HumanMessage(content=long_text), HumanMessage(content=exact_text))),
+        _snapshot(messages=(HumanMessage(content="c"), HumanMessage(content="d"))),
+    )
+
+    assert diff.messages[0].before == "human: " + "a" * 120 + "..."
+    assert diff.messages[1].before == "human: " + exact_text

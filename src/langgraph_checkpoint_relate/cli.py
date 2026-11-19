@@ -446,7 +446,12 @@ def _origin_line(report: RootCauseReport) -> str:
         "[bold yellow]Bad argument origin:[/bold yellow] "
         f"{escape(report.origin_argument)} came from node {escape(str(report.origin_node))} "
         f"(step {report.origin_step}, {report.origin_hops} hops before failure)\n"
+        "[dim]  (hops: checkpoint steps from the write where the argument first appeared "
+        "to the error checkpoint)[/dim]\n"
     )
+
+
+_PATH_LENGTH_NOTE = "[dim](checkpoint steps from the offending write to the error checkpoint)[/dim]"
 
 
 class ForensicsGroup(TyperGroup):
@@ -578,7 +583,7 @@ def forensics_trace_error(
                     f"[bold yellow]Root Tool Name:[/bold yellow]      {report.root_tool_name or 'None'}\n"
                     f"{_origin_line(report)}"
                     f"[bold yellow]Root Channel Write:[/bold yellow]  {report.root_channel_write or 'None'}\n"
-                    f"[bold green]Causal Path Length:[/bold green]  {report.causal_path_length}\n"
+                    f"[bold green]Causal Path Length:[/bold green]  {report.causal_path_length} {_PATH_LENGTH_NOTE}\n"
                     f"[bold white]Diagnostic Summary:[/bold white]  {report.diagnostic_summary}"
                 )
                 console.print(
@@ -734,7 +739,7 @@ def forensics_diagnose(
                     f"[bold yellow]Root Tool Call ID:[/bold yellow]   {root_cause.root_tool_call_id or 'None'}\n"
                     f"[bold yellow]Root Tool Name:[/bold yellow]      {root_cause.root_tool_name or 'None'}\n"
                     f"[bold yellow]Root Channel Write:[/bold yellow]  {root_cause.root_channel_write or 'None'}\n"
-                    f"[bold green]Causal Path Length:[/bold green]  {root_cause.causal_path_length}\n"
+                    f"[bold green]Causal Path Length:[/bold green]  {root_cause.causal_path_length} {_PATH_LENGTH_NOTE}\n"
                     f"[bold white]Diagnostic Summary:[/bold white]  {root_cause.diagnostic_summary}"
                 )
                 console.print(Panel(panel_content, title="Root Cause Analysis", expand=False))

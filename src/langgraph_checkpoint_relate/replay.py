@@ -223,7 +223,9 @@ def snapshot_run(saver: RelateSaver, thread_id: str, checkpoint_id: str) -> RunS
 def _message_text(message: Any) -> str:
     kind = getattr(message, "type", type(message).__name__)
     content = getattr(message, "content", message)
-    return f"{kind}: {str(content)[:_MESSAGE_LIMIT]}"
+    text = str(content)
+    shown = text[:_MESSAGE_LIMIT] + "..." if len(text) > _MESSAGE_LIMIT else text
+    return f"{kind}: {shown}"
 
 
 def _diff_tool_calls(recorded: RunSnapshot, replayed: RunSnapshot) -> tuple[ToolCallChange, ...]:
@@ -283,8 +285,9 @@ def diff_runs(recorded: RunSnapshot, replayed: RunSnapshot) -> RunDiff:
     """Compare a recorded run with its replay.
 
     Tool calls are matched by ``(tool_name, ordinal)``, never by call id; messages by index as
-    ``"<type>: <first 120 characters of content>"``; other channels by ``repr``. Checkpoint
-    ids, timestamps, message ids and ``__*`` / ``branch:*`` channels are never compared, so a
+    ``"<type>: <first 120 characters of content>"`` (with ``...`` appended when the content is
+    longer); other channels by ``repr``. Checkpoint ids, timestamps, message ids and
+    ``__*`` / ``branch:*`` channels are never compared, so a
     replay that behaves like the recording gives an empty diff (AC-104..AC-106).
     """
     return RunDiff(

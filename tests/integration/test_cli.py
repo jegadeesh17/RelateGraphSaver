@@ -1295,6 +1295,29 @@ def test_trace_error_prints_bad_argument_origin_ac_122(runner: CliRunner, tmp_pa
     )
 
 
+def test_trace_error_explains_both_distance_figures_ac_122(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """AC-122: each distance figure says what it counts and keeps its value."""
+    db_file = str(tmp_path / "origin.rl")
+    _run_origin_graph(db_file, "origin-fail", "pkg-alpha-9000")
+
+    result = runner.invoke(app, ["forensics", "trace-error", "origin-fail", "--db", db_file])
+
+    flat = _flatten(result.output)
+    assert result.exit_code == 0
+    assert "2 hops before failure)" in flat
+    assert (
+        "hops: checkpoint steps from the write where the argument first appeared "
+        "to the error checkpoint" in flat
+    )
+    assert re.search(
+        r"Causal Path Length: \d+ \(checkpoint steps from the offending write "
+        r"to the error checkpoint\)",
+        flat,
+    )
+
+
 def test_trace_error_omits_origin_line_without_origin_ac_122(
     runner: CliRunner, seeded_error_db: tuple[str, str, str]
 ) -> None:
