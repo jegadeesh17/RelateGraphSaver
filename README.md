@@ -78,7 +78,8 @@ relate-dag replay demo-research 1f1e336a-4009-673d-8002-559ce0d73f21 --db exampl
 | Root Tool Call ID:   call_57c75bb4c00a464faa16d9aca2bd58ff                  |
 | Root Tool Name:      fetch_source                                           |
 | ...                                                                         |
-| Causal Path Length:  1                                                      |
+| Causal Path Length:  1 (checkpoint steps from the offending write to the    |
+| error checkpoint)                                                           |
 ```
 
 `replay` forks the history up to the chosen checkpoint:
