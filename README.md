@@ -65,17 +65,17 @@ relate-dag forensics trace-error demo-tool-fail --db examples/data/demo.rl
 relate-dag forensics trace-error demo-tool-ok --db examples/data/demo.rl
 
 # Fork the history at the human-review pause (step 2) into an in-memory sandbox
-relate-dag replay demo-research 1f1e336a-4009-673d-8002-559ce0d73f21 --db examples/data/demo.rl
+relate-dag replay demo-research 1f1e3dcc-a305-627f-8002-d2faef9c70e2 --db examples/data/demo.rl
 ```
 
 `trace-error` on `demo-tool-fail` ends in the tool that failed:
 
 ```text
 +-------------------- Root Cause Analysis: demo-tool-fail --------------------+
-| Error Checkpoint ID: 1f1e336a-3b1c-6df0-8000-029fd4dcbd05                   |
+| Error Checkpoint ID: 1f1e3dcc-9e79-6ab8-8000-7d30cc461d0e                   |
 | Error Message:       Error: RuntimeError('upstream unreachable: could not   |
 | fetch https://unreachable.invalid/report')                                  |
-| Root Tool Call ID:   call_57c75bb4c00a464faa16d9aca2bd58ff                  |
+| Root Tool Call ID:   call_9210ac7b64e14f49a288074a4829c677                  |
 | Root Tool Name:      fetch_source                                           |
 | ...                                                                         |
 | Causal Path Length:  1 (checkpoint steps from the offending write to the    |
@@ -88,7 +88,7 @@ relate-dag replay demo-research 1f1e336a-4009-673d-8002-559ce0d73f21 --db exampl
 Sandboxed replay initialized successfully.
   Source Thread:    demo-research
   Replay Thread:    demo-research
-  Checkpoint ID:    1f1e336a-4009-673d-8002-559ce0d73f21
+  Checkpoint ID:    1f1e3dcc-a305-627f-8002-d2faef9c70e2
   Replay Step:      2
   Isolation:        Isolated :memory: sandbox (source database unchanged)
 ```
