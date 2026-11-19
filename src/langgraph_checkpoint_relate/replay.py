@@ -220,12 +220,19 @@ def snapshot_run(saver: RelateSaver, thread_id: str, checkpoint_id: str) -> RunS
     )
 
 
-def _message_text(message: Any) -> str:
+def _message_preview(message: Any) -> tuple[str, str]:
+    """Return ``(key, shown)``: the comparison text and the text to display.
+
+    Both hold the message type and its first ``_MESSAGE_LIMIT`` characters of content. Only
+    ``shown`` gets a trailing ``...`` when the content was longer, so the marker never decides
+    whether two messages are equal.
+    """
     kind = getattr(message, "type", type(message).__name__)
     content = getattr(message, "content", message)
     text = str(content)
-    shown = text[:_MESSAGE_LIMIT] + "..." if len(text) > _MESSAGE_LIMIT else text
-    return f"{kind}: {shown}"
+    key = f"{kind}: {text[:_MESSAGE_LIMIT]}"
+    shown = key + "..." if len(text) > _MESSAGE_LIMIT else key
+    return key, shown
 
 
 def _diff_tool_calls(recorded: RunSnapshot, replayed: RunSnapshot) -> tuple[ToolCallChange, ...]:
@@ -251,15 +258,19 @@ def _diff_tool_calls(recorded: RunSnapshot, replayed: RunSnapshot) -> tuple[Tool
 def _diff_messages(recorded: RunSnapshot, replayed: RunSnapshot) -> tuple[ChannelChange, ...]:
     changes: list[ChannelChange] = []
     for index in range(max(len(recorded.messages), len(replayed.messages))):
-        before = _message_text(recorded.messages[index]) if index < len(recorded.messages) else None
-        after = _message_text(replayed.messages[index]) if index < len(replayed.messages) else None
+        before = (
+            _message_preview(recorded.messages[index]) if index < len(recorded.messages) else None
+        )
+        after = (
+            _message_preview(replayed.messages[index]) if index < len(replayed.messages) else None
+        )
         label = f"messages[{index}]"
-        if before is None:
-            changes.append(ChannelChange(label, "added", None, after))
-        elif after is None:
-            changes.append(ChannelChange(label, "removed", before, None))
-        elif before != after:
-            changes.append(ChannelChange(label, "changed", before, after))
+        if before is None and after is not None:
+            changes.append(ChannelChange(label, "added", None, after[1]))
+        elif after is None and before is not None:
+            changes.append(ChannelChange(label, "removed", before[1], None))
+        elif before is not None and after is not None and before[0] != after[0]:
+            changes.append(ChannelChange(label, "changed", before[1], after[1]))
     return tuple(changes)
 
 
@@ -286,7 +297,7 @@ def diff_runs(recorded: RunSnapshot, replayed: RunSnapshot) -> RunDiff:
 
     Tool calls are matched by ``(tool_name, ordinal)``, never by call id; messages by index as
     ``"<type>: <first 120 characters of content>"`` (with ``...`` appended when the content is
-    longer); other channels by ``repr``. Checkpoint ids, timestamps, message ids and
+    longer, for display only); other channels by ``repr``. Checkpoint ids, timestamps, message ids and
     ``__*`` / ``branch:*`` channels are never compared, so a
     replay that behaves like the recording gives an empty diff (AC-104..AC-106).
     """

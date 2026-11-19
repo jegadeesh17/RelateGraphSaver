@@ -564,7 +564,7 @@ def diff_runs(recorded: RunSnapshot, replayed: RunSnapshot) -> RunDiff: ...
 **Snapshot and diff rules** (AC-104..AC-106):
 - `snapshot_run` reads `saver.get_tuple(...)` for that checkpoint. `tool_calls` come from `extract_tool_events(messages)`: invocations in message order, `ordinal` counted per `tool_name`, `status` from the matching outcome (`error` when `is_error`, else `ok`; `no result` when none). Calls trimmed from message history are absent.
 - Tool calls are matched by `(tool_name, ordinal)`, never by `call_id` (ids are random per run): only in the replay is `added`, only in the recording is `removed`, and differing `args` (compared with `==`) or `status` is `changed`. Result and error text are not compared.
-- Messages are compared by index as `"<type>: <str(content)[:120]>"`, with `...` appended when the content is longer than 120 characters (ASCII, per AC-118; texts sharing their first 120 characters still compare equal, AC-106); extra entries are `added` or `removed`. Other channels compare `repr(value)`. Checkpoint ids, timestamps and message ids are never compared.
+- Messages are compared by index as `"<type>: <str(content)[:120]>"` (AC-106); the `before`/`after` values shown in a `ChannelChange` append `...` (ASCII, per AC-118) when the content is longer than 120 characters, and the marker is never part of the comparison; extra entries are `added` or `removed`. Other channels compare `repr(value)`. Checkpoint ids, timestamps and message ids are never compared.
 - Order: tool calls by recorded position, then added ones; messages by index; channels by name.
 
 ### 9. Argument provenance and tool failure summary (`forensics.py`)

@@ -181,3 +181,27 @@ def test_ac106_message_text_over_the_preview_limit_ends_with_three_dots() -> Non
 
     assert diff.messages[0].before == "human: " + "a" * 120 + "..."
     assert diff.messages[1].before == "human: " + exact_text
+
+
+def test_ac106_messages_sharing_their_first_120_characters_give_an_empty_diff() -> None:
+    shared = "a" * 120
+
+    for longer in (shared + "x", shared + "y" * 50):
+        recorded = _snapshot(messages=(HumanMessage(content=shared),))
+        replayed = _snapshot(messages=(HumanMessage(content=longer),))
+
+        assert diff_runs(recorded, replayed).is_empty
+        assert diff_runs(replayed, recorded).is_empty
+
+
+def test_ac106_the_display_marker_appears_only_on_values_longer_than_the_limit() -> None:
+    shared = "a" * 120
+
+    diff = diff_runs(
+        _snapshot(messages=(HumanMessage(content=shared), HumanMessage(content="one"))),
+        _snapshot(messages=(HumanMessage(content=shared + "x"), HumanMessage(content="two"))),
+    )
+
+    assert [(m.channel, m.before, m.after) for m in diff.messages] == [
+        ("messages[1]", "human: one", "human: two")
+    ]
