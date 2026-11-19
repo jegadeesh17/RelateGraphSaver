@@ -32,6 +32,7 @@ Reference documents:
 | [ADR-0018](#adr-0018-argument-provenance-by-string-containment-earliest-write-wins) | Argument Provenance by String Containment, Earliest Write Wins | Accepted | 2026-11-18 |
 | [ADR-0019](#adr-0019-the-demo-store-holds-a-real-api-thread-and-its-build-needs-network-access) | The Demo Store Holds a Real-API Thread and Its Build Needs Network Access | Accepted | 2026-11-18 |
 | [ADR-0020](#adr-0020-relate-db-version-policy-decided-by-the-test-result) | relate-db Version Policy Decided by the Test Result | Accepted | 2026-11-19 |
+| [ADR-0021](#adr-0021-tool-call-root-cause-anchors-on-the-failure-checkpoint) | Tool-Call Root Cause Anchors on the Failure Checkpoint | Accepted | 2026-11-19 |
 
 ---
 
@@ -703,3 +704,28 @@ Either outcome keeps the README's version statements matching the requirement (A
 - **Positive:** The declared range is always one we have run the suite on.
 - **Negative:** Users on relate-db 1.0.x can no longer install this package; the floor moved to 1.1.0 because that is the version the suite and benchmark ran on.
 - **Negative:** Future relate-db releases are not covered by this decision; whoever raises the floor or adds an upper bound must update this ADR, the requirement and the README together.
+
+## ADR-0021: Tool-Call Root Cause Anchors on the Failure Checkpoint
+
+Date: 2026-11-19  
+Status: Accepted
+
+### Context
+
+The saver links each tool call to one checkpoint with a `(:Checkpoint)-[:INVOKED]->(:ToolCall)` edge, attached by whichever save sees the call first: `put_writes()` for the step that requested the call (the edge lands on that step) or `put()` for the next checkpoint (the edge lands on the next step). LangGraph runs these two saves on different threads, so the same agent run can store the edge on either step. `trace_root_cause()` reported the `[:INVOKED]` checkpoint as `error_checkpoint_id` but started the argument-origin trace from the checkpoint where the tool failed. On runs where the edge landed on the requesting step, `origin_hops` no longer matched what `trace_argument_origin(thread_id, report.error_checkpoint_id, args)` returned, so the consistency promised by AC-119 held on some runs and not on others.
+
+### Decision
+
+When the error comes from a failing tool call, `trace_root_cause()` reports the failure checkpoint as `error_checkpoint_id`: the first checkpoint at or after the `[:INVOKED]` checkpoint on the `[:NEXT]` path whose writes hold the `ToolMessage` for the call, falling back to the `[:INVOKED]` checkpoint when none is found. That checkpoint is the same under both edge layouts, and the origin trace starts from it, so `origin_hops` and the reported error checkpoint always agree (AC-119, AC-129). Errors found through an `__error__` write or checkpoint metadata keep the checkpoint they were found on. The saver's edge placement is unchanged.
+
+### Alternatives considered
+
+1. **Make the saver's edge placement deterministic:** Rejected; it would change which checkpoint already stored runs attach to, which is an expensive-to-change contract, and it needs an ordering between the two saves that LangGraph does not guarantee.
+2. **Start the origin trace from the `[:INVOKED]` checkpoint instead:** Rejected; hops would then count from the step before the tool ran on some runs, which breaks AC-129.
+
+### Consequences
+
+- **Positive:** `error_checkpoint_id`, `origin_hops` and `trace_argument_origin()` agree on every run, whichever step the edge landed on.
+- **Positive:** No stored data changes; the committed demo store produces the same README output as before.
+- **Negative:** `causal_path_length` for tool-call failures still depends on where the `[:INVOKED]` edge attached, so it can differ by one step between two runs of the same agent.
+- **Negative:** Edge placement still decides which tool calls forensics and `failure_summary()` find, so it stays an expensive-to-change contract.
