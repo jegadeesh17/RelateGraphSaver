@@ -43,6 +43,14 @@ class GraphSpecError(ValueError):
     """
 
 
+class ReplayInputError(RelateCheckpointError, ValueError):
+    """Invalid replay input (AC-151, AC-155).
+
+    Still a ``ValueError``, so callers that catch ``ValueError`` keep working. It is also a
+    ``RelateCheckpointError``, so handlers must catch it before that base class.
+    """
+
+
 # Specification parity aliases
 CheckpointSerializationError = RelateSerializationError
 CheckpointNotFoundError = RelateCheckpointNotFoundError
@@ -57,4 +65,5 @@ __all__ = [
     "RelateConnectionError",
     "RelateReadOnlyError",
     "RelateSerializationError",
+    "ReplayInputError",
 ]

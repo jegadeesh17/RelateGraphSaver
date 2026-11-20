@@ -1143,6 +1143,34 @@ class TestCliReplayGraph:
         assert "Error: replay failed: RuntimeError: factory exploded" in _squash(result.output)
         assert "Traceback" not in result.output
 
+    def test_ac155_value_error_from_a_graph_node_keeps_its_context(
+        self, runner: CliRunner, demo_copy: tuple[str, dict[int, str]], tmp_path: Path
+    ) -> None:
+        """AC-155: a ValueError raised by a node is not mistaken for a replay input error."""
+        db_file, steps = demo_copy
+        graph_file = tmp_path / "boom_graph.py"
+        source_lines = [
+            "from langgraph.graph import END, START, MessagesState, StateGraph",
+            "",
+            "def explode(state: MessagesState) -> dict:",
+            "    raise ValueError('boom')",
+            "",
+            "def make(checkpointer=None):",
+            "    builder = StateGraph(MessagesState)",
+            "    builder.add_node('agent', explode)",
+            "    builder.add_node('tools', explode)",
+            "    builder.add_edge(START, 'agent')",
+            "    builder.add_edge('agent', 'tools')",
+            "    builder.add_edge('tools', END)",
+            "    return builder.compile(checkpointer=checkpointer)",
+        ]
+        graph_file.write_text("\n".join(source_lines) + "\n", encoding="utf-8")
+        spec = f"{graph_file}:make"
+        result = runner.invoke(app, _replay_args(db_file, steps[0], "--graph", spec))
+        assert result.exit_code == 1, result.output
+        assert "replay failed: ValueError: boom" in _squash(result.output)
+        assert "Traceback" not in result.output
+
     def test_branch_with_graph_is_rejected(
         self, runner: CliRunner, demo_copy: tuple[str, dict[int, str]]
     ) -> None:

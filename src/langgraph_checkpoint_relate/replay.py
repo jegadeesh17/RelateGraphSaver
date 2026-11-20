@@ -22,7 +22,11 @@ from typing import TYPE_CHECKING, Any
 from langgraph.graph import StateGraph
 from langgraph.pregel import Pregel
 
-from langgraph_checkpoint_relate.errors import CheckpointNotFoundError, GraphSpecError
+from langgraph_checkpoint_relate.errors import (
+    CheckpointNotFoundError,
+    GraphSpecError,
+    ReplayInputError,
+)
 from langgraph_checkpoint_relate.models import (
     ChannelChange,
     ReplayResult,
@@ -315,25 +319,36 @@ def diff_runs(recorded: RunSnapshot, replayed: RunSnapshot) -> RunDiff:
 
 def _validate_inputs(update: dict[str, Any] | None, set_messages: Mapping[int, str] | None) -> None:
     if update is not None and not isinstance(update, dict):
-        raise ValueError(f"update must be a dict, got {type(update).__name__}")
+        raise ReplayInputError(f"update must be a dict, got {type(update).__name__}")
     if set_messages is not None:
         if not isinstance(set_messages, Mapping):
-            raise ValueError(f"set_messages must be a mapping, got {type(set_messages).__name__}")
+            raise ReplayInputError(
+                f"set_messages must be a mapping, got {type(set_messages).__name__}"
+            )
         for key, text in set_messages.items():
             if isinstance(key, bool) or not isinstance(key, int) or key < 0:
-                raise ValueError(f"set_messages keys must be non-negative integers, got {key!r}")
+                raise ReplayInputError(
+                    f"set_messages keys must be non-negative integers, got {key!r}"
+                )
             if not isinstance(text, str):
-                raise ValueError(f"set_messages[{key}] must be a string, got {type(text).__name__}")
+                raise ReplayInputError(
+                    f"set_messages[{key}] must be a string, got {type(text).__name__}"
+                )
         if update is not None and "messages" in update:
-            raise ValueError("update may not contain 'messages' when set_messages is given")
+            raise ReplayInputError("update may not contain 'messages' when set_messages is given")
 
 
 def _compile(factory: GraphFactory, sandbox: RelateSaver) -> Any:
-    graph = (
-        factory.compile(checkpointer=sandbox)
-        if isinstance(factory, StateGraph)
-        else factory(checkpointer=sandbox)
-    )
+    if isinstance(factory, StateGraph):
+        graph = factory.compile(checkpointer=sandbox)
+    else:
+        try:
+            graph = factory(checkpointer=sandbox)
+        except TypeError as exc:
+            name = getattr(factory, "__qualname__", type(factory).__name__)
+            raise GraphSpecError(
+                f"The graph factory {name} could not be called with checkpointer=...: {exc}"
+            ) from exc
     missing = [name for name in ("invoke", "get_state", "update_state") if not hasattr(graph, name)]
     if missing:
         raise GraphSpecError(
@@ -370,20 +385,20 @@ def _edited_messages(
     checkpoint_id: str,
 ) -> list[Any]:
     if not messages:
-        raise ValueError(
+        raise ReplayInputError(
             f"Checkpoint '{checkpoint_id}' holds no messages yet, so set_messages cannot edit "
             f"it; use the next (step 0) checkpoint{_next_checkpoint_hint(source_saver, checkpoint_id)}"
         )
     edited: list[Any] = []
     for index in sorted(set_messages):
         if index >= len(messages):
-            raise ValueError(
+            raise ReplayInputError(
                 f"set_messages index {index} is out of range: the checkpoint holds "
                 f"{len(messages)} message(s)"
             )
         original = messages[index]
         if not getattr(original, "id", None):
-            raise ValueError(f"Message {index} has no id, so it cannot be replaced")
+            raise ReplayInputError(f"Message {index} has no id, so it cannot be replaced")
         edited.append(original.model_copy(update={"content": set_messages[index]}))
     return edited
 
@@ -430,8 +445,8 @@ def replay_from_checkpoint(
         A ``ReplayResult`` whose ``diff`` compares the recorded run with the replay.
 
     Raises:
-        ValueError: For invalid inputs, or when ``set_messages`` targets a checkpoint that
-            holds no messages yet (AC-151).
+        ReplayInputError: A ``ValueError`` subclass, for invalid inputs or when ``set_messages``
+            targets a checkpoint that holds no messages yet (AC-151, AC-155).
         CheckpointNotFoundError: If the checkpoint does not exist for the thread.
         GraphSpecError: If the factory does not return a usable graph on the sandbox.
     """

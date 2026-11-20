@@ -25,6 +25,7 @@ from langgraph_checkpoint_relate.errors import (
     CheckpointNotFoundError,
     GraphSpecError,
     RelateCheckpointError,
+    ReplayInputError,
 )
 from langgraph_checkpoint_relate.forensics import RelateForensics
 from langgraph_checkpoint_relate.models import (
@@ -234,9 +235,7 @@ def _replay_with_graph(
         _print_diff(result.diff)
     except typer.Exit:
         raise
-    except GraphSpecError as exc:
-        raise _fail(str(exc)) from exc
-    except ValueError as exc:
+    except (GraphSpecError, ReplayInputError) as exc:
         raise _fail(str(exc)) from exc
     except CheckpointNotFoundError as exc:
         raise _fail(str(exc)) from exc

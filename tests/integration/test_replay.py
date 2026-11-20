@@ -40,7 +40,12 @@ if _PROJECT_ROOT not in sys.path:
 
 import langgraph_checkpoint_relate as package
 from langgraph_checkpoint_relate import replay as replay_module
-from langgraph_checkpoint_relate.errors import GraphSpecError, RelateConnectionError
+from langgraph_checkpoint_relate.errors import (
+    GraphSpecError,
+    RelateCheckpointError,
+    RelateConnectionError,
+    ReplayInputError,
+)
 from langgraph_checkpoint_relate.models import RunDiff, RunSnapshot
 from langgraph_checkpoint_relate.replay import (
     load_graph_factory,
@@ -406,6 +411,35 @@ def test_ac97_factory_that_ignores_the_checkpointer_is_rejected_before_any_node_
     _assert_closed(captured_sandboxes[0])
 
 
+def test_ac155_factory_without_a_checkpointer_parameter_is_a_graph_spec_error(
+    tool_source: RelateSaver, captured_sandboxes: list[RelateSaver]
+) -> None:
+    def build() -> Any:
+        return create_tool_agent_graph(checkpointer=None)
+
+    first = _by_step(tool_source, THREAD_ID)[-1]
+
+    with pytest.raises(GraphSpecError, match="checkpointer"):
+        replay_from_checkpoint(tool_source, THREAD_ID, first, build)
+
+    _assert_closed(captured_sandboxes[0])
+
+
+def test_ac155_replay_input_error_is_a_value_error_and_a_checkpoint_error(
+    tool_source: RelateSaver,
+) -> None:
+    fork = _by_step(tool_source, THREAD_ID)[0]
+
+    with pytest.raises(ReplayInputError, match="out of range") as raised:
+        replay_from_checkpoint(
+            tool_source, THREAD_ID, fork, create_tool_agent_graph, set_messages={5: "x"}
+        )
+
+    assert isinstance(raised.value, ValueError)
+    assert isinstance(raised.value, RelateCheckpointError)
+    assert not isinstance(raised.value, GraphSpecError)
+
+
 # ---------------------------------------------------------------------------
 # Replay behavior (AC-98..AC-103, AC-151)
 # ---------------------------------------------------------------------------
@@ -677,6 +711,7 @@ def test_ac108_time_travel_engine_replay_returns_the_same_diff(tool_source: Rela
         "RelateReadOnlyError",
         "RelateSaver",
         "RelateSerializationError",
+        "ReplayInputError",
         "RootCauseReport",
         "TimeTravelEngine",
         "fork_in_memory",

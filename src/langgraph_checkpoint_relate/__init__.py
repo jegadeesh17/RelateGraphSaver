@@ -10,6 +10,7 @@ from langgraph_checkpoint_relate.errors import (
     RelateConnectionError,
     RelateReadOnlyError,
     RelateSerializationError,
+    ReplayInputError,
 )
 from langgraph_checkpoint_relate.forensics import RelateForensics
 from langgraph_checkpoint_relate.models import (
@@ -51,6 +52,7 @@ __all__ = [
     "RelateReadOnlyError",
     "RelateSaver",
     "RelateSerializationError",
+    "ReplayInputError",
     "ReplayResult",
     "RootCauseReport",
     "RunDiff",
