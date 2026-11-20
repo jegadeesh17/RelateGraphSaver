@@ -796,3 +796,121 @@ class TestFailureSummary:
         ]
         assert report.root_tool_call_id == call_id
         assert report.root_tool_name == summary[0].tool_name
+
+    def test_ac163_trace_root_cause_detects_write_linked_failed_tool_call(self) -> None:
+        """AC-163: a thread whose only failed ToolCall is Write-linked is detected by trace_root_cause."""
+        thread_id, call_id = "t-write-fail", "call-write-fail"
+        with RelateSaver(":memory:") as saver:
+            _run_summary_thread(saver, thread_id, call_id, "parse_manifest", "manifest-url-1")
+            rows = saver.proxy.execute_read(
+                "MATCH (c:Checkpoint)-[:INVOKED]->(tc:ToolCall {call_id: $call_id}) "
+                "RETURN c.checkpoint_id AS checkpoint_id",
+                {"call_id": call_id},
+            )
+            assert rows, "the run must record the failing call on a checkpoint"
+            checkpoint_id = str(rows[0]["checkpoint_id"])
+
+            # Move the link from the checkpoint to a Write node (without creating any __error__ write).
+            saver.proxy.execute_write(
+                "MATCH (:Checkpoint)-[r:INVOKED]->(:ToolCall {call_id: $call_id}) DELETE r",
+                {"call_id": call_id},
+            )
+            saver.proxy.execute_write(
+                "MATCH (c:Checkpoint {checkpoint_id: $cid}) "
+                "CREATE (w:Write {write_id: 'w-task', thread_id: $thread_id, "
+                "  checkpoint_ns: '', checkpoint_id: $cid, task_id: 'task-w', "
+                "  channel: 'results', idx: 0}) "
+                "CREATE (c)-[:HAS_WRITE]->(w)",
+                {
+                    "cid": checkpoint_id,
+                    "thread_id": thread_id,
+                },
+            )
+            saver.proxy.execute_write(
+                "MATCH (w:Write {write_id: 'w-task'}), (tc:ToolCall {call_id: $call_id}) "
+                "CREATE (w)-[:INVOKED]->(tc)",
+                {"call_id": call_id},
+            )
+
+            # Confirm no __error__ write exists for this thread
+            error_writes = saver.proxy.execute_read(
+                "MATCH (c:Checkpoint {thread_id: $thread_id})-[:HAS_WRITE]->(w:Write) "
+                "WHERE w.channel = '__error__' RETURN w",
+                {"thread_id": thread_id},
+            )
+            assert not error_writes
+
+            with RelateForensics(saver) as forensics:
+                report = forensics.trace_root_cause(thread_id)
+                summary = forensics.failure_summary()
+
+        assert report.root_tool_call_id == call_id
+        assert report.root_tool_name == "parse_manifest"
+        assert report.error_checkpoint_id
+        assert [(s.tool_name, s.failures, s.total_calls, s.threads) for s in summary] == [
+            ("parse_manifest", 1, 1, (thread_id,))
+        ]
+        assert report.root_tool_name == summary[0].tool_name
+
+    def test_ac164_failure_summary_fanout_origin_nodes_listed_separately(self) -> None:
+        """AC-164: a fan-out step with multiple concurrent writing nodes lists origin nodes separately."""
+
+        class FanoutState(TypedDict):
+            target: str
+            extra: str
+            messages: list[Any]
+
+        def fetcher(state: FanoutState) -> dict[str, Any]:
+            return {"target": "manifest-url-1"}
+
+        def parser(state: FanoutState) -> dict[str, Any]:
+            return {"extra": "parsed"}
+
+        def agent(state: FanoutState) -> dict[str, Any]:
+            call = {"id": "call-fanout", "name": "parse_manifest", "args": {"url": state["target"]}}
+            return {"messages": [AIMessage(content="", tool_calls=[call])]}
+
+        builder = StateGraph(FanoutState)
+        builder.add_node("fetcher", fetcher)
+        builder.add_node("parser", parser)
+        builder.add_node("agent", agent)
+        builder.add_node("tools", ToolNode(SUMMARY_TOOLS, handle_tool_errors=True))
+        builder.add_edge(START, "fetcher")
+        builder.add_edge(START, "parser")
+        builder.add_edge("fetcher", "agent")
+        builder.add_edge("parser", "agent")
+        builder.add_edge("agent", "tools")
+        builder.add_edge("tools", END)
+
+        with RelateSaver(":memory:") as saver:
+            builder.compile(checkpointer=saver).invoke(
+                {"messages": [HumanMessage(content="go")], "target": "", "extra": ""},
+                {"configurable": {"thread_id": "t-fanout"}},
+            )
+            with RelateForensics(saver) as forensics:
+                summary = forensics.failure_summary()
+                report = forensics.trace_root_cause("t-fanout")
+                origin = forensics.trace_argument_origin(
+                    "t-fanout", report.error_checkpoint_id, {"url": "manifest-url-1"}
+                )
+
+        assert len(summary) == 1
+        # AC-164: distinct separate string elements in origin_nodes, not single joined string
+        assert summary[0].origin_nodes == ("fetcher", "parser")
+        # trace_argument_origin(...).node remains a joined string (unchanged public behavior)
+        assert origin is not None
+        assert origin.node == "fetcher, parser"
+        assert report.origin_node == "fetcher, parser"
+
+    def test_ac164_failure_summary_origin_nodes_unknown_when_not_found(self) -> None:
+        """AC-164: when origin writing nodes cannot be determined, '<unknown>' is reported."""
+        thread_id, call_id = "t-unknown-node", "call-unknown-node"
+        with RelateSaver(":memory:") as saver:
+            _run_summary_thread(saver, thread_id, call_id, "parse_manifest", "manifest-url-1")
+            with RelateForensics(saver) as forensics:
+                # Monkeypatch _writing_nodes to return empty tuple (unknown)
+                forensics._writing_nodes = lambda cid, tid: ()  # type: ignore[assignment]
+                summary = forensics.failure_summary()
+
+        assert len(summary) == 1
+        assert summary[0].origin_nodes == ("<unknown>",)

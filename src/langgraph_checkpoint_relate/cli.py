@@ -34,7 +34,11 @@ from langgraph_checkpoint_relate.models import (
     RunDiff,
     ToolCallChange,
 )
-from langgraph_checkpoint_relate.replay import load_graph_factory, replay_from_checkpoint
+from langgraph_checkpoint_relate.replay import (
+    is_update_state_error,
+    load_graph_factory,
+    replay_from_checkpoint,
+)
 from langgraph_checkpoint_relate.saver import RelateSaver
 from langgraph_checkpoint_relate.time_travel import TimeTravelEngine
 from langgraph_checkpoint_relate.visualizer import DAGVisualizer
@@ -120,13 +124,15 @@ def _parse_set_messages(raw_items: list[str]) -> dict[int, str]:
 
 def _print_wide(table: Table) -> None:
     """Print a table at its natural width so cell text such as ``error -> ok`` never wraps."""
+    # Rich Console.print(width=) clamps to min(width, console.width); save/restore _width directly
+    original_width = console._width
     natural_width = console.measure(table, options=console.options.update_width(10_000)).maximum
     available_width = console.width
-    console.width = max(natural_width, available_width)
+    console._width = max(natural_width, available_width)
     try:
         console.print(table)
     finally:
-        console.width = available_width
+        console._width = original_width
 
 
 def _argument_changes(change: ToolCallChange) -> str:
@@ -223,10 +229,18 @@ def _replay_with_graph(
         console.print("[bold green]Graph replay completed in an isolated sandbox.[/bold green]")
         console.print("[bold cyan]Replay result[/bold cyan]")
         console.print(f"  Source Thread:        [cyan]{escape(thread_id)}[/cyan]")
-        console.print(f"  Fork checkpoint:      [cyan]{result.fork_checkpoint_id}[/cyan]")
-        console.print(f"  Updated checkpoint:   [cyan]{result.updated_checkpoint_id}[/cyan]")
-        console.print(f"  New final:            [cyan]{result.final_checkpoint_id}[/cyan]")
-        console.print(f"  Recorded final:       [cyan]{result.recorded_checkpoint_id}[/cyan]")
+        console.print(
+            f"  Fork checkpoint:      [cyan]{escape(str(result.fork_checkpoint_id))}[/cyan]"
+        )
+        console.print(
+            f"  Updated checkpoint:   [cyan]{escape(str(result.updated_checkpoint_id))}[/cyan]"
+        )
+        console.print(
+            f"  New final:            [cyan]{escape(str(result.final_checkpoint_id))}[/cyan]"
+        )
+        console.print(
+            f"  Recorded final:       [cyan]{escape(str(result.recorded_checkpoint_id))}[/cyan]"
+        )
         stopped = "yes" if result.interrupted else "no"
         console.print(f"  Stopped at interrupt: [bold yellow]{stopped}[/bold yellow]")
         console.print(
@@ -242,11 +256,13 @@ def _replay_with_graph(
     except RelateCheckpointError as exc:
         raise _fail(f"Database error: {exc}") from exc
     except InvalidUpdateError as exc:
-        err_console.print(f"[bold red]Error:[/bold red] {escape(str(exc))}")
-        err_console.print(
-            "Hint: pass --as-node with the node that should be treated as the writer."
-        )
-        raise typer.Exit(code=1) from exc
+        if is_update_state_error(exc):
+            err_console.print(f"[bold red]Error:[/bold red] {escape(str(exc))}")
+            err_console.print(
+                "Hint: pass --as-node with the node that should be treated as the writer."
+            )
+            raise typer.Exit(code=1) from exc
+        raise _fail(f"replay failed: {type(exc).__name__}: {exc}") from exc
     except Exception as exc:
         raise _fail(f"replay failed: {type(exc).__name__}: {exc}") from exc
     finally:
@@ -275,7 +291,7 @@ def tree(
         raise typer.Exit(code=1)
 
     if db != ":memory:" and not os.path.exists(db):
-        err_console.print(f"[bold red]Error:[/bold red] Database file not found: {db}")
+        err_console.print(f"[bold red]Error:[/bold red] Database file not found: {escape(db)}")
         raise typer.Exit(code=1)
 
     try:
@@ -285,13 +301,13 @@ def tree(
     except typer.Exit:
         raise
     except CheckpointNotFoundError as exc:
-        err_console.print(f"[bold red]Error:[/bold red] {exc}")
+        err_console.print(f"[bold red]Error:[/bold red] {escape(str(exc))}")
         raise typer.Exit(code=1) from exc
     except RelateCheckpointError as exc:
-        err_console.print(f"[bold red]Error:[/bold red] Database error: {exc}")
+        err_console.print(f"[bold red]Error:[/bold red] Database error: {escape(str(exc))}")
         raise typer.Exit(code=1) from exc
     except Exception as exc:
-        err_console.print(f"[bold red]Error:[/bold red] Unexpected error: {exc}")
+        err_console.print(f"[bold red]Error:[/bold red] Unexpected error: {escape(str(exc))}")
         raise typer.Exit(code=1) from exc
 
 
@@ -365,7 +381,7 @@ def replay(
         raise typer.Exit(code=1)
 
     if db != ":memory:" and not os.path.exists(db):
-        err_console.print(f"[bold red]Error:[/bold red] Database file not found: {db}")
+        err_console.print(f"[bold red]Error:[/bold red] Database file not found: {escape(db)}")
         raise typer.Exit(code=1)
 
     if graph is None:
@@ -411,9 +427,9 @@ def replay(
 
         target_thread = branch if branch else thread_id
         console.print("[bold green]Sandboxed replay initialized successfully.[/bold green]")
-        console.print(f"  Source Thread:    [cyan]{thread_id}[/cyan]")
-        console.print(f"  Replay Thread:    [cyan]{target_thread}[/cyan]")
-        console.print(f"  Checkpoint ID:    [cyan]{effective_checkpoint_id}[/cyan]")
+        console.print(f"  Source Thread:    [cyan]{escape(thread_id)}[/cyan]")
+        console.print(f"  Replay Thread:    [cyan]{escape(target_thread)}[/cyan]")
+        console.print(f"  Checkpoint ID:    [cyan]{escape(effective_checkpoint_id)}[/cyan]")
         console.print(f"  Replay Step:      [bold yellow]{step}[/bold yellow]")
         console.print("  Isolation:        Isolated :memory: sandbox (source database unchanged)")
         console.print(
@@ -422,13 +438,13 @@ def replay(
     except typer.Exit:
         raise
     except CheckpointNotFoundError as exc:
-        err_console.print(f"[bold red]Error:[/bold red] {exc}")
+        err_console.print(f"[bold red]Error:[/bold red] {escape(str(exc))}")
         raise typer.Exit(code=1) from exc
     except RelateCheckpointError as exc:
-        err_console.print(f"[bold red]Error:[/bold red] Database error: {exc}")
+        err_console.print(f"[bold red]Error:[/bold red] Database error: {escape(str(exc))}")
         raise typer.Exit(code=1) from exc
     except Exception as exc:
-        err_console.print(f"[bold red]Error:[/bold red] Unexpected error: {exc}")
+        err_console.print(f"[bold red]Error:[/bold red] Unexpected error: {escape(str(exc))}")
         raise typer.Exit(code=1) from exc
     finally:
         if sandboxed_saver is not None:
@@ -507,40 +523,40 @@ def forensics_loops(
         raise typer.Exit(code=1)
 
     if db != ":memory:" and not os.path.exists(db):
-        err_console.print(f"[bold red]Error:[/bold red] Database file not found: {db}")
+        err_console.print(f"[bold red]Error:[/bold red] Database file not found: {escape(db)}")
         raise typer.Exit(code=1)
 
     try:
         with _open_inspection_saver(db) as saver, RelateForensics(saver) as forensics_engine:
             reports = forensics_engine.detect_loops(thread_id, threshold=threshold)
             if reports:
-                table = Table(title=f"Detected Loops: {thread_id}")
+                table = Table(title=f"Detected Loops: {escape(thread_id)}")
                 table.add_column("Cycle Nodes", style="cyan")
                 table.add_column("Occurrences", justify="right", style="magenta")
                 table.add_column("First Checkpoint", style="green")
                 table.add_column("Last Checkpoint", style="yellow")
                 for rep in reports:
                     table.add_row(
-                        " -> ".join(rep.cycle_nodes),
+                        escape(" -> ".join(rep.cycle_nodes)),
                         str(rep.occurrence_count),
-                        rep.checkpoint_id_range[0],
-                        rep.checkpoint_id_range[1],
+                        escape(str(rep.checkpoint_id_range[0])),
+                        escape(str(rep.checkpoint_id_range[1])),
                     )
                 console.print(table)
             else:
                 console.print(
-                    f"[green]OK[/green] No loops or repeating cycles detected in thread '{thread_id}' (threshold: {threshold})."
+                    f"[green]OK[/green] No loops or repeating cycles detected in thread '{escape(thread_id)}' (threshold: {threshold})."
                 )
     except typer.Exit:
         raise
     except CheckpointNotFoundError as exc:
-        err_console.print(f"[bold red]Error:[/bold red] {exc}")
+        err_console.print(f"[bold red]Error:[/bold red] {escape(str(exc))}")
         raise typer.Exit(code=1) from exc
     except RelateCheckpointError as exc:
-        err_console.print(f"[bold red]Error:[/bold red] Database error: {exc}")
+        err_console.print(f"[bold red]Error:[/bold red] Database error: {escape(str(exc))}")
         raise typer.Exit(code=1) from exc
     except Exception as exc:
-        err_console.print(f"[bold red]Error:[/bold red] Unexpected error: {exc}")
+        err_console.print(f"[bold red]Error:[/bold red] Unexpected error: {escape(str(exc))}")
         raise typer.Exit(code=1) from exc
 
 
@@ -730,8 +746,8 @@ def forensics_diagnose(
                     table.add_row(
                         escape(" -> ".join(rep.cycle_nodes)),
                         str(rep.occurrence_count),
-                        rep.checkpoint_id_range[0],
-                        rep.checkpoint_id_range[1],
+                        escape(str(rep.checkpoint_id_range[0])),
+                        escape(str(rep.checkpoint_id_range[1])),
                     )
                 console.print(table)
             else:

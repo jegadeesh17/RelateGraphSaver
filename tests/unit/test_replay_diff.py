@@ -412,3 +412,73 @@ def test_ac106_the_display_marker_appears_only_on_values_longer_than_the_limit()
     assert [(m.channel, m.before, m.after) for m in diff.messages] == [
         ("messages[1]", "human: one", "human: two")
     ]
+
+
+def test_ac106_auxiliary_channel_list_of_messages_differing_only_in_id_is_empty_diff() -> None:
+    # AC-106, ADR-0024: list of messages in auxiliary channel normalized per AC-106.
+    recorded = _snapshot(channels={"scratchpad": [AIMessage(content="draft", id="msg-1")]})
+    replayed = _snapshot(channels={"scratchpad": [AIMessage(content="draft", id="msg-2")]})
+
+    diff = diff_runs(recorded, replayed)
+
+    assert diff.is_empty
+
+
+def test_ac106_dict_channel_with_different_key_order_gives_empty_diff() -> None:
+    # AC-106, ADR-0024: dict key order is ignored under ==.
+    recorded = _snapshot(channels={"config": {"first": 1, "second": 2}})
+    replayed = _snapshot(channels={"config": {"second": 2, "first": 1}})
+
+    diff = diff_runs(recorded, replayed)
+
+    assert diff.is_empty
+
+
+def test_ac106_changed_value_in_non_message_channel_reports_repr_before_and_after() -> None:
+    # AC-106, ADR-0024: changed value in a non-message channel is reported with repr(value).
+    recorded = _snapshot(channels={"counter": 10, "meta": {"status": "pending"}})
+    replayed = _snapshot(channels={"counter": 20, "meta": {"status": "done"}})
+
+    diff = diff_runs(recorded, replayed)
+
+    assert [(c.channel, c.kind, c.before, c.after) for c in diff.channels] == [
+        ("counter", "changed", "10", "20"),
+        ("meta", "changed", "{'status': 'pending'}", "{'status': 'done'}"),
+    ]
+
+
+def test_ac106_plain_dict_id_keys_in_channel_are_not_stripped() -> None:
+    # ADR-0024: Plain-dict id keys outside messages are not stripped.
+    recorded = _snapshot(channels={"entity": {"id": "ent-1", "name": "sample"}})
+    replayed = _snapshot(channels={"entity": {"id": "ent-2", "name": "sample"}})
+
+    diff = diff_runs(recorded, replayed)
+
+    assert [(c.channel, c.kind, c.before, c.after) for c in diff.channels] == [
+        (
+            "entity",
+            "changed",
+            "{'id': 'ent-1', 'name': 'sample'}",
+            "{'id': 'ent-2', 'name': 'sample'}",
+        ),
+    ]
+
+
+def test_ac106_nested_dict_and_tuple_channels_differing_in_key_order_gives_empty_diff() -> None:
+    # AC-106, ADR-0024: nested collections compared by value recursively ignore dict ordering.
+    recorded = _snapshot(
+        channels={
+            "nested": [{"a": 1, "b": 2}, {"c": [10, 20]}],
+            "coords": (10, 20),
+        }
+    )
+    replayed = _snapshot(
+        channels={
+            "nested": [{"b": 2, "a": 1}, {"c": (10, 20)}],
+            "coords": [10, 20],
+        }
+    )
+
+    diff = diff_runs(recorded, replayed)
+
+    assert diff.is_empty

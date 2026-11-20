@@ -32,6 +32,7 @@ from examples.tool_agent import (
 )
 from langchain_core.messages import HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
+from langgraph.errors import InvalidUpdateError
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
@@ -49,6 +50,7 @@ from langgraph_checkpoint_relate.errors import (
 )
 from langgraph_checkpoint_relate.models import RunDiff, RunSnapshot
 from langgraph_checkpoint_relate.replay import (
+    is_update_state_error,
     load_graph_factory,
     replay_from_checkpoint,
     snapshot_run,
@@ -931,3 +933,78 @@ def test_ac156_set_messages_accepts_add_messages_with_a_format_argument() -> Non
         assert result.updated_checkpoint_id
     finally:
         source.close()
+
+
+def test_ac162_import_succeeds_when_state_graph_not_subscriptable() -> None:
+    """Importing the package succeeds even when StateGraph cannot be parametrized at runtime."""
+    script = textwrap.dedent(
+        """
+        import langgraph.graph
+
+        def _raising_class_getitem(cls, item):
+            raise TypeError("StateGraph is not subscriptable")
+
+        langgraph.graph.StateGraph.__class_getitem__ = classmethod(_raising_class_getitem)
+        import langgraph_checkpoint_relate
+        import langgraph_checkpoint_relate.replay
+        from langgraph_checkpoint_relate.replay import GraphFactory
+        """
+    )
+    env = {**os.environ, "PYTHONPATH": _SRC_DIR}
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, f"Import failed with stderr:\n{result.stderr}"
+
+
+def test_ac165_file_spec_without_attribute_delimiter_is_rejected() -> None:
+    """A file-path graph spec without an attribute delimiter is rejected with a helpful message."""
+    with pytest.raises(
+        GraphSpecError,
+        match="must look like 'module:attribute' or 'path/to/file.py:attribute'",
+    ):
+        load_graph_factory(r"C:\work\graph.py")
+
+    with pytest.raises(
+        GraphSpecError,
+        match="must look like 'module:attribute' or 'path/to/file.py:attribute'",
+    ):
+        load_graph_factory("path/to/graph.py")
+
+
+def test_ac165_absolute_path_spec_with_attribute_loads_cleanly(tmp_path: Path) -> None:
+    """An absolute file path spec with ':attribute' loads the factory successfully."""
+    agent_file = tmp_path / "agent.py"
+    agent_file.write_text(_AGENT_FILE, encoding="utf-8")
+
+    factory = load_graph_factory(f"{agent_file.resolve()}:make")
+    assert callable(factory)
+    assert factory.__name__ == "make"
+
+
+def test_ac166_invalid_update_error_during_update_state_is_tagged(
+    research_source: RelateSaver,
+) -> None:
+    """AC-166: InvalidUpdateError during update_state carries note tagging it as such."""
+    fork = _checkpoint_before_human_review(research_source)
+    with pytest.raises(InvalidUpdateError) as exc_info:
+        replay_from_checkpoint(
+            research_source,
+            RESEARCH_THREAD_ID,
+            fork,
+            create_research_graph,
+            update={"plan": ["edited plan"]},
+            as_node="non_existent_node",
+        )
+    assert is_update_state_error(exc_info.value)
+
+
+def test_ac166_is_update_state_error_false_for_untagged_exception() -> None:
+    """AC-166: is_update_state_error returns False for an exception without the update note."""
+    exc = InvalidUpdateError("regular invalid update")
+    assert not is_update_state_error(exc)
+    assert not is_update_state_error(ValueError("other"))
