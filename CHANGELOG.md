@@ -49,6 +49,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.4
 - Tool-call capture sends only new statements per saver (ADR-0011) and commits without its own flush; the store is flushed on close (ADR-0014).
 
 ### Fixed
+- `relate-dag replay --graph` no longer hides an exception raised by the user's graph behind a bare `Error:` line: it prints `replay failed: <Type>: <message>`, a factory that does not accept `checkpointer=` raises `GraphSpecError`, and invalid replay inputs raise `ReplayInputError`, a `ValueError` subclass (AC-155, ADR-0022).
+- `replay_from_checkpoint(..., set_messages=...)` rejects a graph whose `messages` channel is not reduced by `add_messages` instead of silently dropping the unedited messages (AC-156, ADR-0022).
+- The replay diff compares full message content and AI tool-call names and arguments, so changes after the first 120 characters are reported; the shown text is still truncated (AC-106, AC-159, ADR-0023).
+- `failure_summary()` counts failing tool calls linked through a `:Write`, as `trace_root_cause()` already did (AC-158).
+- `trace_root_cause()` resolves the failure checkpoint once per trace instead of twice (ADR-0021).
+- `relate-dag forensics trace-error` and `relate-dag forensics` print stored error text and thread ids containing Rich markup literally instead of failing (AC-160).
+- `examples/build_demo_store.py` reports unreadable lookup arguments as an unreachable PyPI instead of an unrelated `TypeError` (AC-136).
 - `trace_root_cause()` reports the same error checkpoint and origin hop count on every run for a failed tool call, whichever step the tool call is attached to (ADR-0021).
 - `mypy src tests` passes on a `dev`-only install, without the optional `llm` extra.
 - `examples/build_demo_store.py` refuses to overwrite the recorded LLM store, and `examples/openrouter_agent.py` refuses to add a second run to a thread that already holds one.
