@@ -7,6 +7,7 @@ and boundary error handling (AC-24, AC-32).
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 import re
 import shutil
@@ -25,8 +26,12 @@ from langgraph.checkpoint.base import empty_checkpoint
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
+from rich.console import Console
+from rich.errors import MarkupError
+from rich.table import Table
 from typer.testing import CliRunner
 
+from langgraph_checkpoint_relate import cli
 from langgraph_checkpoint_relate.cli import app
 from langgraph_checkpoint_relate.saver import RelateSaver
 
@@ -1546,7 +1551,84 @@ def test_ac160_error_paths_print_markup_like_text_literally(
 
     assert unknown.exit_code == 1
     assert "[/b]-[red]x[/red]" in _flatten(unknown.output)
-    assert "MarkupError" not in repr(unknown)
+    assert unknown.exception is None or isinstance(unknown.exception, SystemExit)
     assert missing.exit_code == 1
     assert "Database file not found" in missing.output
     assert "gone-[red]x[bold].rl" in _flatten(missing.output)
+
+
+@pytest.mark.parametrize(
+    "command_args",
+    [
+        ["tree", "run[/x]"],
+        ["forensics", "loops", "run[/x]"],
+        ["replay", "run[/x]", "chk-1"],
+    ],
+)
+def test_ac161_markup_thread_id_exits_one_without_markup_error(
+    runner: CliRunner, tmp_path: Path, command_args: list[str]
+) -> None:
+    """AC-161: tree, loops and replay exit 1 with literal text and result.exception not MarkupError."""
+    db_file = str(tmp_path / "markup_store.rl")
+    _seed_markup_error_store(db_file, "markup-thread")
+
+    result = runner.invoke(app, [*command_args, "--db", db_file])
+
+    assert result.exit_code == 1
+    assert "run[/x]" in _flatten(result.output)
+    assert not isinstance(result.exception, MarkupError)
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+
+
+@pytest.mark.parametrize(
+    "command_args",
+    [
+        ["tree", "any-thread"],
+        ["forensics", "loops", "any-thread"],
+        ["replay", "any-thread", "chk-1"],
+    ],
+)
+def test_ac161_missing_db_with_markup_name_prints_literally(
+    runner: CliRunner, tmp_path: Path, command_args: list[str]
+) -> None:
+    """AC-161: a missing --db named [red]missing.rl prints literally for tree, loops, and replay."""
+    missing_db = str(tmp_path / "[red]missing.rl")
+
+    result = runner.invoke(app, [*command_args, "--db", missing_db])
+
+    assert result.exit_code == 1
+    assert "Database file not found" in result.output
+    assert "[red]missing.rl" in _flatten(result.output)
+    assert not isinstance(result.exception, MarkupError)
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+
+
+def test_ac161_loops_prints_markup_thread_id_literally(runner: CliRunner, tmp_path: Path) -> None:
+    """AC-161: loops on a tmp store containing a thread named [bold]x prints literally without styling."""
+    db_file = str(tmp_path / "bold_thread.rl")
+    thread_id = "[bold]x"
+    _seed_markup_error_store(db_file, thread_id)
+
+    result = runner.invoke(app, ["forensics", "loops", thread_id, "--db", db_file])
+
+    assert result.exit_code == 0, result.output
+    assert "[bold]x" in result.output
+    assert not isinstance(result.exception, MarkupError)
+
+
+def test_ac167_print_wide_preserves_console_width(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AC-167: _print_wide preserves and restores console._width to pre-call value (None)."""
+    fake_stream = io.StringIO()
+    test_console = Console(file=fake_stream)
+    monkeypatch.setattr(cli, "console", test_console)
+
+    assert test_console._width is None
+
+    table = Table(title="Wide Table")
+    table.add_column("Column 1")
+    table.add_row("Value 1")
+
+    cli._print_wide(table)
+
+    assert test_console._width is None
+    assert "Wide Table" in fake_stream.getvalue()
