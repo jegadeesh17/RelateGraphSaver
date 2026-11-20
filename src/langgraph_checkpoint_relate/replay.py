@@ -21,6 +21,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias
 
+from langchain_core.messages import BaseMessage
 from langgraph.channels.binop import BinaryOperatorAggregate
 from langgraph.graph import StateGraph
 from langgraph.graph.message import add_messages
@@ -250,15 +251,13 @@ def _normalize(value: Any) -> Any:
     return value
 
 
-def _message_preview(message: Any) -> tuple[_MessageKey, str]:
-    """Return ``(key, shown)``: what decides equality and the text to display.
+def _message_key(message: Any) -> _MessageKey:
+    """Return the normalized comparison key for a message (AC-106, ADR-0023).
 
-    ``key`` holds the message type, the full content and the ``(name, args)`` of each tool call
-    of an AI message, compared by ``==`` and never by ``repr``. String content and tool-call
-    arguments are compared as they are (an argument named ``id`` is a real argument); list
-    content is normalized so that ``id`` keys inside content blocks are ignored. Message ids and
-    tool-call ids are left out. ``shown`` is ``"<type>: <first _MESSAGE_LIMIT
-    characters>"``, with ``...`` appended when the content was longer (AC-106, AC-159, ADR-0023).
+    Holds the message type, the full content and the ``(name, args)`` of each tool call of an
+    AI message, compared by ``==`` and never by ``repr``. String content and tool-call
+    arguments are compared as they are; list content is normalized so that ``id`` keys inside
+    content blocks are ignored. Message ids and tool-call ids are left out.
     """
     kind = str(getattr(message, "type", type(message).__name__))
     content = getattr(message, "content", message)
@@ -267,11 +266,44 @@ def _message_preview(message: Any) -> tuple[_MessageKey, str]:
         (call.get("name"), call.get("args"))
         for call in (getattr(message, "tool_calls", None) or [])
     )
+    return (kind, full, tool_calls)
+
+
+def _message_preview(message: Any) -> tuple[_MessageKey, str]:
+    """Return ``(key, shown)``: what decides equality and the text to display.
+
+    ``key`` is computed by :func:`_message_key`. String content and tool-call
+    arguments are compared as they are (an argument named ``id`` is a real argument); list
+    content is normalized so that ``id`` keys inside content blocks are ignored. Message ids and
+    tool-call ids are left out. ``shown`` is ``"<type>: <first _MESSAGE_LIMIT
+    characters>"``, with ``...`` appended when the content was longer (AC-106, AC-159, ADR-0023).
+    """
+    kind = str(getattr(message, "type", type(message).__name__))
+    content = getattr(message, "content", message)
     text = str(content)
     shown = f"{kind}: {text[:_MESSAGE_LIMIT]}"
     if len(text) > _MESSAGE_LIMIT:
         shown += "..."
-    return (kind, full, tool_calls), shown
+    return _message_key(message), shown
+
+
+def _channel_key(value: Any) -> Any:
+    """Return a comparison key for a channel value (ADR-0024).
+
+    Messages are normalized with :func:`_message_key` so random ids do not trigger diffs;
+    lists and tuples are mapped elementwise; dicts are mapped key-by-key preserving dict
+    ``id`` keys; scalars (str, int, float, bool, None) are returned directly; and any
+    other object falls back to its ``repr``.
+    """
+    if isinstance(value, BaseMessage):
+        return _message_key(value)
+    if isinstance(value, (list, tuple)):
+        return [_channel_key(item) for item in value]
+    if isinstance(value, dict):
+        return {k: _channel_key(v) for k, v in value.items()}
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return repr(value)
 
 
 def _diff_tool_calls(recorded: RunSnapshot, replayed: RunSnapshot) -> tuple[ToolCallChange, ...]:
@@ -320,14 +352,19 @@ def _diff_channels(recorded: RunSnapshot, replayed: RunSnapshot) -> tuple[Channe
     for name in sorted(set(before_channels) | set(after_channels)):
         in_before = name in before_channels
         in_after = name in after_channels
-        before = repr(before_channels[name]) if in_before else None
-        after = repr(after_channels[name]) if in_after else None
         if not in_before:
-            changes.append(ChannelChange(name, "added", None, after))
+            changes.append(ChannelChange(name, "added", None, repr(after_channels[name])))
         elif not in_after:
-            changes.append(ChannelChange(name, "removed", before, None))
-        elif before != after:
-            changes.append(ChannelChange(name, "changed", before, after))
+            changes.append(ChannelChange(name, "removed", repr(before_channels[name]), None))
+        elif _channel_key(before_channels[name]) != _channel_key(after_channels[name]):
+            changes.append(
+                ChannelChange(
+                    name,
+                    "changed",
+                    repr(before_channels[name]),
+                    repr(after_channels[name]),
+                )
+            )
     return tuple(changes)
 
 
@@ -336,7 +373,7 @@ def diff_runs(recorded: RunSnapshot, replayed: RunSnapshot) -> RunDiff:
 
     Tool calls are matched by ``(tool_name, ordinal)``, never by call id; messages by index, by
     type, full content and the names and arguments of an AI message's tool calls (AC-106,
-    AC-159, ADR-0023); other channels by ``repr``. A changed message is shown as
+    AC-159, ADR-0023); other channels by value (ADR-0024). A changed message is shown as
     ``"<type>: <first 120 characters of content>"``, with ``...`` appended when the content is
     longer, for display only. Checkpoint ids, timestamps, message ids, tool-call ids and
     ``__*`` / ``branch:*`` channels are never compared, so a replay that behaves like the
