@@ -1440,3 +1440,80 @@ def test_failures_is_not_read_as_a_thread_id_rc_04(runner: CliRunner, tmp_path: 
 
     assert "Thread 'failures'" not in result.output
     assert "not found" not in result.output
+
+
+_MARKUP_ERROR_TEXT = "bad tag [/b] and [red]x[/red]"
+
+
+def _seed_markup_error_store(db_file: str, thread_id: str) -> None:
+    """Persist one failed tool call whose error text looks like Rich markup."""
+    with RelateSaver(db_path=db_file) as saver:
+        cfg: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+        cp: Any = dict(empty_checkpoint())
+        cp["id"] = "1f1e314c-8a21-6b3e-8000-000000000001"
+        saved_cfg = saver.put(cfg, cp, {"step": 1, "source": "loop", "parents": {}}, {})
+        ai = AIMessage(
+            content="",
+            tool_calls=[{"id": "call-markup-1", "name": "fetch_source", "args": {}}],
+        )
+        saver.put_writes(saved_cfg, [("messages", [ai])], task_id="task-ai")
+        tool_msg = ToolMessage(
+            content=f"Error: {_MARKUP_ERROR_TEXT}", tool_call_id="call-markup-1", status="error"
+        )
+        saver.put_writes(saved_cfg, [("messages", [tool_msg])], task_id="task-tool")
+
+
+@pytest.mark.parametrize("command", [["forensics", "trace-error"], ["forensics", "diagnose"]])
+def test_ac160_root_cause_panel_prints_stored_markup_literally(
+    runner: CliRunner, tmp_path: Path, command: list[str]
+) -> None:
+    """AC-160: tool error text that looks like Rich markup prints as written, never styled."""
+    db_file = str(tmp_path / "markup.rl")
+    _seed_markup_error_store(db_file, "markup-thread")
+
+    result = runner.invoke(app, [*command, "markup-thread", "--db", db_file])
+
+    assert result.exit_code == 0, result.output
+    assert "Unexpected error" not in result.output
+    assert "[/b]" in result.output
+    assert "[red]x[/red]" in result.output
+
+
+@pytest.mark.parametrize("command", ["trace-error", "diagnose"])
+def test_ac160_markup_like_thread_id_prints_literally(
+    runner: CliRunner, tmp_path: Path, command: str
+) -> None:
+    """AC-160: a thread id that looks like markup is escaped in headings and panel titles."""
+    db_file = str(tmp_path / "markup_thread.rl")
+    thread_id = "t-[red]x[/red]"
+    _seed_markup_error_store(db_file, thread_id)
+
+    result = runner.invoke(app, ["forensics", command, thread_id, "--db", db_file])
+
+    assert result.exit_code == 0, result.output
+    assert "t-[red]x[/red]" in result.output
+    if command == "trace-error":
+        assert "Root Cause Analysis: t-[red]x[/red]" in result.output
+    else:
+        assert "Thread Forensics Diagnostic: t-[red]x[/red]" in result.output
+
+
+@pytest.mark.parametrize("command", ["trace-error", "diagnose"])
+def test_ac160_error_paths_print_markup_like_text_literally(
+    runner: CliRunner, tmp_path: Path, command: str
+) -> None:
+    """AC-160: not-found and missing-file errors echo markup-like input without crashing."""
+    db_file = str(tmp_path / "markup_errors.rl")
+    _seed_markup_error_store(db_file, "markup-thread")
+    thread_id = "no-such-[/b]-[red]x[/red]"
+
+    unknown = runner.invoke(app, ["forensics", command, thread_id, "--db", db_file])
+    missing_db = str(tmp_path / "gone-[red]x[bold].rl")
+    missing = runner.invoke(app, ["forensics", command, "markup-thread", "--db", missing_db])
+
+    assert unknown.exit_code == 1
+    assert "[/b]-[red]x[/red]" in _flatten(unknown.output)
+    assert "MarkupError" not in repr(unknown)
+    assert missing.exit_code == 1
+    assert "Database file not found" in missing.output
+    assert "gone-[red]x[bold].rl" in _flatten(missing.output)

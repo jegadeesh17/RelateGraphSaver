@@ -564,7 +564,7 @@ def forensics_trace_error(
         raise typer.Exit(code=1)
 
     if db != ":memory:" and not os.path.exists(db):
-        err_console.print(f"[bold red]Error:[/bold red] Database file not found: {db}")
+        err_console.print(f"[bold red]Error:[/bold red] Database file not found: {escape(db)}")
         raise typer.Exit(code=1)
 
     try:
@@ -572,32 +572,36 @@ def forensics_trace_error(
             report = forensics_engine.trace_root_cause(thread_id)
             if report.error_message == "No error detected" and not report.error_checkpoint_id:
                 console.print(
-                    f"[green]OK[/green] No error detected in execution thread '{thread_id}'. Workflow completed cleanly."
+                    f"[green]OK[/green] No error detected in execution thread '{escape(thread_id)}'. Workflow completed cleanly."
                 )
             else:
                 panel_content = (
-                    f"[bold cyan]Error Checkpoint ID:[/bold cyan] {report.error_checkpoint_id}\n"
-                    f"[bold red]Error Message:[/bold red]       {report.error_message}\n"
-                    f"[bold yellow]Root Tool Call ID:[/bold yellow]   {report.root_tool_call_id or 'None'}\n"
-                    f"[bold yellow]Root Tool Name:[/bold yellow]      {report.root_tool_name or 'None'}\n"
+                    f"[bold cyan]Error Checkpoint ID:[/bold cyan] {escape(report.error_checkpoint_id)}\n"
+                    f"[bold red]Error Message:[/bold red]       {escape(report.error_message)}\n"
+                    f"[bold yellow]Root Tool Call ID:[/bold yellow]   {escape(report.root_tool_call_id or 'None')}\n"
+                    f"[bold yellow]Root Tool Name:[/bold yellow]      {escape(report.root_tool_name or 'None')}\n"
                     f"{_origin_line(report)}"
-                    f"[bold yellow]Root Channel Write:[/bold yellow]  {report.root_channel_write or 'None'}\n"
+                    f"[bold yellow]Root Channel Write:[/bold yellow]  {escape(report.root_channel_write or 'None')}\n"
                     f"[bold green]Causal Path Length:[/bold green]  {report.causal_path_length} {_PATH_LENGTH_NOTE}\n"
-                    f"[bold white]Diagnostic Summary:[/bold white]  {report.diagnostic_summary}"
+                    f"[bold white]Diagnostic Summary:[/bold white]  {escape(report.diagnostic_summary)}"
                 )
                 console.print(
-                    Panel(panel_content, title=f"Root Cause Analysis: {thread_id}", expand=False)
+                    Panel(
+                        panel_content,
+                        title=f"Root Cause Analysis: {escape(thread_id)}",
+                        expand=False,
+                    )
                 )
     except typer.Exit:
         raise
     except CheckpointNotFoundError as exc:
-        err_console.print(f"[bold red]Error:[/bold red] {exc}")
+        err_console.print(f"[bold red]Error:[/bold red] {escape(str(exc))}")
         raise typer.Exit(code=1) from exc
     except RelateCheckpointError as exc:
-        err_console.print(f"[bold red]Error:[/bold red] Database error: {exc}")
+        err_console.print(f"[bold red]Error:[/bold red] Database error: {escape(str(exc))}")
         raise typer.Exit(code=1) from exc
     except Exception as exc:
-        err_console.print(f"[bold red]Error:[/bold red] Unexpected error: {exc}")
+        err_console.print(f"[bold red]Error:[/bold red] Unexpected error: {escape(str(exc))}")
         raise typer.Exit(code=1) from exc
 
 
@@ -692,7 +696,7 @@ def forensics_diagnose(
         raise typer.Exit(code=1)
 
     if db != ":memory:" and not os.path.exists(db):
-        err_console.print(f"[bold red]Error:[/bold red] Database file not found: {db}")
+        err_console.print(f"[bold red]Error:[/bold red] Database file not found: {escape(db)}")
         raise typer.Exit(code=1)
 
     try:
@@ -704,25 +708,27 @@ def forensics_diagnose(
             count = records[0]["count"] if records else 0
             if count == 0:
                 err_console.print(
-                    f"[bold red]Error:[/bold red] Thread '{thread_id}' not found or contains no checkpoints."
+                    f"[bold red]Error:[/bold red] Thread '{escape(thread_id)}' not found or contains no checkpoints."
                 )
                 raise typer.Exit(code=1)
 
             loops = forensics_engine.detect_loops(thread_id, threshold=threshold)
             root_cause = forensics_engine.trace_root_cause(thread_id)
 
-            console.print(f"[bold cyan]Thread Forensics Diagnostic:[/bold cyan] {thread_id}")
+            console.print(
+                f"[bold cyan]Thread Forensics Diagnostic:[/bold cyan] {escape(thread_id)}"
+            )
             console.print(f"  Total Checkpoints: {count}")
 
             if loops:
-                table = Table(title=f"Detected Loops: {thread_id}")
+                table = Table(title=f"Detected Loops: {escape(thread_id)}")
                 table.add_column("Cycle Nodes", style="cyan")
                 table.add_column("Occurrences", justify="right", style="magenta")
                 table.add_column("First Checkpoint", style="green")
                 table.add_column("Last Checkpoint", style="yellow")
                 for rep in loops:
                     table.add_row(
-                        " -> ".join(rep.cycle_nodes),
+                        escape(" -> ".join(rep.cycle_nodes)),
                         str(rep.occurrence_count),
                         rep.checkpoint_id_range[0],
                         rep.checkpoint_id_range[1],
@@ -733,13 +739,13 @@ def forensics_diagnose(
 
             if root_cause.error_message != "No error detected" and root_cause.error_checkpoint_id:
                 panel_content = (
-                    f"[bold cyan]Error Checkpoint ID:[/bold cyan] {root_cause.error_checkpoint_id}\n"
-                    f"[bold red]Error Message:[/bold red]       {root_cause.error_message}\n"
-                    f"[bold yellow]Root Tool Call ID:[/bold yellow]   {root_cause.root_tool_call_id or 'None'}\n"
-                    f"[bold yellow]Root Tool Name:[/bold yellow]      {root_cause.root_tool_name or 'None'}\n"
-                    f"[bold yellow]Root Channel Write:[/bold yellow]  {root_cause.root_channel_write or 'None'}\n"
+                    f"[bold cyan]Error Checkpoint ID:[/bold cyan] {escape(root_cause.error_checkpoint_id)}\n"
+                    f"[bold red]Error Message:[/bold red]       {escape(root_cause.error_message)}\n"
+                    f"[bold yellow]Root Tool Call ID:[/bold yellow]   {escape(root_cause.root_tool_call_id or 'None')}\n"
+                    f"[bold yellow]Root Tool Name:[/bold yellow]      {escape(root_cause.root_tool_name or 'None')}\n"
+                    f"[bold yellow]Root Channel Write:[/bold yellow]  {escape(root_cause.root_channel_write or 'None')}\n"
                     f"[bold green]Causal Path Length:[/bold green]  {root_cause.causal_path_length} {_PATH_LENGTH_NOTE}\n"
-                    f"[bold white]Diagnostic Summary:[/bold white]  {root_cause.diagnostic_summary}"
+                    f"[bold white]Diagnostic Summary:[/bold white]  {escape(root_cause.diagnostic_summary)}"
                 )
                 console.print(Panel(panel_content, title="Root Cause Analysis", expand=False))
                 console.print("  Status:            ERROR DETECTED")
@@ -749,13 +755,13 @@ def forensics_diagnose(
     except typer.Exit:
         raise
     except CheckpointNotFoundError as exc:
-        err_console.print(f"[bold red]Error:[/bold red] {exc}")
+        err_console.print(f"[bold red]Error:[/bold red] {escape(str(exc))}")
         raise typer.Exit(code=1) from exc
     except RelateCheckpointError as exc:
-        err_console.print(f"[bold red]Error:[/bold red] Database error: {exc}")
+        err_console.print(f"[bold red]Error:[/bold red] Database error: {escape(str(exc))}")
         raise typer.Exit(code=1) from exc
     except Exception as exc:
-        err_console.print(f"[bold red]Error:[/bold red] Unexpected error: {exc}")
+        err_console.print(f"[bold red]Error:[/bold red] Unexpected error: {escape(str(exc))}")
         raise typer.Exit(code=1) from exc
 
 
