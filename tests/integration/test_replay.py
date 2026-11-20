@@ -32,6 +32,7 @@ from examples.tool_agent import (
 )
 from langchain_core.messages import HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
+from langgraph.errors import InvalidUpdateError
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
@@ -49,6 +50,7 @@ from langgraph_checkpoint_relate.errors import (
 )
 from langgraph_checkpoint_relate.models import RunDiff, RunSnapshot
 from langgraph_checkpoint_relate.replay import (
+    is_update_state_error,
     load_graph_factory,
     replay_from_checkpoint,
     snapshot_run,
@@ -980,3 +982,27 @@ def test_ac165_absolute_path_spec_with_attribute_loads_cleanly(tmp_path: Path) -
     factory = load_graph_factory(f"{agent_file.resolve()}:make")
     assert callable(factory)
     assert factory.__name__ == "make"
+
+
+def test_ac166_invalid_update_error_during_update_state_is_tagged(
+    research_source: RelateSaver,
+) -> None:
+    """AC-166: InvalidUpdateError during update_state carries note tagging it as such."""
+    fork = _checkpoint_before_human_review(research_source)
+    with pytest.raises(InvalidUpdateError) as exc_info:
+        replay_from_checkpoint(
+            research_source,
+            RESEARCH_THREAD_ID,
+            fork,
+            create_research_graph,
+            update={"plan": ["edited plan"]},
+            as_node="non_existent_node",
+        )
+    assert is_update_state_error(exc_info.value)
+
+
+def test_ac166_is_update_state_error_false_for_untagged_exception() -> None:
+    """AC-166: is_update_state_error returns False for an exception without the update note."""
+    exc = InvalidUpdateError("regular invalid update")
+    assert not is_update_state_error(exc)
+    assert not is_update_state_error(ValueError("other"))

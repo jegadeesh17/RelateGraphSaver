@@ -34,7 +34,11 @@ from langgraph_checkpoint_relate.models import (
     RunDiff,
     ToolCallChange,
 )
-from langgraph_checkpoint_relate.replay import load_graph_factory, replay_from_checkpoint
+from langgraph_checkpoint_relate.replay import (
+    is_update_state_error,
+    load_graph_factory,
+    replay_from_checkpoint,
+)
 from langgraph_checkpoint_relate.saver import RelateSaver
 from langgraph_checkpoint_relate.time_travel import TimeTravelEngine
 from langgraph_checkpoint_relate.visualizer import DAGVisualizer
@@ -242,11 +246,13 @@ def _replay_with_graph(
     except RelateCheckpointError as exc:
         raise _fail(f"Database error: {exc}") from exc
     except InvalidUpdateError as exc:
-        err_console.print(f"[bold red]Error:[/bold red] {escape(str(exc))}")
-        err_console.print(
-            "Hint: pass --as-node with the node that should be treated as the writer."
-        )
-        raise typer.Exit(code=1) from exc
+        if is_update_state_error(exc):
+            err_console.print(f"[bold red]Error:[/bold red] {escape(str(exc))}")
+            err_console.print(
+                "Hint: pass --as-node with the node that should be treated as the writer."
+            )
+            raise typer.Exit(code=1) from exc
+        raise _fail(f"replay failed: {type(exc).__name__}: {exc}") from exc
     except Exception as exc:
         raise _fail(f"replay failed: {type(exc).__name__}: {exc}") from exc
     finally:

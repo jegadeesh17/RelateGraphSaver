@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, TypeAlias
 
 from langchain_core.messages import BaseMessage
 from langgraph.channels.binop import BinaryOperatorAggregate
+from langgraph.errors import InvalidUpdateError
 from langgraph.graph import StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.pregel import Pregel
@@ -52,6 +53,12 @@ GraphFactory: TypeAlias = "Callable[..., Any] | StateGraph[Any, Any, Any, Any]"
 
 _DETAIL_LIMIT = 120
 _MESSAGE_LIMIT = 120
+_UPDATE_STATE_NOTE = "relate:update_state_error"
+
+
+def is_update_state_error(exc: BaseException) -> bool:
+    """Return whether the exception originated directly from graph.update_state (ADR-0024)."""
+    return _UPDATE_STATE_NOTE in getattr(exc, "__notes__", [])
 
 
 # ---------------------------------------------------------------------------
@@ -591,7 +598,11 @@ def replay_from_checkpoint(
                 step = (fork_state.metadata or {}).get("step", 0)
                 if isinstance(step, int) and step <= 0:
                     node = "__start__"
-            new_cfg = graph.update_state(fork_cfg, values, as_node=node)
+            try:
+                new_cfg = graph.update_state(fork_cfg, values, as_node=node)
+            except InvalidUpdateError as exc:
+                exc.add_note(_UPDATE_STATE_NOTE)
+                raise
             updated_checkpoint_id = str(new_cfg["configurable"]["checkpoint_id"])
 
         graph.invoke(
