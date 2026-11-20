@@ -746,8 +746,8 @@ Status: Accepted
 ### Decision
 
 1. Invalid replay inputs raise `ReplayInputError`, which subclasses both `RelateCheckpointError` and `ValueError`, so the documented `ValueError` contract still holds (AC-151, AC-155). The CLI prints its message as a plain `Error:` line; any other exception from user graph code prints `Error: replay failed: <Type>: <message>`.
-2. A `TypeError` raised while calling the factory with `checkpointer=` becomes a `GraphSpecError` naming `checkpointer`, before any node runs (AC-155).
-3. Before applying `set_messages`, replay checks that the compiled graph's `messages` channel is a `BinaryOperatorAggregate` reduced by `add_messages` (matched by identity, falling back to the function's name and module for wrapped reducers). Otherwise it raises `ReplayInputError` mentioning `add_messages`, and the graph is not run (AC-156).
+2. Before calling a factory, replay checks that its signature accepts `checkpointer=` (`inspect.signature(factory).bind(checkpointer=...)`). Only a failed bind raises `GraphSpecError` naming `checkpointer`, before any node runs (AC-155). A `TypeError` raised inside the factory body is the user's own error: it propagates and the CLI prints `Error: replay failed: TypeError: <message>`. A factory whose signature cannot be inspected is called directly.
+3. Before applying `set_messages`, replay checks that the compiled graph's `messages` channel is a `BinaryOperatorAggregate` reduced by LangGraph's `add_messages`. A `functools.partial` wrapper, such as the one `add_messages(format=...)` returns, is unwrapped first; the function then matches by identity, or by module `langgraph.graph.message` and name for LangGraph's wrapped reducer. A function with the same name from another module does not match, because it would append instead of replacing by id. Otherwise it raises `ReplayInputError` mentioning `add_messages`, and the graph is not run (AC-156).
 4. No code change for no-edit replays: we verified on LangGraph 1.2.22 that `invoke` from the fork checkpoint re-executes the fork step even though its writes were copied, and `updated_checkpoint_id` equals `fork_checkpoint_id`. AC-154 guards this behaviour so a LangGraph upgrade that changes it fails the suite.
 
 ### Alternatives considered
@@ -778,7 +778,7 @@ Status: Accepted
 
 ### Decision
 
-This replaces the message rule in decision 4 of ADR-0017; the rest of ADR-0017 stands. Messages are compared by index on their type, their full content (a string as is, list content by `repr`) and, for AI messages, each tool call's name and `repr` of its arguments (AC-159). Message ids and tool-call ids are never compared, because they are random in every run (AC-106). The text shown for a changed message stays the first 120 characters plus `...` when longer; the marker is never part of the comparison.
+This replaces the message rule in decision 4 of ADR-0017; the rest of ADR-0017 stands. Messages are compared by index with `==`, never by `repr`: two messages are equal when they have the same type, the same content and the same sequence of tool-call `(name, arguments)` pairs (AC-159). String content is compared as is. List content is compared block by block with every `id` key removed at any nesting depth, because content blocks get fresh ids in every run. Dict key order and object reprs therefore never produce a change. Message ids and tool-call ids are never compared, because they are random in every run (AC-106); a tool argument that is itself named `id` is still compared. The text shown for a changed message stays the first 120 characters plus `...` when longer; the marker is never part of the comparison.
 
 ### Alternatives considered
 
