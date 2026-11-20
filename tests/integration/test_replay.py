@@ -859,6 +859,10 @@ class _FormattedMessagesState(TypedDict):
     messages: Annotated[list[Any], add_messages(format="langchain-openai")]
 
 
+class _IdMergingMessagesState(TypedDict):
+    messages: Annotated[list[Any], add_messages]
+
+
 def _echo_graph(state_type: Any, checkpointer: Any = None) -> Any:
     def echo(state: Any) -> dict[str, list[Any]]:
         return {"messages": []}
@@ -877,10 +881,12 @@ def _seed_messages_thread(source: RelateSaver, state_type: Any, thread_id: str) 
         {"messages": [HumanMessage(content=f"message {n}", id=f"m{n}") for n in range(3)]},
         config,
     )
+    # The step 0 checkpoint is the first one that holds the input messages; select it by its
+    # recorded step rather than by position in the history.
     return next(
         str(snap.config["configurable"]["checkpoint_id"])
-        for snap in reversed(list(graph.get_state_history(config)))
-        if snap.values.get("messages")
+        for snap in graph.get_state_history(config)
+        if snap.metadata is not None and snap.metadata.get("step") == 0
     )
 
 
@@ -903,10 +909,16 @@ def test_ac156_set_messages_rejects_a_user_function_named_add_messages() -> None
 
 
 def test_ac156_set_messages_accepts_add_messages_with_a_format_argument() -> None:
-    """``add_messages(format=...)`` is a functools.partial of LangGraph's reducer."""
+    """``add_messages(format=...)`` is a functools.partial of LangGraph's reducer.
+
+    ``format="langchain-openai"`` rebuilds every message without its id, and whether the step 0
+    checkpoint keeps the ids LangGraph assigned depends on when it is serialized relative to the
+    next step mutating the same message objects. So the recorded run is seeded with the plain
+    reducer, which keeps ids, and only the replayed graph uses the formatted one.
+    """
     source = RelateSaver(":memory:")
     try:
-        fork = _seed_messages_thread(source, _FormattedMessagesState, "formatted")
+        fork = _seed_messages_thread(source, _IdMergingMessagesState, "formatted")
 
         result = replay_from_checkpoint(
             source,
