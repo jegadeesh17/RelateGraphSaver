@@ -351,12 +351,15 @@ AC-97: Given a spec with no `:`, a missing file or module, a missing attribute, 
 AC-98: Given the recorded failing tool-agent thread, When `replay_from_checkpoint` runs from its first checkpoint with no update and no message edit, Then the returned `ReplayResult.diff` has no tool-call changes, no message changes and no channel changes.
 AC-99: Given the recorded failing tool-agent thread, When `replay_from_checkpoint` runs from its step 0 checkpoint (the first checkpoint whose state holds the human message) with `set_messages={0: <working URL>}`, Then the diff reports `fetch_source` call 1 changing from error to ok with its `url` argument before and after, and the final answer message differs from the recorded one.
 AC-100: Given a replay with `set_messages={0: <text>}`, When the replayed run finishes, Then its message list holds exactly one human message at index 0, with the new text, and no copy of the original human message.
+AC-156: Given a graph whose `messages` channel is not reduced by `add_messages`, When `replay_from_checkpoint` is called with `set_messages`, Then `ReplayInputError` is raised mentioning `add_messages`, the graph is not run, and the source store is unchanged ([ADR-0022](DECISIONS.md#adr-0022-replay-input-errors-and-message-edit-safety)).
 AC-101: Given `update=<dict>` and `as_node=<node>`, When `replay_from_checkpoint` runs, Then `updated_checkpoint_id` differs from `fork_checkpoint_id` and the replayed run continues from the updated checkpoint.
+AC-154: Given a recorded run and a checkpoint whose next task already has stored writes, When `replay_from_checkpoint` is called with no edits, Then that task's node executes again on the sandbox, and `updated_checkpoint_id` equals `fork_checkpoint_id` ([ADR-0022](DECISIONS.md#adr-0022-replay-input-errors-and-message-edit-safety)).
 AC-102: Given a research-agent thread and a checkpoint before its human-review interrupt, When `replay_from_checkpoint` runs, Then it returns normally with `interrupted=True` and a diff covering the steps that ran.
 AC-103: Given a file store, When `replay_from_checkpoint` completes or raises, Then the file's sha256 and its directory listing are unchanged and the sandbox saver is closed.
 AC-104: Given two run snapshots whose tool calls have different call ids but the same tool names in the same order and the same outcomes, When `diff_runs` is called, Then no tool-call change is reported.
 AC-105: Given two run snapshots, When the second has an extra call to a tool, lacks a call, or a call whose arguments or outcome differ (matched by tool name and ordinal), Then `diff_runs` reports that call as added, removed or changed respectively.
-AC-106: Given two run snapshots that differ only in checkpoint ids, timestamps, channels named `__*` or `branch:*`, or message text after the first 120 characters, When `diff_runs` is called, Then the diff is empty.
+AC-106: Given two run snapshots that differ only in checkpoint ids, timestamps, message ids, tool-call ids, or channels named `__*` or `branch:*`, When `diff_runs` is called, Then the diff is empty ([ADR-0023](DECISIONS.md#adr-0023-replay-diff-compares-full-message-content)).
+AC-159: Given two run snapshots whose messages differ only after the first 120 characters, or only in an AI message's tool-call names or arguments, When `diff_runs` is called, Then that message is reported as `changed`, and the shown before/after text is truncated to 120 characters plus `...` ([ADR-0023](DECISIONS.md#adr-0023-replay-diff-compares-full-message-content)).
 AC-107: Given a fork point with several descendant branches, When a replay builds the recorded run, Then it uses the latest `[:NEXT]` leaf that descends from the fork point.
 AC-108: Given the package, When `replay_from_checkpoint`, `diff_runs`, `ReplayResult` and `RunDiff` are imported from `langgraph_checkpoint_relate` and `TimeTravelEngine.replay(...)` is called with the same inputs, Then the imports succeed and both calls return equal diffs.
 
@@ -371,6 +374,7 @@ AC-152: Given `--graph` and `--as-node` but no effective edit (neither `--update
 AC-153: Given `--set-message` repeated with the same INDEX, When `relate-dag replay --graph ...` is run, Then it exits with code 1, prints an `Error:` line naming the duplicate index, and does not run the graph (no "Replay result" section is printed).
 AC-115: Given a `--graph` spec that fails to load (AC-97), When `relate-dag replay` is run, Then it exits with code 1, prints an `Error:` line containing the spec, and prints no Python traceback.
 AC-116: Given `--as-node` naming a node the graph rejects for the update, When `relate-dag replay --graph ...` is run, Then it exits with code 1 and prints an `Error:` line with a hint about `--as-node`.
+AC-155: Given a `--graph` factory that does not accept `checkpointer=`, When replay runs, Then `GraphSpecError` is raised naming `checkpointer`; Given a graph node that raises an exception during replay, When `relate-dag replay --graph ...` is run, Then it exits with code 1 and prints `Error: replay failed: <ExceptionType>: <message>`; and invalid replay inputs raise `ReplayInputError`, a `ValueError` subclass, with their existing messages (AC-151) ([ADR-0022](DECISIONS.md#adr-0022-replay-input-errors-and-message-edit-safety)).
 AC-117: Given a closed file store, When `relate-dag replay` runs with or without `--graph`, succeeding or failing, Then the store's sha256 and its directory listing are unchanged.
 AC-118: Given stdout encoded as cp1252, When the AC-110 command is run, Then it exits with code 0 without `UnicodeEncodeError` and its output contains `error -> ok`.
 
@@ -382,8 +386,12 @@ AC-122: Given a root cause with an origin, When `relate-dag forensics trace-erro
 
 #### Cross-thread tool failures
 AC-123: Given a store with failing tool calls in several threads, When `failure_summary()` is called, Then it returns one entry per tool with at least one failure, holding `tool_name`, `failures`, `total_calls`, the `threads` it failed in and the `origin_nodes` of its bad arguments, ordered by `failures` descending; tools that never failed are omitted.
+AC-158: Given a failing tool call linked only through `(:Checkpoint)-[:HAS_WRITE]->(:Write)-[:INVOKED]->(:ToolCall)`, When `failure_summary()` is called, Then that call is counted.
 AC-124: Given the committed store, When `relate-dag forensics failures --db examples/data/demo.rl` is run, Then it exits with code 0 and prints a table whose rows include `fetch_source` and `lookup_pypi_package`.
 AC-125: Given a store with no failing tool call, When `relate-dag forensics failures --db <store>` is run, Then it exits with code 0 and prints an ASCII no-failures message.
+
+#### Stored text in forensics output
+AC-160: Given stored error text or a thread id containing Rich markup such as `[/b]` or `[red]`, When `relate-dag forensics trace-error <thread>` or `relate-dag forensics <thread>` (the `diagnose` command) is run, Then the text prints literally and the command does not crash.
 
 #### Research agent notes
 AC-126: Given `examples/research_agent.py`, When its generated notes text is read, Then it contains none of "sub-millisecond", "instantaneous" or "eliminate branch-tracking ambiguities", nor any other latency or speed claim.

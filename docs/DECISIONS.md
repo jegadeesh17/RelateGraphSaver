@@ -33,6 +33,8 @@ Reference documents:
 | [ADR-0019](#adr-0019-the-demo-store-holds-a-real-api-thread-and-its-build-needs-network-access) | The Demo Store Holds a Real-API Thread and Its Build Needs Network Access | Accepted | 2026-11-18 |
 | [ADR-0020](#adr-0020-relate-db-version-policy-decided-by-the-test-result) | relate-db Version Policy Decided by the Test Result | Accepted | 2026-11-19 |
 | [ADR-0021](#adr-0021-tool-call-root-cause-anchors-on-the-failure-checkpoint) | Tool-Call Root Cause Anchors on the Failure Checkpoint | Accepted | 2026-11-19 |
+| [ADR-0022](#adr-0022-replay-input-errors-and-message-edit-safety) | Replay Input Errors and Message-Edit Safety | Accepted | 2026-11-20 |
+| [ADR-0023](#adr-0023-replay-diff-compares-full-message-content) | Replay Diff Compares Full Message Content | Accepted | 2026-11-20 |
 
 ---
 
@@ -729,3 +731,63 @@ When the error comes from a failing tool call, `trace_root_cause()` reports the 
 - **Positive:** No stored data changes; the committed demo store produces the same README output as before.
 - **Negative:** `causal_path_length` for tool-call failures still depends on where the `[:INVOKED]` edge attached, so it can differ by one step between two runs of the same agent.
 - **Negative:** Edge placement still decides which tool calls forensics and `failure_summary()` find, so it stays an expensive-to-change contract.
+
+---
+
+## ADR-0022: Replay Input Errors and Message-Edit Safety
+
+Date: 2026-11-20  
+Status: Accepted
+
+### Context
+
+[ADR-0017](#adr-0017-replay-runs-user-graph-code-only-against-an-in-memory-sandbox) lets replay run a user's graph with edits. Three gaps showed up. Invalid replay inputs were documented as `ValueError`, but the CLI could not tell them apart from an exception raised inside user graph code, so a crashing node and a bad argument printed the same way. A factory that does not accept `checkpointer=` failed with a bare `TypeError` instead of the spec error users already get for other bad graphs. And a `set_messages` edit relies on LangGraph's `add_messages` reducer to replace a message by id; on a graph whose `messages` channel has another reducer, or none, the same edit would append a duplicate or overwrite the whole history. We also needed to know whether a replay with no edit really re-runs the step at the fork point, because `fork_in_memory` copies that checkpoint's stored writes into the sandbox.
+
+### Decision
+
+1. Invalid replay inputs raise `ReplayInputError`, which subclasses both `RelateCheckpointError` and `ValueError`, so the documented `ValueError` contract still holds (AC-151, AC-155). The CLI prints its message as a plain `Error:` line; any other exception from user graph code prints `Error: replay failed: <Type>: <message>`.
+2. A `TypeError` raised while calling the factory with `checkpointer=` becomes a `GraphSpecError` naming `checkpointer`, before any node runs (AC-155).
+3. Before applying `set_messages`, replay checks that the compiled graph's `messages` channel is a `BinaryOperatorAggregate` reduced by `add_messages` (matched by identity, falling back to the function's name and module for wrapped reducers). Otherwise it raises `ReplayInputError` mentioning `add_messages`, and the graph is not run (AC-156).
+4. No code change for no-edit replays: we verified on LangGraph 1.2.22 that `invoke` from the fork checkpoint re-executes the fork step even though its writes were copied, and `updated_checkpoint_id` equals `fork_checkpoint_id`. AC-154 guards this behaviour so a LangGraph upgrade that changes it fails the suite.
+
+### Alternatives considered
+
+1. **Send the full edited message list instead of only the edited messages:** Rejected; under `add_messages` it duplicates every unedited message, and without `add_messages` it silently truncates or replaces history.
+2. **Delete the fork checkpoint's writes in the sandbox before a no-edit replay:** Rejected; LangGraph already re-runs the step, so it adds code for no observed benefit.
+3. **Use `update_state(..., as_node="__copy__")` to force a fresh step:** Rejected; it needs a LangGraph floor above our declared `>=0.2.0`.
+4. **Keep plain `ValueError` for input errors:** Rejected; the CLI could not separate input errors from failures inside user code.
+
+### Consequences
+
+- **Positive:** Code that catches `ValueError` keeps working, and the CLI now says whether the user's input or the user's graph failed.
+- **Positive:** A message edit can no longer silently corrupt the replayed history on a graph without `add_messages`.
+- **Negative:** `ReplayInputError` is also a `RelateCheckpointError`, so handlers must catch it before that base class, or it is reported as a database error.
+- **Negative:** Graphs with a custom message reducer cannot use `set_messages`; they must use `update`.
+- **Negative:** The no-edit behaviour depends on LangGraph internals; AC-154 detects a change but does not prevent it.
+
+---
+
+## ADR-0023: Replay Diff Compares Full Message Content
+
+Date: 2026-11-20  
+Status: Accepted
+
+### Context
+
+[ADR-0017](#adr-0017-replay-runs-user-graph-code-only-against-an-in-memory-sandbox) compared messages by index and their first 120 characters. Two replays whose messages differed only after character 120, or only in an AI message's tool-call names or arguments, were reported as identical, so the diff could hide the change the user was looking for.
+
+### Decision
+
+This replaces the message rule in decision 4 of ADR-0017; the rest of ADR-0017 stands. Messages are compared by index on their type, their full content (a string as is, list content by `repr`) and, for AI messages, each tool call's name and `repr` of its arguments (AC-159). Message ids and tool-call ids are never compared, because they are random in every run (AC-106). The text shown for a changed message stays the first 120 characters plus `...` when longer; the marker is never part of the comparison.
+
+### Alternatives considered
+
+1. **Keep the 120-character comparison:** Rejected; it hides late differences in long messages and every tool-call argument change.
+2. **Compare whole messages with `==`:** Rejected; message and tool-call ids differ in every run, so every message would appear changed.
+3. **Show the full text of changed messages:** Rejected; long messages make the CLI table unreadable.
+
+### Consequences
+
+- **Positive:** Any change in message content or requested tool calls appears in the diff.
+- **Negative:** Replays that differ only late in long messages, such as a timestamp in model output, now show a change where they showed none before.
+- **Negative:** Two messages can show the same truncated text and still be reported as `changed`; the user must inspect the stored state to see where they differ.
