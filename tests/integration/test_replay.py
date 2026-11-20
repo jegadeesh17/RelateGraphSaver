@@ -19,7 +19,7 @@ import sys
 import textwrap
 from collections.abc import Generator
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import pytest
 from examples.research_agent import create_research_graph, run_research_workflow
@@ -32,6 +32,7 @@ from examples.tool_agent import (
 )
 from langchain_core.messages import HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
+from langgraph.graph import END, START, StateGraph
 
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
 if _PROJECT_ROOT not in sys.path:
@@ -696,3 +697,54 @@ def test_ac108_time_travel_engine_replay_returns_the_same_diff(tool_source: Rela
 def test_rc09_ac108_every_export_imports_from_the_package(name: str) -> None:
     assert name in package.__all__
     assert hasattr(package, name)
+
+
+_FORK_STEP_RUNS: list[str] = []
+
+
+class _CounterState(TypedDict):
+    value: int
+
+
+def _fork_step_graph(checkpointer: Any = None) -> Any:
+    def first(state: _CounterState) -> dict[str, int]:
+        return {"value": state["value"] + 1}
+
+    def second(state: _CounterState) -> dict[str, int]:
+        _FORK_STEP_RUNS.append("second")
+        return {"value": state["value"] * 10}
+
+    builder = StateGraph(_CounterState)
+    builder.add_node("first", first)
+    builder.add_node("second", second)
+    builder.add_edge(START, "first")
+    builder.add_edge("first", "second")
+    builder.add_edge("second", END)
+    return builder.compile(checkpointer=checkpointer)
+
+
+def test_ac154_replay_without_edits_re_executes_the_fork_step() -> None:
+    """A fork point that already holds stored writes must still run its node again."""
+    source = RelateSaver(":memory:")
+    try:
+        graph = _fork_step_graph(source)
+        graph.invoke({"value": 1}, {"configurable": {"thread_id": "fork-step"}})
+        assert _FORK_STEP_RUNS == ["second"]
+
+        # The checkpoint before "second" runs: its task writes are stored on that checkpoint.
+        fork = next(
+            str(snap.config["configurable"]["checkpoint_id"])
+            for snap in graph.get_state_history({"configurable": {"thread_id": "fork-step"}})
+            if snap.next == ("second",)
+        )
+        _FORK_STEP_RUNS.clear()
+
+        result = replay_from_checkpoint(source, "fork-step", fork, _fork_step_graph)
+
+        assert _FORK_STEP_RUNS == ["second"]
+        assert result.updated_checkpoint_id == fork
+        assert result.fork_checkpoint_id == fork
+        assert not result.interrupted
+    finally:
+        _FORK_STEP_RUNS.clear()
+        source.close()
