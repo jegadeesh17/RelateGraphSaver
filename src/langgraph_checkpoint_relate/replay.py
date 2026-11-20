@@ -19,7 +19,9 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from langgraph.channels.binop import BinaryOperatorAggregate
 from langgraph.graph import StateGraph
+from langgraph.graph.message import add_messages
 from langgraph.pregel import Pregel
 
 from langgraph_checkpoint_relate.errors import (
@@ -378,6 +380,31 @@ def _next_checkpoint_hint(source_saver: RelateSaver, checkpoint_id: str) -> str:
     return ""
 
 
+def _is_add_messages(operator: Any) -> bool:
+    if operator is add_messages:
+        return True
+    # A wrapped reducer is not the same object; match LangGraph's own function by name and module.
+    name = getattr(operator, "__name__", "")
+    if name == "add_messages":
+        return True
+    return name == add_messages.__name__ and (
+        getattr(operator, "__module__", None) == add_messages.__module__
+    )
+
+
+def _require_add_messages(graph: Any) -> None:
+    """Reject graphs whose ``messages`` channel would overwrite instead of merge by id (AC-156)."""
+    channel = getattr(graph, "channels", {}).get("messages")
+    if isinstance(channel, BinaryOperatorAggregate) and _is_add_messages(
+        getattr(channel, "operator", None)
+    ):
+        return
+    raise ReplayInputError(
+        "set_messages needs a 'messages' channel reduced by add_messages, so edited messages "
+        "replace the originals by id"
+    )
+
+
 def _edited_messages(
     messages: list[Any],
     set_messages: Mapping[int, str],
@@ -446,7 +473,8 @@ def replay_from_checkpoint(
 
     Raises:
         ReplayInputError: A ``ValueError`` subclass, for invalid inputs or when ``set_messages``
-            targets a checkpoint that holds no messages yet (AC-151, AC-155).
+            targets a checkpoint that holds no messages yet, or the graph's ``messages`` channel is
+            not reduced by ``add_messages`` (AC-151, AC-155, AC-156).
         CheckpointNotFoundError: If the checkpoint does not exist for the thread.
         GraphSpecError: If the factory does not return a usable graph on the sandbox.
     """
@@ -466,6 +494,7 @@ def replay_from_checkpoint(
             fork_state = graph.get_state(fork_cfg)
             values: dict[str, Any] = {**(update or {})}
             if set_messages:
+                _require_add_messages(graph)
                 messages = list(fork_state.values.get("messages", []))
                 values["messages"] = _edited_messages(
                     messages, set_messages, source_saver, checkpoint_id

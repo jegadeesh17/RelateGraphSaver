@@ -783,3 +783,45 @@ def test_ac154_replay_without_edits_re_executes_the_fork_step() -> None:
     finally:
         _FORK_STEP_RUNS.clear()
         source.close()
+
+
+class _PlainMessagesState(TypedDict):
+    messages: list[Any]
+
+
+def _plain_messages_graph(checkpointer: Any = None) -> Any:
+    def echo(state: _PlainMessagesState) -> dict[str, list[Any]]:
+        return {"messages": state["messages"]}
+
+    builder = StateGraph(_PlainMessagesState)
+    builder.add_node("echo", echo)
+    builder.add_edge(START, "echo")
+    builder.add_edge("echo", END)
+    return builder.compile(checkpointer=checkpointer)
+
+
+def test_ac156_set_messages_rejects_a_messages_channel_without_add_messages() -> None:
+    """Without an id-merging reducer the edit would replace the list and drop the rest."""
+    source = RelateSaver(":memory:")
+    try:
+        graph = _plain_messages_graph(source)
+        config: RunnableConfig = {"configurable": {"thread_id": "plain-messages"}}
+        graph.invoke(
+            {"messages": [HumanMessage(content=f"message {n}", id=f"m{n}") for n in range(3)]},
+            config,
+        )
+        fork = next(
+            str(snap.config["configurable"]["checkpoint_id"])
+            for snap in reversed(list(graph.get_state_history(config)))
+            if snap.values.get("messages")
+        )
+        before = len(list(source.list(config)))
+
+        with pytest.raises(ReplayInputError, match="add_messages"):
+            replay_from_checkpoint(
+                source, "plain-messages", fork, _plain_messages_graph, set_messages={0: "new"}
+            )
+
+        assert len(list(source.list(config))) == before
+    finally:
+        source.close()
