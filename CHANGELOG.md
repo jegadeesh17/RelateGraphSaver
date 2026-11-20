@@ -49,6 +49,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.4
 - Tool-call capture sends only new statements per saver (ADR-0011) and commits without its own flush; the store is flushed on close (ADR-0014).
 
 ### Fixed
+- `GraphFactory` uses a string type annotation so `langgraph_checkpoint_relate` imports successfully even in environments where `StateGraph` cannot be parametrized at runtime (AC-162).
+- The replay diff compares non-message channel values recursively by key rather than by string representation (`repr`), ignoring dictionary key order and normalizing message lists (AC-106, ADR-0024).
+- `trace_root_cause()` detects failing tool calls linked to checkpoints through intermediate `:Write` nodes, achieving parity with `failure_summary()` (AC-163).
+- `relate-dag tree`, `loops`, and `replay` escape user and database text (thread IDs, database paths, target threads, and checkpoint IDs) so Rich markup is rendered literally without formatting crashes (AC-161).
+- The `--as-node` CLI hint is displayed only when `graph.update_state()` rejects the edit; graph execution failures print `replay failed: InvalidUpdateError: <message>` without the misleading hint (AC-116, AC-166, ADR-0024).
+- `failure_summary()` lists each distinct writing node of a concurrent fan-out step separately in `origin_nodes` rather than as a single joined string (AC-164).
+- Graph specifications without an attribute delimiter (such as `C:\work\graph.py`) are rejected with `GraphSpecError` and a clear format message before execution (AC-165).
+- `_print_wide()` saves and restores the console's width state (`console._width`), ensuring wide tables do not leave the console permanently clamped or pinned (AC-167).
 - `relate-dag replay --graph` no longer hides an exception raised by the user's graph behind a bare `Error:` line: it prints `replay failed: <Type>: <message>`, a factory that does not accept `checkpointer=` raises `GraphSpecError`, and invalid replay inputs raise `ReplayInputError`, a `ValueError` subclass (AC-155, ADR-0022).
 - `replay_from_checkpoint(..., set_messages=...)` rejects a graph whose `messages` channel is not reduced by `add_messages` instead of silently dropping the unedited messages (AC-156, ADR-0022).
 - The replay diff compares full message content and AI tool-call names and arguments, so changes after the first 120 characters are reported; the shown text is still truncated (AC-106, AC-159, ADR-0023).
