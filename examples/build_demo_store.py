@@ -37,7 +37,7 @@ from examples.dependency_agent import FetchJson, run_dependency_agent  # noqa: E
 from examples.research_agent import run_research_workflow  # noqa: E402
 from examples.tool_agent import run_tool_agent  # noqa: E402
 
-from langgraph_checkpoint_relate.saver import RelateSaver  # noqa: E402
+from langgraph_checkpoint_relate.saver import RelateSaver, _extract_bytes  # noqa: E402
 
 DEFAULT_OUT_PATH = Path(__file__).resolve().parent / "data" / "demo.rl"
 TOOL_FAIL_THREAD = "demo-tool-fail"
@@ -93,7 +93,8 @@ def _check_real_api_lookups(saver: RelateSaver) -> None:
 
     Raises:
         PyPIUnreachableError: With the first unexpected tool error, or a short description when
-            a lookup is missing or holds neither a result nor the expected 404.
+            a lookup is missing, holds neither a result nor the expected 404, or recorded
+            arguments that are missing, undecodable or not a dict.
     """
     rows: list[dict[str, Any]] = saver.proxy.execute_read(
         "MATCH (c:Checkpoint {thread_id: $tid})-[:INVOKED]->(tc:ToolCall) "
@@ -102,7 +103,12 @@ def _check_real_api_lookups(saver: RelateSaver) -> None:
     )
     lookups: list[tuple[str, str | None, bool]] = []
     for row in rows:
-        args = saver.serde.loads(bytes(row["args"]))
+        try:
+            args = saver.serde.loads(_extract_bytes(row["args"]))
+        except Exception as exc:  # a missing or corrupt blob means the run is unusable
+            raise PyPIUnreachableError("a lookup recorded unreadable arguments") from exc
+        if not isinstance(args, dict):
+            raise PyPIUnreachableError("a lookup recorded unreadable arguments")
         # ToolNode appends a retry hint on a second line; the first line names the failure.
         error_lines = (row["error"] or "").strip().splitlines()
         error = error_lines[0].strip() if error_lines else None
