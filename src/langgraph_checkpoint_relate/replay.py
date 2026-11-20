@@ -10,9 +10,11 @@ read. ``snapshot_run`` and ``diff_runs`` produce and compare the comparable cont
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import importlib
 import importlib.util
+import inspect
 import logging
 import sys
 from collections.abc import Callable, Mapping
@@ -352,17 +354,31 @@ def _validate_inputs(update: dict[str, Any] | None, set_messages: Mapping[int, s
             raise ReplayInputError("update may not contain 'messages' when set_messages is given")
 
 
+def _check_accepts_checkpointer(factory: Any, sandbox: RelateSaver) -> None:
+    """Raise ``GraphSpecError`` when the factory cannot take ``checkpointer=`` (AC-155).
+
+    Binding the signature, instead of catching ``TypeError`` around the call, keeps a
+    ``TypeError`` raised inside the factory body visible as the user's own error.
+    """
+    try:
+        signature = inspect.signature(factory)
+    except (ValueError, TypeError):
+        return  # no introspectable signature (some builtins): the call itself will report it
+    try:
+        signature.bind(checkpointer=sandbox)
+    except TypeError as exc:
+        name = getattr(factory, "__qualname__", type(factory).__name__)
+        raise GraphSpecError(
+            f"The graph factory {name} could not be called with checkpointer=...: {exc}"
+        ) from exc
+
+
 def _compile(factory: GraphFactory, sandbox: RelateSaver) -> Any:
     if isinstance(factory, StateGraph):
         graph = factory.compile(checkpointer=sandbox)
     else:
-        try:
-            graph = factory(checkpointer=sandbox)
-        except TypeError as exc:
-            name = getattr(factory, "__qualname__", type(factory).__name__)
-            raise GraphSpecError(
-                f"The graph factory {name} could not be called with checkpointer=...: {exc}"
-            ) from exc
+        _check_accepts_checkpointer(factory, sandbox)
+        graph = factory(checkpointer=sandbox)
     missing = [name for name in ("invoke", "get_state", "update_state") if not hasattr(graph, name)]
     if missing:
         raise GraphSpecError(
@@ -393,15 +409,16 @@ def _next_checkpoint_hint(source_saver: RelateSaver, checkpoint_id: str) -> str:
 
 
 def _is_add_messages(operator: Any) -> bool:
+    # ``add_messages(format=...)`` returns a functools.partial of LangGraph's reducer.
+    while isinstance(operator, functools.partial):
+        operator = operator.func
     if operator is add_messages:
         return True
-    # A wrapped reducer is not the same object; match LangGraph's own function by name and module.
-    name = getattr(operator, "__name__", "")
-    if name == "add_messages":
-        return True
-    return name == add_messages.__name__ and (
-        getattr(operator, "__module__", None) == add_messages.__module__
-    )
+    # LangGraph wraps its reducer, so the wrapped function is not the same object; match it by
+    # name and module, never by name alone: a user's own add_messages would append, not replace.
+    return getattr(operator, "__module__", None) == add_messages.__module__ and getattr(
+        operator, "__name__", None
+    ) in {add_messages.__name__, "add_messages"}
 
 
 def _require_add_messages(graph: Any) -> None:

@@ -19,7 +19,7 @@ import sys
 import textwrap
 from collections.abc import Generator
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Annotated, Any, TypedDict
 
 import pytest
 from examples.research_agent import create_research_graph, run_research_workflow
@@ -33,6 +33,7 @@ from examples.tool_agent import (
 from langchain_core.messages import HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
 
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
 if _PROJECT_ROOT not in sys.path:
@@ -423,6 +424,20 @@ def test_ac155_factory_without_a_checkpointer_parameter_is_a_graph_spec_error(
         replay_from_checkpoint(tool_source, THREAD_ID, first, build)
 
     _assert_closed(captured_sandboxes[0])
+
+
+def test_ac155_type_error_inside_the_factory_body_is_not_a_graph_spec_error(
+    tool_source: RelateSaver,
+) -> None:
+    def build(checkpointer: Any = None) -> Any:
+        raise TypeError("inner bug")
+
+    first = _by_step(tool_source, THREAD_ID)[-1]
+
+    with pytest.raises(TypeError, match="inner bug") as raised:
+        replay_from_checkpoint(tool_source, THREAD_ID, first, build)
+
+    assert not isinstance(raised.value, GraphSpecError)
 
 
 def test_ac155_replay_input_error_is_a_value_error_and_a_checkpoint_error(
@@ -823,5 +838,84 @@ def test_ac156_set_messages_rejects_a_messages_channel_without_add_messages() ->
             )
 
         assert len(list(source.list(config))) == before
+    finally:
+        source.close()
+
+
+def add_messages_lookalike(left: Any, right: Any) -> Any:
+    return left + right
+
+
+# A user function that is called add_messages but lives in this module appends instead of
+# replacing by id, so it must not pass for LangGraph's reducer.
+add_messages_lookalike.__name__ = "add_messages"
+
+
+class _LookalikeMessagesState(TypedDict):
+    messages: Annotated[list[Any], add_messages_lookalike]
+
+
+class _FormattedMessagesState(TypedDict):
+    messages: Annotated[list[Any], add_messages(format="langchain-openai")]
+
+
+def _echo_graph(state_type: Any, checkpointer: Any = None) -> Any:
+    def echo(state: Any) -> dict[str, list[Any]]:
+        return {"messages": []}
+
+    builder = StateGraph(state_type)
+    builder.add_node("echo", echo)
+    builder.add_edge(START, "echo")
+    builder.add_edge("echo", END)
+    return builder.compile(checkpointer=checkpointer)
+
+
+def _seed_messages_thread(source: RelateSaver, state_type: Any, thread_id: str) -> str:
+    graph = _echo_graph(state_type, source)
+    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+    graph.invoke(
+        {"messages": [HumanMessage(content=f"message {n}", id=f"m{n}") for n in range(3)]},
+        config,
+    )
+    return next(
+        str(snap.config["configurable"]["checkpoint_id"])
+        for snap in reversed(list(graph.get_state_history(config)))
+        if snap.values.get("messages")
+    )
+
+
+def test_ac156_set_messages_rejects_a_user_function_named_add_messages() -> None:
+    """A same-named function from another module is not LangGraph's id-merging reducer."""
+    source = RelateSaver(":memory:")
+    try:
+        fork = _seed_messages_thread(source, _LookalikeMessagesState, "lookalike")
+
+        with pytest.raises(ReplayInputError, match="add_messages"):
+            replay_from_checkpoint(
+                source,
+                "lookalike",
+                fork,
+                lambda checkpointer=None: _echo_graph(_LookalikeMessagesState, checkpointer),
+                set_messages={0: "new"},
+            )
+    finally:
+        source.close()
+
+
+def test_ac156_set_messages_accepts_add_messages_with_a_format_argument() -> None:
+    """``add_messages(format=...)`` is a functools.partial of LangGraph's reducer."""
+    source = RelateSaver(":memory:")
+    try:
+        fork = _seed_messages_thread(source, _FormattedMessagesState, "formatted")
+
+        result = replay_from_checkpoint(
+            source,
+            "formatted",
+            fork,
+            lambda checkpointer=None: _echo_graph(_FormattedMessagesState, checkpointer),
+            set_messages={0: "new"},
+        )
+
+        assert result.updated_checkpoint_id
     finally:
         source.close()
