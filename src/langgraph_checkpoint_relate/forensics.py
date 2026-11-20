@@ -533,12 +533,23 @@ class RelateForensics:
         suits demo-sized stores. Tools that never failed are omitted; the result is ordered
         by failures descending, then tool name.
         """
-        rows = self._saver.proxy.execute_read(
-            "MATCH (c:Checkpoint)-[:INVOKED]->(tc:ToolCall) "
+        # A call is linked either from its checkpoint or through one of that checkpoint's
+        # writes (the reserved edge trace_root_cause also honours). Two reads with the same
+        # columns, concatenated, feed the one dedupe below.
+        return_columns = (
             "RETURN c.thread_id AS thread_id, c.checkpoint_id AS checkpoint_id, "
             "       tc.call_id AS call_id, tc.tool_name AS tool_name, "
             "       tc.error AS error, tc.args_blob AS args_blob"
         )
+        rows = [
+            *self._saver.proxy.execute_read(
+                "MATCH (c:Checkpoint)-[:INVOKED]->(tc:ToolCall) " + return_columns
+            ),
+            *self._saver.proxy.execute_read(
+                "MATCH (c:Checkpoint)-[:HAS_WRITE]->(:Write)-[:INVOKED]->(tc:ToolCall) "
+                + return_columns
+            ),
+        ]
         # One entry per (thread, call); the earliest invoking checkpoint is the error checkpoint.
         calls: dict[tuple[str, str], dict[str, Any]] = {}
         for row in sorted(rows, key=lambda r: str(r.get("checkpoint_id") or "")):

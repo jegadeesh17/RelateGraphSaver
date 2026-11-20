@@ -748,3 +748,51 @@ class TestFailureSummary:
             _run_summary_thread(saver, "t-ok", "call-ok", "echo_value", "echo-target-1")
             with RelateForensics(saver) as forensics:
                 assert forensics.failure_summary() == []
+
+    def test_ac158_failure_summary_counts_calls_linked_through_a_write(self) -> None:
+        """AC-158/AC-123: a tool call linked only by (:Write)-[:INVOKED] is summarized too."""
+        thread_id, call_id = "t-write", "call-write"
+        with RelateSaver(":memory:") as saver:
+            _run_summary_thread(saver, thread_id, call_id, "parse_manifest", "manifest-url-1")
+            rows = saver.proxy.execute_read(
+                "MATCH (c:Checkpoint)-[:INVOKED]->(tc:ToolCall {call_id: $call_id}) "
+                "RETURN c.checkpoint_id AS checkpoint_id",
+                {"call_id": call_id},
+            )
+            assert rows, "the run must record the failing call on a checkpoint"
+            checkpoint_id = str(rows[0]["checkpoint_id"])
+
+            # Move the link from the checkpoint to one of its writes (the reserved edge).
+            saver.proxy.execute_write(
+                "MATCH (:Checkpoint)-[r:INVOKED]->(:ToolCall {call_id: $call_id}) DELETE r",
+                {"call_id": call_id},
+            )
+            for write_id, channel in (("w-reserved", "results"), ("w-error", "__error__")):
+                saver.proxy.execute_write(
+                    "MATCH (c:Checkpoint {checkpoint_id: $cid}) "
+                    "CREATE (w:Write {write_id: $write_id, thread_id: $thread_id, "
+                    "  checkpoint_ns: '', checkpoint_id: $cid, task_id: 'task-w', "
+                    "  channel: $channel, idx: 0}) "
+                    "CREATE (c)-[:HAS_WRITE]->(w)",
+                    {
+                        "cid": checkpoint_id,
+                        "write_id": write_id,
+                        "thread_id": thread_id,
+                        "channel": channel,
+                    },
+                )
+            saver.proxy.execute_write(
+                "MATCH (w:Write {write_id: 'w-reserved'}), (tc:ToolCall {call_id: $call_id}) "
+                "CREATE (w)-[:INVOKED]->(tc)",
+                {"call_id": call_id},
+            )
+
+            with RelateForensics(saver) as forensics:
+                summary = forensics.failure_summary()
+                report = forensics.trace_root_cause(thread_id)
+
+        assert [(s.tool_name, s.failures, s.total_calls, s.threads) for s in summary] == [
+            ("parse_manifest", 1, 1, (thread_id,))
+        ]
+        assert report.root_tool_call_id == call_id
+        assert report.root_tool_name == summary[0].tool_name
