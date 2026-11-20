@@ -292,6 +292,115 @@ def test_ac159_identical_list_content_is_equal() -> None:
     assert diff_runs(recorded, replayed).is_empty
 
 
+def test_ac106_tool_call_arguments_in_a_different_key_order_are_equal() -> None:
+    recorded = _snapshot(
+        messages=(
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "fetch", "args": {"url": "a", "opts": {"x": 1, "y": 2}}, "id": "c1"}
+                ],
+            ),
+        )
+    )
+    replayed = _snapshot(
+        messages=(
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "fetch", "args": {"opts": {"y": 2, "x": 1}, "url": "a"}, "id": "c2"}
+                ],
+            ),
+        )
+    )
+
+    assert diff_runs(recorded, replayed).is_empty
+    assert diff_runs(replayed, recorded).is_empty
+
+
+def test_ac106_tool_call_arguments_equal_by_value_but_with_different_reprs_are_equal() -> None:
+    class Handle:
+        def __init__(self, value: int) -> None:
+            self.value = value
+
+        def __eq__(self, other: object) -> bool:
+            return isinstance(other, Handle) and other.value == self.value
+
+        __hash__ = None  # type: ignore[assignment]
+
+    first, second = Handle(1), Handle(1)
+    assert repr(first) != repr(second)
+    recorded = _snapshot(
+        messages=(
+            AIMessage(content="", tool_calls=[{"name": "f", "args": {"h": first}, "id": "c1"}]),
+        )
+    )
+    replayed = _snapshot(
+        messages=(
+            AIMessage(content="", tool_calls=[{"name": "f", "args": {"h": second}, "id": "c2"}]),
+        )
+    )
+
+    assert diff_runs(recorded, replayed).is_empty
+
+
+def test_ac106_content_block_ids_are_ignored_for_tool_use_blocks() -> None:
+    def blocks(block_id: str) -> list[str | dict[Any, Any]]:
+        return [
+            {"type": "text", "text": "checking"},
+            {"type": "tool_use", "id": block_id, "name": "x", "input": {"q": 1, "r": [1, 2]}},
+        ]
+
+    recorded = _snapshot(messages=(AIMessage(content=blocks("toolu_A")),))
+    replayed = _snapshot(messages=(AIMessage(content=blocks("toolu_B")),))
+
+    assert diff_runs(recorded, replayed).is_empty
+    assert diff_runs(replayed, recorded).is_empty
+
+
+def test_ac106_content_block_ids_are_ignored_for_text_blocks() -> None:
+    recorded = _snapshot(
+        messages=(AIMessage(content=[{"type": "text", "text": "hi", "id": "lc_111"}]),)
+    )
+    replayed = _snapshot(
+        messages=(AIMessage(content=[{"type": "text", "text": "hi", "id": "lc_222"}]),)
+    )
+
+    assert diff_runs(recorded, replayed).is_empty
+
+
+def test_ac159_list_content_with_different_tool_use_input_is_changed_despite_same_ids() -> None:
+    def blocks(query: str) -> list[str | dict[Any, Any]]:
+        return [{"type": "tool_use", "id": "toolu_A", "name": "x", "input": {"q": query}}]
+
+    diff = diff_runs(
+        _snapshot(messages=(AIMessage(content=blocks("one")),)),
+        _snapshot(messages=(AIMessage(content=blocks("two")),)),
+    )
+
+    assert [(m.channel, m.kind) for m in diff.messages] == [("messages[0]", "changed")]
+
+
+def test_ac159_list_content_with_different_text_is_changed_despite_different_block_ids() -> None:
+    diff = diff_runs(
+        _snapshot(messages=(AIMessage(content=[{"type": "text", "text": "a", "id": "lc_1"}]),)),
+        _snapshot(messages=(AIMessage(content=[{"type": "text", "text": "b", "id": "lc_2"}]),)),
+    )
+
+    assert [(m.channel, m.kind) for m in diff.messages] == [("messages[0]", "changed")]
+
+
+def test_ac159_a_tool_call_argument_named_id_still_counts_as_a_change() -> None:
+    def message(value: int) -> AIMessage:
+        return AIMessage(
+            content="", tool_calls=[{"name": "get", "args": {"id": value}, "id": "c1"}]
+        )
+
+    diff = diff_runs(_snapshot(messages=(message(1),)), _snapshot(messages=(message(2),)))
+
+    assert [(m.channel, m.kind) for m in diff.messages] == [("messages[0]", "changed")]
+
+
 def test_ac106_the_display_marker_appears_only_on_values_longer_than_the_limit() -> None:
     shared = "a" * 120
 

@@ -228,22 +228,39 @@ def snapshot_run(saver: RelateSaver, thread_id: str, checkpoint_id: str) -> RunS
     )
 
 
-_MessageKey = tuple[str, str, tuple[tuple[Any, str], ...]]
+# ``(type, content, ((tool name, args), ...))``. The parts hold dicts and lists, so the key is
+# compared with ``!=`` only and never hashed.
+_MessageKey = tuple[str, Any, tuple[tuple[Any, Any], ...]]
+
+
+def _normalize(value: Any) -> Any:
+    """Return ``value`` with every dict key named ``id`` dropped, recursively.
+
+    Dicts keep their other items (compared by ``==``, so key order does not matter), lists and
+    tuples map elementwise, and any other value is returned as it is.
+    """
+    if isinstance(value, dict):
+        return {key: _normalize(item) for key, item in value.items() if key != "id"}
+    if isinstance(value, (list, tuple)):
+        return [_normalize(item) for item in value]
+    return value
 
 
 def _message_preview(message: Any) -> tuple[_MessageKey, str]:
     """Return ``(key, shown)``: what decides equality and the text to display.
 
-    ``key`` holds the message type, the full content (lists and other non-string content by
-    ``repr``) and the ``(name, repr(args))`` of each tool call of an AI message. Message ids and
-    tool-call ids are left out. ``shown`` is ``"<type>: <first _MESSAGE_LIMIT characters>"``,
-    with ``...`` appended when the content was longer (AC-106, AC-159, ADR-0023).
+    ``key`` holds the message type, the full content and the ``(name, args)`` of each tool call
+    of an AI message, compared by ``==`` and never by ``repr``. String content and tool-call
+    arguments are compared as they are (an argument named ``id`` is a real argument); list
+    content is normalized so that ``id`` keys inside content blocks are ignored. Message ids and
+    tool-call ids are left out. ``shown`` is ``"<type>: <first _MESSAGE_LIMIT
+    characters>"``, with ``...`` appended when the content was longer (AC-106, AC-159, ADR-0023).
     """
     kind = str(getattr(message, "type", type(message).__name__))
     content = getattr(message, "content", message)
-    full = content if isinstance(content, str) else repr(content)
+    full = content if isinstance(content, str) else _normalize(content)
     tool_calls = tuple(
-        (call.get("name"), repr(call.get("args")))
+        (call.get("name"), call.get("args"))
         for call in (getattr(message, "tool_calls", None) or [])
     )
     text = str(content)
