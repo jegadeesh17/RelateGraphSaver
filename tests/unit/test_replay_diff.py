@@ -142,16 +142,15 @@ def test_ac105_extra_replayed_message_is_added() -> None:
     ]
 
 
-def test_ac106_ids_timestamps_internal_channels_and_late_text_are_ignored() -> None:
-    shared = "x" * 120
+def test_ac106_ids_timestamps_and_internal_channels_are_ignored() -> None:
     recorded = _snapshot(
-        messages=(HumanMessage(content=shared + "tail one", id="m-1"),),
+        messages=(HumanMessage(content="x" * 150, id="m-1"),),
         channels={"__start__": 1, "branch:to:agent": 2, "created_at": None},
         checkpoint_id="cp-a",
         step=1,
     )
     replayed = _snapshot(
-        messages=(HumanMessage(content=shared + "tail two", id="m-2"),),
+        messages=(HumanMessage(content="x" * 150, id="m-2"),),
         channels={"__start__": 9, "branch:to:tools": 3, "created_at": None},
         checkpoint_id="cp-b",
         step=7,
@@ -183,15 +182,114 @@ def test_ac106_message_text_over_the_preview_limit_ends_with_three_dots() -> Non
     assert diff.messages[1].before == "human: " + exact_text
 
 
-def test_ac106_messages_sharing_their_first_120_characters_give_an_empty_diff() -> None:
+def test_ac159_messages_sharing_their_first_120_characters_are_reported_as_changed() -> None:
     shared = "a" * 120
 
     for longer in (shared + "x", shared + "y" * 50):
         recorded = _snapshot(messages=(HumanMessage(content=shared),))
         replayed = _snapshot(messages=(HumanMessage(content=longer),))
 
-        assert diff_runs(recorded, replayed).is_empty
-        assert diff_runs(replayed, recorded).is_empty
+        forward = diff_runs(recorded, replayed)
+        backward = diff_runs(replayed, recorded)
+
+        assert [(m.channel, m.kind) for m in forward.messages] == [("messages[0]", "changed")]
+        assert forward.messages[0].before == "human: " + shared
+        assert forward.messages[0].after == "human: " + shared + "..."
+        assert [(m.channel, m.kind) for m in backward.messages] == [("messages[0]", "changed")]
+
+
+def test_ac159_a_difference_after_the_limit_shows_the_same_truncated_text_on_both_sides() -> None:
+    shared = "a" * 120
+
+    diff = diff_runs(
+        _snapshot(messages=(HumanMessage(content=shared + "tail one"),)),
+        _snapshot(messages=(HumanMessage(content=shared + "tail two"),)),
+    )
+
+    assert [(m.channel, m.kind, m.before, m.after) for m in diff.messages] == [
+        ("messages[0]", "changed", "human: " + shared + "...", "human: " + shared + "...")
+    ]
+
+
+def test_ac159_equal_content_with_different_tool_call_arguments_is_changed() -> None:
+    recorded = _snapshot(
+        messages=(
+            AIMessage(
+                content="looking it up",
+                tool_calls=[{"name": "fetch_source", "args": {"url": "a"}, "id": "call_1"}],
+            ),
+        )
+    )
+    replayed = _snapshot(
+        messages=(
+            AIMessage(
+                content="looking it up",
+                tool_calls=[{"name": "fetch_source", "args": {"url": "b"}, "id": "call_1"}],
+            ),
+        )
+    )
+
+    diff = diff_runs(recorded, replayed)
+
+    assert [(m.channel, m.kind) for m in diff.messages] == [("messages[0]", "changed")]
+    assert diff.messages[0].before == "ai: looking it up"
+    assert diff.messages[0].after == "ai: looking it up"
+
+
+def test_ac159_equal_content_with_a_different_tool_call_name_is_changed() -> None:
+    recorded = _snapshot(
+        messages=(AIMessage(content="", tool_calls=[{"name": "a", "args": {}, "id": "call_1"}]),)
+    )
+    replayed = _snapshot(
+        messages=(AIMessage(content="", tool_calls=[{"name": "b", "args": {}, "id": "call_1"}]),)
+    )
+
+    assert [m.kind for m in diff_runs(recorded, replayed).messages] == ["changed"]
+
+
+def test_ac106_ai_messages_differing_only_in_tool_call_ids_and_message_ids_are_equal() -> None:
+    recorded = _snapshot(
+        messages=(
+            AIMessage(
+                content="looking it up",
+                id="m-1",
+                tool_calls=[{"name": "fetch_source", "args": {"url": "a"}, "id": "call_1"}],
+            ),
+        )
+    )
+    replayed = _snapshot(
+        messages=(
+            AIMessage(
+                content="looking it up",
+                id="m-2",
+                tool_calls=[{"name": "fetch_source", "args": {"url": "a"}, "id": "call_9"}],
+            ),
+        )
+    )
+
+    assert diff_runs(recorded, replayed).is_empty
+    assert diff_runs(replayed, recorded).is_empty
+
+
+def test_ac159_list_content_differing_after_the_limit_is_changed() -> None:
+    shared = "a" * 130
+    recorded = _snapshot(messages=(AIMessage(content=[{"type": "text", "text": shared + " one"}]),))
+    replayed = _snapshot(messages=(AIMessage(content=[{"type": "text", "text": shared + " two"}]),))
+
+    diff = diff_runs(recorded, replayed)
+
+    assert [(m.channel, m.kind) for m in diff.messages] == [("messages[0]", "changed")]
+    assert diff.messages[0].before is not None and diff.messages[0].before.endswith("...")
+    assert diff.messages[0].after is not None and diff.messages[0].after.endswith("...")
+
+
+def test_ac159_identical_list_content_is_equal() -> None:
+    parts = [{"type": "text", "text": "a" * 200}]
+
+    recorded = _snapshot(messages=(AIMessage(content=list(parts)),))
+    replayed = _snapshot(messages=(AIMessage(content=list(parts)),))
+
+    assert diff_runs(recorded, replayed).is_empty
 
 
 def test_ac106_the_display_marker_appears_only_on_values_longer_than_the_limit() -> None:
@@ -199,7 +297,7 @@ def test_ac106_the_display_marker_appears_only_on_values_longer_than_the_limit()
 
     diff = diff_runs(
         _snapshot(messages=(HumanMessage(content=shared), HumanMessage(content="one"))),
-        _snapshot(messages=(HumanMessage(content=shared + "x"), HumanMessage(content="two"))),
+        _snapshot(messages=(HumanMessage(content=shared), HumanMessage(content="two"))),
     )
 
     assert [(m.channel, m.before, m.after) for m in diff.messages] == [

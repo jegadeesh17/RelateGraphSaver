@@ -226,19 +226,29 @@ def snapshot_run(saver: RelateSaver, thread_id: str, checkpoint_id: str) -> RunS
     )
 
 
-def _message_preview(message: Any) -> tuple[str, str]:
-    """Return ``(key, shown)``: the comparison text and the text to display.
+_MessageKey = tuple[str, str, tuple[tuple[Any, str], ...]]
 
-    Both hold the message type and its first ``_MESSAGE_LIMIT`` characters of content. Only
-    ``shown`` gets a trailing ``...`` when the content was longer, so the marker never decides
-    whether two messages are equal.
+
+def _message_preview(message: Any) -> tuple[_MessageKey, str]:
+    """Return ``(key, shown)``: what decides equality and the text to display.
+
+    ``key`` holds the message type, the full content (lists and other non-string content by
+    ``repr``) and the ``(name, repr(args))`` of each tool call of an AI message. Message ids and
+    tool-call ids are left out. ``shown`` is ``"<type>: <first _MESSAGE_LIMIT characters>"``,
+    with ``...`` appended when the content was longer (AC-106, AC-159, ADR-0023).
     """
-    kind = getattr(message, "type", type(message).__name__)
+    kind = str(getattr(message, "type", type(message).__name__))
     content = getattr(message, "content", message)
+    full = content if isinstance(content, str) else repr(content)
+    tool_calls = tuple(
+        (call.get("name"), repr(call.get("args")))
+        for call in (getattr(message, "tool_calls", None) or [])
+    )
     text = str(content)
-    key = f"{kind}: {text[:_MESSAGE_LIMIT]}"
-    shown = key + "..." if len(text) > _MESSAGE_LIMIT else key
-    return key, shown
+    shown = f"{kind}: {text[:_MESSAGE_LIMIT]}"
+    if len(text) > _MESSAGE_LIMIT:
+        shown += "..."
+    return (kind, full, tool_calls), shown
 
 
 def _diff_tool_calls(recorded: RunSnapshot, replayed: RunSnapshot) -> tuple[ToolCallChange, ...]:
@@ -301,11 +311,13 @@ def _diff_channels(recorded: RunSnapshot, replayed: RunSnapshot) -> tuple[Channe
 def diff_runs(recorded: RunSnapshot, replayed: RunSnapshot) -> RunDiff:
     """Compare a recorded run with its replay.
 
-    Tool calls are matched by ``(tool_name, ordinal)``, never by call id; messages by index as
-    ``"<type>: <first 120 characters of content>"`` (with ``...`` appended when the content is
-    longer, for display only); other channels by ``repr``. Checkpoint ids, timestamps, message ids and
-    ``__*`` / ``branch:*`` channels are never compared, so a
-    replay that behaves like the recording gives an empty diff (AC-104..AC-106).
+    Tool calls are matched by ``(tool_name, ordinal)``, never by call id; messages by index, by
+    type, full content and the names and arguments of an AI message's tool calls (AC-106,
+    AC-159, ADR-0023); other channels by ``repr``. A changed message is shown as
+    ``"<type>: <first 120 characters of content>"``, with ``...`` appended when the content is
+    longer, for display only. Checkpoint ids, timestamps, message ids, tool-call ids and
+    ``__*`` / ``branch:*`` channels are never compared, so a replay that behaves like the
+    recording gives an empty diff (AC-104..AC-106).
     """
     return RunDiff(
         tool_calls=_diff_tool_calls(recorded, replayed),
