@@ -462,3 +462,23 @@ def test_ac106_plain_dict_id_keys_in_channel_are_not_stripped() -> None:
             "{'id': 'ent-2', 'name': 'sample'}",
         ),
     ]
+
+
+def test_ac106_nested_dict_and_tuple_channels_differing_in_key_order_gives_empty_diff() -> None:
+    # AC-106, ADR-0024: nested collections compared by value recursively ignore dict ordering.
+    recorded = _snapshot(
+        channels={
+            "nested": [{"a": 1, "b": 2}, {"c": [10, 20]}],
+            "coords": (10, 20),
+        }
+    )
+    replayed = _snapshot(
+        channels={
+            "nested": [{"b": 2, "a": 1}, {"c": (10, 20)}],
+            "coords": [10, 20],
+        }
+    )
+
+    diff = diff_runs(recorded, replayed)
+
+    assert diff.is_empty

@@ -946,6 +946,8 @@ def test_ac162_import_succeeds_when_state_graph_not_subscriptable() -> None:
 
         langgraph.graph.StateGraph.__class_getitem__ = classmethod(_raising_class_getitem)
         import langgraph_checkpoint_relate
+        import langgraph_checkpoint_relate.replay
+        from langgraph_checkpoint_relate.replay import GraphFactory
         """
     )
     env = {**os.environ, "PYTHONPATH": _SRC_DIR}

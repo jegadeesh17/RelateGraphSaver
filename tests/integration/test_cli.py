@@ -1209,6 +1209,19 @@ class TestCliReplayGraph:
         assert "Hint:" not in result.output
         assert "Traceback" not in result.output
 
+    @pytest.mark.parametrize("spec", [r"C:\work\graph.py", "path/to/graph.py"])
+    def test_ac165_file_spec_without_attribute_rejected_by_cli(
+        self, runner: CliRunner, demo_copy: tuple[str, dict[int, str]], spec: str
+    ) -> None:
+        """AC-165: file path spec without attribute is rejected by CLI with code 1 and spec format error."""
+        db_file, steps = demo_copy
+        result = runner.invoke(app, _replay_args(db_file, steps[0], "--graph", spec))
+        assert result.exit_code == 1
+        assert "must look like 'module:attribute' or 'path/to/file.py:attribute'" in _squash(
+            result.output
+        )
+        assert "Traceback" not in result.output
+
     def test_branch_with_graph_is_rejected(
         self, runner: CliRunner, demo_copy: tuple[str, dict[int, str]]
     ) -> None:
@@ -1616,13 +1629,133 @@ def test_ac161_loops_prints_markup_thread_id_literally(runner: CliRunner, tmp_pa
     assert not isinstance(result.exception, MarkupError)
 
 
-def test_ac167_print_wide_preserves_console_width(monkeypatch: pytest.MonkeyPatch) -> None:
-    """AC-167: _print_wide preserves and restores console._width to pre-call value (None)."""
+def test_ac161_tree_and_replay_print_markup_thread_id_literally(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """AC-161: tree and replay on an existing thread named [bold]x print literally without styling."""
+    db_file = str(tmp_path / "bold_thread_all.rl")
+    thread_id = "[bold]x"
+    _seed_markup_error_store(db_file, thread_id)
+
+    tree_result = runner.invoke(app, ["tree", thread_id, "--db", db_file])
+    assert tree_result.exit_code == 0, tree_result.output
+    assert "[bold]x" in tree_result.output
+    assert not isinstance(tree_result.exception, MarkupError)
+
+    replay_result = runner.invoke(
+        app,
+        ["replay", thread_id, "1f1e314c-8a21-6b3e-8000-000000000001", "--db", db_file],
+    )
+    assert replay_result.exit_code == 0, replay_result.output
+    assert "[bold]x" in replay_result.output
+    assert "1f1e314c-8a21-6b3e-8000-000000000001" in replay_result.output
+    assert not isinstance(replay_result.exception, MarkupError)
+
+
+def test_ac163_cli_trace_error_finds_write_linked_failed_tool_call(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """AC-163: CLI trace-error identifies a Write-linked tool failure as root cause."""
+    db_file = str(tmp_path / "write_linked.rl")
+    thread_id = "t-write-fail"
+    _seed_markup_error_store(db_file, thread_id)
+    with RelateSaver(db_path=db_file) as saver:
+        rows = saver.proxy.execute_read(
+            "MATCH (c:Checkpoint)-[:INVOKED]->(tc:ToolCall) "
+            "RETURN c.checkpoint_id AS checkpoint_id",
+            {},
+        )
+        assert rows
+        checkpoint_id = str(rows[0]["checkpoint_id"])
+        saver.proxy.execute_write(
+            "MATCH (:Checkpoint)-[r:INVOKED]->(:ToolCall) DELETE r",
+            {},
+        )
+        saver.proxy.execute_write(
+            "MATCH (c:Checkpoint {checkpoint_id: $cid}) "
+            "CREATE (w:Write {write_id: 'w-task', thread_id: $thread_id, "
+            "  checkpoint_ns: '', checkpoint_id: $cid, task_id: 'task-w', "
+            "  channel: 'results', idx: 0}) "
+            "CREATE (c)-[:HAS_WRITE]->(w)",
+            {"cid": checkpoint_id, "thread_id": thread_id},
+        )
+        saver.proxy.execute_write(
+            "MATCH (w:Write {write_id: 'w-task'}), (tc:ToolCall) CREATE (w)-[:INVOKED]->(tc)",
+            {},
+        )
+
+    result = runner.invoke(app, ["forensics", "trace-error", thread_id, "--db", db_file])
+    assert result.exit_code == 0, result.output
+    assert f"Root Cause Analysis: {thread_id}" in result.output
+    assert "fetch_source" in result.output
+    assert "call-markup-1" in result.output
+
+
+@tool
+def _failing_fanout_tool(url: str) -> str:
+    """Failing tool for testing origin node rendering in CLI."""
+    raise RuntimeError(f"cannot fetch {url}")
+
+
+def test_ac164_cli_forensics_failures_displays_fanout_origin_nodes(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """AC-164: CLI forensics failures displays distinct fan-out origin nodes in the table."""
+
+    class FanoutState(TypedDict):
+        target: str
+        extra: str
+        messages: list[Any]
+
+    def fetcher(state: FanoutState) -> dict[str, Any]:
+        return {"target": "manifest-url-1"}
+
+    def parser(state: FanoutState) -> dict[str, Any]:
+        return {"extra": "parsed"}
+
+    def agent(state: FanoutState) -> dict[str, Any]:
+        call = {
+            "id": "call-fanout-cli",
+            "name": "_failing_fanout_tool",
+            "args": {"url": state["target"]},
+        }
+        return {"messages": [AIMessage(content="", tool_calls=[call])]}
+
+    builder = StateGraph(FanoutState)
+    builder.add_node("fetcher", fetcher)
+    builder.add_node("parser", parser)
+    builder.add_node("agent", agent)
+    builder.add_node("tools", ToolNode([_failing_fanout_tool], handle_tool_errors=True))
+    builder.add_edge(START, "fetcher")
+    builder.add_edge(START, "parser")
+    builder.add_edge("fetcher", "agent")
+    builder.add_edge("parser", "agent")
+    builder.add_edge("agent", "tools")
+    builder.add_edge("tools", END)
+
+    db_file = str(tmp_path / "fanout_cli.rl")
+    with RelateSaver(db_path=db_file) as saver:
+        builder.compile(checkpointer=saver).invoke(
+            {"messages": [HumanMessage(content="go")], "target": "", "extra": ""},
+            {"configurable": {"thread_id": "t-fanout-cli"}},
+        )
+
+    result = runner.invoke(app, ["forensics", "failures", "--db", db_file])
+    assert result.exit_code == 0, result.output
+    assert "_failing_fanout_tool" in result.output
+    assert "fetcher, parser" in result.output
+
+
+@pytest.mark.parametrize("initial_width", [None, 80, 120])
+def test_ac167_print_wide_preserves_console_width(
+    monkeypatch: pytest.MonkeyPatch, initial_width: int | None
+) -> None:
+    """AC-167: _print_wide preserves and restores console._width to pre-call value (None or fixed width)."""
     fake_stream = io.StringIO()
-    test_console = Console(file=fake_stream)
+    test_console = Console(file=fake_stream, width=initial_width)
     monkeypatch.setattr(cli, "console", test_console)
 
-    assert test_console._width is None
+    assert test_console._width == initial_width
 
     table = Table(title="Wide Table")
     table.add_column("Column 1")
@@ -1630,5 +1763,5 @@ def test_ac167_print_wide_preserves_console_width(monkeypatch: pytest.MonkeyPatc
 
     cli._print_wide(table)
 
-    assert test_console._width is None
+    assert test_console._width == initial_width
     assert "Wide Table" in fake_stream.getvalue()
