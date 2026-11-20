@@ -931,3 +931,52 @@ def test_ac156_set_messages_accepts_add_messages_with_a_format_argument() -> Non
         assert result.updated_checkpoint_id
     finally:
         source.close()
+
+
+def test_ac162_import_succeeds_when_state_graph_not_subscriptable() -> None:
+    """Importing the package succeeds even when StateGraph cannot be parametrized at runtime."""
+    script = textwrap.dedent(
+        """
+        import langgraph.graph
+
+        def _raising_class_getitem(cls, item):
+            raise TypeError("StateGraph is not subscriptable")
+
+        langgraph.graph.StateGraph.__class_getitem__ = classmethod(_raising_class_getitem)
+        import langgraph_checkpoint_relate
+        """
+    )
+    env = {**os.environ, "PYTHONPATH": _SRC_DIR}
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, f"Import failed with stderr:\n{result.stderr}"
+
+
+def test_ac165_file_spec_without_attribute_delimiter_is_rejected() -> None:
+    """A file-path graph spec without an attribute delimiter is rejected with a helpful message."""
+    with pytest.raises(
+        GraphSpecError,
+        match="must look like 'module:attribute' or 'path/to/file.py:attribute'",
+    ):
+        load_graph_factory(r"C:\work\graph.py")
+
+    with pytest.raises(
+        GraphSpecError,
+        match="must look like 'module:attribute' or 'path/to/file.py:attribute'",
+    ):
+        load_graph_factory("path/to/graph.py")
+
+
+def test_ac165_absolute_path_spec_with_attribute_loads_cleanly(tmp_path: Path) -> None:
+    """An absolute file path spec with ':attribute' loads the factory successfully."""
+    agent_file = tmp_path / "agent.py"
+    agent_file.write_text(_AGENT_FILE, encoding="utf-8")
+
+    factory = load_graph_factory(f"{agent_file.resolve()}:make")
+    assert callable(factory)
+    assert factory.__name__ == "make"

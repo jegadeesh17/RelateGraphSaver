@@ -19,7 +19,7 @@ import logging
 import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 from langgraph.channels.binop import BinaryOperatorAggregate
 from langgraph.graph import StateGraph
@@ -47,7 +47,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-GraphFactory = Callable[..., Any] | StateGraph[Any, Any, Any, Any]
+GraphFactory: TypeAlias = "Callable[..., Any] | StateGraph[Any, Any, Any, Any]"
 
 _DETAIL_LIMIT = 120
 _MESSAGE_LIMIT = 120
@@ -104,6 +104,10 @@ def load_graph_factory(spec: str) -> GraphFactory:
             f"Graph spec '{spec}' must look like 'module:attribute' or 'path/to/file.py:attribute'"
         )
     module_part, _, attribute = spec.rpartition(":")
+    if "/" in attribute or "\\" in attribute or attribute.strip().endswith(".py"):
+        raise GraphSpecError(
+            f"Invalid graph specification '{spec}': must look like 'module:attribute' or 'path/to/file.py:attribute'"
+        )
     if not module_part.strip() or not attribute.strip():
         raise GraphSpecError(
             f"Graph spec '{spec}' must have a non-empty module or file path and attribute name"
