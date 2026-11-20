@@ -365,8 +365,11 @@ class RelateForensics:
             logger.debug("Skipping undeserializable %s: %s", what, exc)
             return None
 
-    def _writing_node(self, checkpoint_id: str, thread_id: str) -> str:
-        """Name the node(s) whose versions_seen entry changes after a checkpoint (ADR-0018)."""
+    def _writing_nodes(self, checkpoint_id: str, thread_id: str) -> tuple[str, ...]:
+        """Name the node(s) whose versions_seen entry changes after a checkpoint (ADR-0018).
+
+        Returns an empty tuple when the writing node(s) cannot be determined.
+        """
         rows = self._saver.proxy.execute_read(
             "MATCH (a:Checkpoint {checkpoint_id: $id})-[:NEXT]->"
             "(b:Checkpoint {thread_id: $thread_id}) "
@@ -375,41 +378,24 @@ class RelateForensics:
             {"id": checkpoint_id, "thread_id": thread_id},
         )
         if not rows:
-            return _UNKNOWN_NODE
+            return ()
         before = self._loads_blob(rows[0].get("before_blob"), "checkpoint")
         after = self._loads_blob(rows[0].get("after_blob"), "checkpoint")
         if not isinstance(before, dict) or not isinstance(after, dict):
-            return _UNKNOWN_NODE
+            return ()
         seen_before = before.get("versions_seen")
         seen_after = after.get("versions_seen")
         if not isinstance(seen_before, dict) or not isinstance(seen_after, dict):
-            return _UNKNOWN_NODE
+            return ()
         changed = sorted(
             str(node) for node in seen_after if seen_after[node] != seen_before.get(node)
         )
-        return ", ".join(changed) if changed else _UNKNOWN_NODE
+        return tuple(changed)
 
-    def trace_argument_origin(
+    def _argument_origin(
         self, thread_id: str, error_checkpoint_id: str, args: Mapping[str, Any]
-    ) -> ArgumentOrigin | None:
-        """Find the earliest write that held a string argument of a failing tool call.
-
-        Only top-level string arguments of at least 3 characters are traced, by
-        case-sensitive containment; the earliest matching write on the ``[:NEXT]`` path
-        ending at ``error_checkpoint_id`` wins (ADR-0018). This is a heuristic, not
-        data-flow tracking.
-
-        Args:
-            thread_id: Execution thread identifier.
-            error_checkpoint_id: Checkpoint where the failure was found; hops count back from it.
-            args: The failing tool call's arguments.
-
-        Returns:
-            The origin, or None when no argument is traceable or no write holds one.
-
-        Raises:
-            CheckpointNotFoundError: If thread_id or error_checkpoint_id is not a non-empty string.
-        """
+    ) -> tuple[ArgumentOrigin, tuple[str, ...]] | None:
+        """Find the earliest write holding a tool call's argument, returning origin and origin nodes."""
         if not isinstance(thread_id, str) or not thread_id.strip():
             raise CheckpointNotFoundError("thread_id must be a non-empty string.")
         if not isinstance(error_checkpoint_id, str) or not error_checkpoint_id.strip():
@@ -442,16 +428,43 @@ class RelateForensics:
             for name, needle in candidates:
                 if _value_contains(value, needle):
                     checkpoint_id = str(row["checkpoint_id"])
-                    return ArgumentOrigin(
+                    nodes = self._writing_nodes(checkpoint_id, thread_id)
+                    node = ", ".join(nodes) or _UNKNOWN_NODE
+                    origin = ArgumentOrigin(
                         argument=name,
                         value=needle,
-                        node=self._writing_node(checkpoint_id, thread_id),
+                        node=node,
                         step=int(row.get("step") or 0),
                         # length(path) also counts the closing [:HAS_WRITE] edge.
                         hops=max(int(row.get("hops") or 1) - 1, 0),
                         checkpoint_id=checkpoint_id,
                     )
+                    return origin, nodes
         return None
+
+    def trace_argument_origin(
+        self, thread_id: str, error_checkpoint_id: str, args: Mapping[str, Any]
+    ) -> ArgumentOrigin | None:
+        """Find the earliest write that held a string argument of a failing tool call.
+
+        Only top-level string arguments of at least 3 characters are traced, by
+        case-sensitive containment; the earliest matching write on the ``[:NEXT]`` path
+        ending at ``error_checkpoint_id`` wins (ADR-0018). This is a heuristic, not
+        data-flow tracking.
+
+        Args:
+            thread_id: Execution thread identifier.
+            error_checkpoint_id: Checkpoint where the failure was found; hops count back from it.
+            args: The failing tool call's arguments.
+
+        Returns:
+            The origin, or None when no argument is traceable or no write holds one.
+
+        Raises:
+            CheckpointNotFoundError: If thread_id or error_checkpoint_id is not a non-empty string.
+        """
+        res = self._argument_origin(thread_id, error_checkpoint_id, args)
+        return res[0] if res is not None else None
 
     def _failure_checkpoint_id(
         self, thread_id: str, error_checkpoint_id: str, tool_call_id: str
@@ -491,13 +504,14 @@ class RelateForensics:
         )
         if not rows:
             return None
-        return self._trace_call_args_origin(
+        res = self._trace_call_args_origin(
             thread_id,
             error_checkpoint_id,
             tool_call_id,
             rows[0].get("args_blob"),
             anchored=anchored,
         )
+        return res[0] if res is not None else None
 
     def _trace_call_args_origin(
         self,
@@ -507,7 +521,7 @@ class RelateForensics:
         args_blob: Any,
         *,
         anchored: bool = False,
-    ) -> ArgumentOrigin | None:
+    ) -> tuple[ArgumentOrigin, tuple[str, ...]] | None:
         """Trace stored arguments from the checkpoint where the tool's result was written.
 
         ``anchored`` means ``error_checkpoint_id`` is already that checkpoint, so it is not
@@ -523,7 +537,7 @@ class RelateForensics:
             if anchored
             else self._failure_checkpoint_id(thread_id, error_checkpoint_id, tool_call_id)
         )
-        return self.trace_argument_origin(thread_id, start, args)
+        return self._argument_origin(thread_id, start, args)
 
     def failure_summary(self) -> list[ToolFailureSummary]:
         """Summarize failing tool calls across every thread in the store (AC-123).
@@ -568,11 +582,16 @@ class RelateForensics:
                 continue
             failures[tool_name] = failures.get(tool_name, 0) + 1
             failed_threads.setdefault(tool_name, set()).add(thread_id)
-            origin = self._trace_call_args_origin(
+            res = self._trace_call_args_origin(
                 thread_id, str(row["checkpoint_id"]), call_id, row.get("args_blob")
             )
-            if origin is not None:
-                origin_nodes.setdefault(tool_name, set()).add(origin.node)
+            if res is not None:
+                origin, nodes = res
+                if nodes:
+                    for n in nodes:
+                        origin_nodes.setdefault(tool_name, set()).add(n)
+                else:
+                    origin_nodes.setdefault(tool_name, set()).add(_UNKNOWN_NODE)
 
         summaries = [
             ToolFailureSummary(
@@ -632,20 +651,32 @@ class RelateForensics:
 
         # 2. Look for error checkpoint via tool call error
         if not error_records:
-            error_tool_query = (
-                "MATCH (c:Checkpoint {thread_id: $thread_id})-[:INVOKED]->(tc:ToolCall) "
-                "WHERE tc.error IS NOT NULL AND tc.error <> '' "
+            return_columns = (
                 "RETURN c.checkpoint_id AS checkpoint_id, "
                 "       c.step AS step, "
+                "       c.created_at AS created_at, "
                 "       tc.call_id AS tool_call_id, "
                 "       tc.error AS tool_error, "
-                "       c.metadata_blob AS metadata_blob "
-                "ORDER BY c.step DESC, c.created_at DESC "
-                "LIMIT 1"
+                "       c.metadata_blob AS metadata_blob"
             )
-            error_records = self._saver.proxy.execute_read(
-                error_tool_query, {"thread_id": thread_id}
-            )
+            tool_rows = [
+                *self._saver.proxy.execute_read(
+                    "MATCH (c:Checkpoint {thread_id: $thread_id})-[:INVOKED]->(tc:ToolCall) "
+                    "WHERE tc.error IS NOT NULL AND tc.error <> '' " + return_columns,
+                    {"thread_id": thread_id},
+                ),
+                *self._saver.proxy.execute_read(
+                    "MATCH (c:Checkpoint {thread_id: $thread_id})-[:HAS_WRITE]->(:Write)-[:INVOKED]->(tc:ToolCall) "
+                    "WHERE tc.error IS NOT NULL AND tc.error <> '' " + return_columns,
+                    {"thread_id": thread_id},
+                ),
+            ]
+            if tool_rows:
+                best = max(
+                    tool_rows,
+                    key=lambda r: (int(r.get("step") or 0), str(r.get("created_at") or "")),
+                )
+                error_records = [best]
 
         # 3. Look for error checkpoint via metadata tags/status
         if not error_records:
