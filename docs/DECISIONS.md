@@ -35,6 +35,7 @@ Reference documents:
 | [ADR-0021](#adr-0021-tool-call-root-cause-anchors-on-the-failure-checkpoint) | Tool-Call Root Cause Anchors on the Failure Checkpoint | Accepted | 2026-11-19 |
 | [ADR-0022](#adr-0022-replay-input-errors-and-message-edit-safety) | Replay Input Errors and Message-Edit Safety | Accepted | 2026-11-20 |
 | [ADR-0023](#adr-0023-replay-diff-compares-full-message-content) | Replay Diff Compares Full Message Content | Accepted | 2026-11-20 |
+| [ADR-0024](#adr-0024-replay-diff-compares-channel-values-not-repr) | Replay Diff Compares Channel Values, Not Repr | Accepted | 2026-11-20 |
 
 ---
 
@@ -770,7 +771,8 @@ Status: Accepted
 ## ADR-0023: Replay Diff Compares Full Message Content
 
 Date: 2026-11-20  
-Status: Accepted
+Status: Accepted  
+Amended by: [ADR-0024](#adr-0024-replay-diff-compares-channel-values-not-repr)
 
 ### Context
 
@@ -791,3 +793,45 @@ This replaces the message rule in decision 4 of ADR-0017; the rest of ADR-0017 s
 - **Positive:** Any change in message content or requested tool calls appears in the diff.
 - **Negative:** Replays that differ only late in long messages, such as a timestamp in model output, now show a change where they showed none before.
 - **Negative:** Two messages can show the same truncated text and still be reported as `changed`; the user must inspect the stored state to see where they differ.
+
+---
+
+## ADR-0024: Replay Diff Compares Channel Values, Not Repr
+
+Date: 2026-11-20  
+Status: Accepted
+
+### Context
+
+AC-106 requires comparing run snapshots such that runs producing equivalent state report an empty diff. However, [ADR-0023](#adr-0023-replay-diff-compares-full-message-content) stated "Other channels compare `repr(value)`". In Python and LangGraph, non-message channels can contain nested dictionaries, lists, or custom payloads (including LangChain messages stored outside the main `messages` channel). Comparing string representations (`repr`) creates spurious diffs due to arbitrary dictionary key iteration order across runs or Python versions, or due to random message IDs embedded in messages placed in auxiliary channels.
+
+Additionally, when replaying a graph with an invalid state update or an unrecognized writer node, LangGraph's `update_state` raises `InvalidUpdateError`. An identical `InvalidUpdateError` can also be raised during graph execution if a graph node itself calls `update_state` incorrectly or encounters an invalid update during `graph.invoke`. The CLI previously appended a hint (`Hint: pass --as-node with the node that should be treated as the writer.`, AC-116) for any `InvalidUpdateError`. When an internal node failed during graph execution, displaying the `--as-node` CLI hint was misleading because `--as-node` only applies to the initial replay state update.
+
+### Decision
+
+This amends ADR-0023's channel comparison rule and clarifies replay exception propagation:
+
+1. **Value-based channel comparison via `_channel_key(value)`:** Non-message channels are compared by value representation using a recursive key mapper:
+   - `BaseMessage` instances are normalized via `_message_key(value)` (matching type, content with nested `id` keys removed from list parts, and tool-call names and arguments), ensuring random message IDs do not trigger diffs.
+   - `list` and `tuple` map to a `list` of recursively mapped channel keys.
+   - `dict` maps to `{k: _channel_key(v)}` for all key-value pairs; because Python dictionary equality compares key-value pairs independently of insertion order, dictionary key order is ignored under `==`. Dict `id` keys outside messages are preserved (not stripped).
+   - Primitive scalar types (`str`, `int`, `float`, `bool`, `None`) map to the values themselves.
+   - Any other arbitrary object falls back to `repr(value)`.
+2. **Channel diff rendering:** `_diff_channels` compares mapped channel keys using `==` to determine whether a change occurred. When a channel is added, removed, or changed, `before` and `after` strings in `ChannelChange` are rendered using `repr(value)` of the original channel value for clear diagnostic inspection.
+3. **Tagging `update_state` exceptions:** In `replay_from_checkpoint`, when `graph.update_state` raises `InvalidUpdateError`, the exception is tagged using Python's `exc.add_note(...)` before re-raising. The exception type and message propagate unchanged (AC-101), preserving the public API contract for SDK callers. The CLI inspects the exception's notes to determine whether the failure originated directly from `update_state` (displaying the `--as-node` hint, AC-116) or occurred later during node execution in `graph.invoke` (printing `Error: replay failed: InvalidUpdateError: <message>` without the hint, AC-166).
+
+### Alternatives considered
+
+1. **Compare non-message channels with raw `==`:** Rejected; channels containing LangChain messages would compare random message IDs and report false diffs, and unhashable or custom objects without clean equality semantics could raise exceptions or behave inconsistently.
+2. **Keep `repr(value)` for non-message channels:** Rejected; dictionary key order or embedded message instances produce false-positive changes between functionally identical runs.
+3. **Strip `id` keys from all dictionaries in all channels:** Rejected; while message content blocks generate random `id` keys that must be ignored, user data dictionaries in arbitrary channels may treat `id` as meaningful domain data (such as database primary keys).
+4. **Wrap `InvalidUpdateError` in a custom `ReplayStateUpdateError`:** Rejected; wrapping changes the exception hierarchy, breaking existing callers and acceptance criteria expecting `InvalidUpdateError` to propagate directly.
+5. **String-match exception message in CLI to detect `update_state` failures:** Rejected; matching internal message strings is brittle against changes in LangGraph error formatting across minor versions.
+
+### Consequences
+
+- **Positive:** Replay diffs across runs with dictionary state or auxiliary message channels compare semantic value without spurious diffs from key order or message IDs (AC-106).
+- **Positive:** Diagnostic output retains human-readable `repr(value)` in the before/after columns of `ChannelChange`.
+- **Positive:** The CLI accurately distinguishes replay setup errors from graph execution errors without modifying LangGraph exception types or public API contracts (AC-166).
+- **Negative:** Non-primitive objects not covered by `_channel_key` (e.g. custom classes) still fall back to `repr()`.
+- **Negative:** Exception notes require Python 3.11+, which is already the minimum supported Python version for this project.

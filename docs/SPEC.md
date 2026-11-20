@@ -32,6 +32,7 @@ The product capabilities are structured across four delivery milestones:
 - **Milestone 3:** Forensic Diagnostics & Production Polish (Cypher loop detection, poison-tool root-cause analysis, multi-agent demo application, PyPI packaging).
 - **Milestone 4:** Judge Readiness (clean-install CLI fix, lint and type-check baseline, README Relate rationale and limits, `:ToolCall` capture from real runs, async checkpointer methods, SQLite comparison benchmark).
 - **Judge Impact:** tree status fix, graph re-execution replay with a run diff, argument provenance, cross-thread tool failures, a key-free real-API demo thread, README and metadata corrections (updated 2026-11-18).
+- **Code-Review Fixes:** CLI markup escaping, import type-annotation robustness, indirect tool-call root-cause parity, fan-out origin node splitting, path spec validation, update-state hint scoping, and console width restoration (updated 2026-11-20).
 
 ### 2.1 Milestone 1: MVP Vertical Slice
 
@@ -202,6 +203,19 @@ Starts from Journey 14 and the committed-store README.
 #### Journey 25 (optional, only if the project owner approves): Recorded LLM Run
 1. The developer sets `OPENROUTER_API_KEY` in the environment, installs the `llm` extra, and runs `examples/openrouter_agent.py --model <model>`.
 2. The run is stored once in `examples/data/demo-llm.rl`, separate from the key-free store.
+
+### 2.6 Code-Review Fixes
+
+These journeys define the expected user and API behavior across code-review hardening fixes, ensuring reliable CLI markup rendering, import stability, forensic root-cause tracing, graph spec validation, update-state error scoping, and terminal console width management.
+
+#### Journey 26: Robust Diagnostics, Spec Validation, and CLI Rendering
+Starts from Journeys 8, 9, 19, and 22.
+1. The developer runs `relate-dag tree`, `relate-dag forensics loops`, or `relate-dag replay` against threads, database paths, or errors containing Rich markup-like syntax (such as `[red]` or `run[/x]`), and the CLI renders all text literally without formatting artifacts or markup errors.
+2. The developer imports `langgraph_checkpoint_relate` in Python environments where `StateGraph` cannot be parametrized at runtime, and the import succeeds without raising `TypeError`.
+3. The developer runs root-cause analysis on a thread where tool failures are linked via writes or where fan-out nodes execute concurrently; `trace_root_cause` accurately identifies the failed tool call, and `failure_summary` reports distinct fan-out origin nodes separately.
+4. The developer specifies a filesystem graph path without a function or attribute delimiter (`C:\work\graph.py`); `load_graph_factory` raises `GraphSpecError` explaining the required `module:attribute` or `path/to/file.py:attribute` format.
+5. The developer replays a graph that triggers `InvalidUpdateError` during graph execution; the CLI prints the failure error without the misleading `--as-node` update hint.
+6. The CLI displays wide tables via `_print_wide`; after printing, the terminal width setting is restored, preserving standard rendering for subsequent outputs.
 
 ---
 
@@ -431,7 +445,17 @@ AC-149: Given the README replay command, When its checkpoint id is compared with
 AC-150: Given `README.md`, When "Where the data lives" is read, Then it names all four thread ids of the committed store.
 AC-151: Given a checkpoint whose state holds no messages yet (such as the step -1 input checkpoint), When `relate-dag replay <thread> <checkpoint id> --graph SPEC --set-message 0=TEXT` is run, or `replay_from_checkpoint(..., set_messages={0: TEXT})` is called, Then the CLI exits with code 1 and prints an `Error:` line (the API raises `ValueError` with the same message) saying the checkpoint holds no messages yet and suggesting the next (step 0) checkpoint, and the source store is unchanged.
 
-### 3.7 Regression Criteria
+### 3.7 Code-Review Fixes
+
+AC-161: Given a thread ID, database path, checkpoint ID, exception message, or table element containing Rich markup-like syntax (such as `run[/x]` or missing `--db` `[red]missing.rl`), When `relate-dag tree`, `relate-dag forensics loops`, or `relate-dag replay` (without `--graph`) is run, Then all interpolated text is escaped and rendered literally without `MarkupError` or unintended formatting artifacts.
+AC-162: Given a Python runtime environment where `StateGraph` cannot be subscripted or parametrized at runtime, When `langgraph_checkpoint_relate` or any of its submodules is imported, Then the import succeeds without raising `TypeError`.
+AC-163: Given a thread where a failing tool call is linked to a checkpoint only through `(:Checkpoint)-[:HAS_WRITE]->(:Write)-[:INVOKED]->(:ToolCall)`, When `trace_root_cause(thread_id)` is invoked, Then it detects the failed tool call and identifies it as the root cause with its `tool_name` and `call_id` in parity with `failure_summary()`.
+AC-164: Given a workflow step produced by multiple concurrent fan-out nodes whose writes contain a bad argument, When `failure_summary()` is called, Then `origin_nodes` contains each origin node as a distinct separate string element in the list rather than as a single comma-joined string.
+AC-165: Given a file-path graph spec without an attribute delimiter and attribute name (such as `C:\work\graph.py` or `path/to/graph.py`), When `load_graph_factory(spec)` is called, Then `GraphSpecError` is raised with a message stating the spec must look like `module:attribute` or `path/to/file.py:attribute`.
+AC-166: Given a replayed graph execution where `InvalidUpdateError` is raised by a node during graph execution, When `relate-dag replay --graph ...` is run, Then the CLI exits with code 1 and prints `Error: replay failed: InvalidUpdateError: <message>` without appending the `--as-node` hint; Given `update_state` itself rejects the update prior to execution, When `relate-dag replay --graph ...` is run, Then the CLI exits with code 1 and prints the `--as-node` hint.
+AC-167: Given a Rich Console instance with an initial width state, When `_print_wide(console, ...)` is called and completes, Then `console._width` is preserved and restored to its exact pre-call value so subsequent table prints do not stay clamped or pinned.
+
+### 3.8 Regression Criteria
 
 RC-01: Given a thread with branches, When `relate-dag tree` is run, Then branch points still show `Branch: [BRANCH]` and an unknown thread still exits non-zero with a not-found error (AC-23, AC-24).
 RC-02: Given `relate-dag replay` without `--graph`, When the checkpoint id is empty or unknown, Then it still exits with code 1 and prints `checkpoint_id must be a non-empty string` or `Available checkpoints:` respectively.
@@ -474,6 +498,13 @@ Judge impact non-goals:
 20. **Offline build of `demo-real-api`:** no offline or staged-data flag; the real-API thread needs pypi.org.
 21. **Exact provenance:** argument origin is a heuristic (string containment, earliest write), not data-flow tracking.
 22. **Refactors not required by these criteria.**
+
+Code-review fixes non-goals:
+
+23. **`[:FORKED_TO]` failure-anchor diagnostic note:** modifying the failure-anchor diagnostic logic for forked threads is out of scope.
+24. **LangGraph async message-id note:** documenting or altering LangGraph async message ID handling is out of scope.
+25. **Store rebuild or README updates:** rebuilding `examples/data/demo.rl` or updating benchmark figures and README copy is out of scope.
+26. **Dependency or `pyproject.toml` changes:** adding or modifying runtime or package dependencies is out of scope.**
 
 ---
 
@@ -554,3 +585,11 @@ Judge impact non-goals:
 18. **Judge impact: Homepage URL form:**
     - *Question:* Should `Homepage` point at the repository root or its `#readme` anchor?
     - *Assumption:* `Homepage` uses `#readme`, `Repository` the root, `Issues` `/issues`; AC-142 accepts any URL under the repository.
+
+19. **Code-review fixes: Non-message channel comparison:**
+    - *Question:* Is a separate acceptance criterion required for channel value comparison?
+    - *Assumption:* No dedicated acceptance criterion assigned; existing AC-106 and regression criteria assert channel diff invariance, while AC-161 through AC-167 define the specific behavior required for the code-review fixes.
+
+20. **Code-review fixes: Graph spec error hierarchy:**
+    - *Question:* Does `GraphSpecError` inherit from `ValueError` to preserve existing exception handling?
+    - *Assumption:* Yes, `GraphSpecError` remains a `ValueError` subclass per ADR-0022 and AC-97/AC-155.
