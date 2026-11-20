@@ -474,9 +474,17 @@ class RelateForensics:
         return error_checkpoint_id
 
     def _trace_failing_call_origin(
-        self, thread_id: str, error_checkpoint_id: str, tool_call_id: str
+        self,
+        thread_id: str,
+        error_checkpoint_id: str,
+        tool_call_id: str,
+        *,
+        anchored: bool = False,
     ) -> ArgumentOrigin | None:
-        """Trace the arguments of a recorded tool call back to the write that first held one."""
+        """Trace the arguments of a recorded tool call back to the write that first held one.
+
+        ``anchored`` means ``error_checkpoint_id`` is already the failure checkpoint.
+        """
         rows = self._saver.proxy.execute_read(
             "MATCH (tc:ToolCall {call_id: $call_id}) RETURN tc.args_blob AS args_blob",
             {"call_id": tool_call_id},
@@ -484,19 +492,37 @@ class RelateForensics:
         if not rows:
             return None
         return self._trace_call_args_origin(
-            thread_id, error_checkpoint_id, tool_call_id, rows[0].get("args_blob")
+            thread_id,
+            error_checkpoint_id,
+            tool_call_id,
+            rows[0].get("args_blob"),
+            anchored=anchored,
         )
 
     def _trace_call_args_origin(
-        self, thread_id: str, error_checkpoint_id: str, tool_call_id: str, args_blob: Any
+        self,
+        thread_id: str,
+        error_checkpoint_id: str,
+        tool_call_id: str,
+        args_blob: Any,
+        *,
+        anchored: bool = False,
     ) -> ArgumentOrigin | None:
-        """Trace stored arguments from the checkpoint where the tool's result was written."""
+        """Trace stored arguments from the checkpoint where the tool's result was written.
+
+        ``anchored`` means ``error_checkpoint_id`` is already that checkpoint, so it is not
+        resolved again.
+        """
         if not args_blob:
             return None
         args = self._loads_blob(args_blob, f"arguments of call '{tool_call_id}'")
         if not isinstance(args, dict):
             return None
-        start = self._failure_checkpoint_id(thread_id, error_checkpoint_id, tool_call_id)
+        start = (
+            error_checkpoint_id
+            if anchored
+            else self._failure_checkpoint_id(thread_id, error_checkpoint_id, tool_call_id)
+        )
         return self.trace_argument_origin(thread_id, start, args)
 
     def failure_summary(self) -> list[ToolFailureSummary]:
@@ -820,8 +846,13 @@ class RelateForensics:
         if root_tool_call_id is not None and any(
             r.get("tool_call_id") == root_tool_call_id and r.get("tool_error") for r in causal_rows
         ):
+            # error_checkpoint_id was anchored above for failed_call_id; reuse it when the
+            # origin trace is for that same call (ADR-0021).
             origin = self._trace_failing_call_origin(
-                thread_id, error_checkpoint_id, root_tool_call_id
+                thread_id,
+                error_checkpoint_id,
+                root_tool_call_id,
+                anchored=bool(failed_call_id) and root_tool_call_id == str(failed_call_id),
             )
 
         return RootCauseReport(

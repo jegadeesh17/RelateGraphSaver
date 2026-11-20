@@ -17,6 +17,7 @@ import time
 from collections.abc import Generator
 from pathlib import Path
 from typing import Annotated, Any, TypedDict
+from unittest.mock import patch
 
 import pytest
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
@@ -645,6 +646,25 @@ class TestArgumentProvenance:
         assert report.origin_node is None
         assert report.origin_step is None
         assert report.origin_hops is None
+
+    def test_ac121_root_cause_resolves_the_failure_checkpoint_once(self) -> None:
+        """AC-121: one root-cause trace anchors on the failure checkpoint once (ADR-0021)."""
+        original = RelateForensics._failure_checkpoint_id
+        with RelateSaver(":memory:") as saver:
+            _run_provenance_graph(saver, self.THREAD, PLANNED_TARGET)
+
+            with RelateForensics(saver) as forensics:
+                with patch.object(
+                    RelateForensics,
+                    "_failure_checkpoint_id",
+                    autospec=True,
+                    side_effect=original,
+                ) as anchor:
+                    report = forensics.trace_root_cause(self.THREAD)
+
+        assert report.root_tool_call_id == FETCH_CALL_ID
+        assert report.origin_node == "planner"
+        assert anchor.call_count == 1
 
 
 @tool
