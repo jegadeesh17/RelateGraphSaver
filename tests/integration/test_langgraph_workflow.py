@@ -382,3 +382,33 @@ class TestLangGraphResearchWorkflow:
             assert final_state["status"] == "completed"
             assert final_state["topic"] == DEFAULT_TOPIC
             assert DEFAULT_FEEDBACK in final_state["final_summary"]
+
+    def test_research_notes_make_no_latency_claims(self) -> None:
+        """AC-126: the notes the research agent generates make no latency or speed claims."""
+        with RelateSaver(":memory:") as saver:
+            final_state = run_research_workflow(
+                topic="checkpoint storage",
+                auto_approve=True,
+                saver=saver,
+                print_output=False,
+            )
+        notes = final_state["research_notes"]
+        assert len(notes) > 0
+        text = "\n".join(notes)
+        for phrase in (
+            "sub-millisecond",
+            "instantaneous",
+            "eliminate branch-tracking ambiguities",
+        ):
+            assert phrase not in text
+        lowered = text.lower()
+        for word in (
+            "millisecond",
+            "latency",
+            "instant",
+            "fast",
+            "faster",
+            "real-time",
+            "zero-latency",
+        ):
+            assert word not in lowered

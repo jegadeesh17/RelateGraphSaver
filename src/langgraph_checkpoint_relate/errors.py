@@ -36,6 +36,21 @@ class RelateReadOnlyError(RelateCheckpointError):
     """Raised when a write is attempted through a read-only saver or proxy."""
 
 
+class GraphSpecError(ValueError):
+    """Raised when a graph spec cannot be loaded or does not yield a usable graph.
+
+    The message always contains the offending spec.
+    """
+
+
+class ReplayInputError(RelateCheckpointError, ValueError):
+    """Invalid replay input (AC-151, AC-155).
+
+    Still a ``ValueError``, so callers that catch ``ValueError`` keep working. It is also a
+    ``RelateCheckpointError``, so handlers must catch it before that base class.
+    """
+
+
 # Specification parity aliases
 CheckpointSerializationError = RelateSerializationError
 CheckpointNotFoundError = RelateCheckpointNotFoundError
@@ -43,10 +58,12 @@ CheckpointNotFoundError = RelateCheckpointNotFoundError
 __all__ = [
     "CheckpointNotFoundError",
     "CheckpointSerializationError",
+    "GraphSpecError",
     "RelateCheckpointError",
     "RelateCheckpointNotFoundError",
     "RelateConcurrencyError",
     "RelateConnectionError",
     "RelateReadOnlyError",
     "RelateSerializationError",
+    "ReplayInputError",
 ]

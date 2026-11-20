@@ -1,9 +1,12 @@
 """README content checks for the use case, Relate rationale, data location, limits and benchmark.
 
 Covers AC-39 (how and why Relate is used), AC-40 (single-process limit), AC-58 (published
-benchmark results) and AC-76 to AC-80 (use case, mode, data location and the explore commands).
+benchmark results), AC-76 to AC-80 (use case, mode, data location and the explore commands) and
+AC-144 to AC-150 (source install, plain tagline, "Why not X?", the four explore commands and the
+four demo threads).
 """
 
+import hashlib
 import re
 from pathlib import Path
 
@@ -15,10 +18,10 @@ from langgraph_checkpoint_relate.cli import app
 REPO_ROOT = Path(__file__).resolve().parents[2]
 README_PATH = REPO_ROOT / "README.md"
 DEMO_STORE = REPO_ROOT / "examples" / "data" / "demo.rl"
-DEMO_THREADS = ("demo-tool-fail", "demo-tool-ok", "demo-research")
+DEMO_THREADS = ("demo-tool-fail", "demo-tool-ok", "demo-research", "demo-real-api")
 REPLAY_COMMAND = re.compile(
     r"^relate-dag replay (?P<thread>\S+) (?P<checkpoint>[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})"
-    r" --db examples/data/demo\.rl$",
+    r"(?P<flags>(?: \S+)*?) --db examples/data/demo\.rl$",
     flags=re.MULTILINE,
 )
 
@@ -112,7 +115,7 @@ def test_relate_section_states_mode_reason_and_model_ac_77() -> None:
 
 
 def test_where_the_data_lives_names_store_and_threads_ac_78() -> None:
-    """AC-78: the data section names the committed store and its three thread ids."""
+    """AC-78: the data section names the committed store and its thread ids."""
     section = _section("Where the data lives")
     assert "examples/data/demo.rl" in section
     for thread_id in DEMO_THREADS:
@@ -147,16 +150,39 @@ def _readme_demo_commands() -> list[list[str]]:
     return commands
 
 
-def test_explore_commands_exit_zero_on_committed_store_ac_79() -> None:
-    """AC-79: each documented tree, trace-error and replay command exits 0, no agent run first."""
+def _data_state() -> tuple[list[str], dict[str, str]]:
+    """Return the sorted file names in examples/data and the sha256 of each file."""
+    data_dir = DEMO_STORE.parent
+    names = sorted(path.name for path in data_dir.iterdir())
+    digests = {
+        name: hashlib.sha256((data_dir / name).read_bytes()).hexdigest()
+        for name in names
+        if (data_dir / name).is_file()
+    }
+    return names, digests
+
+
+def test_explore_commands_exit_zero_on_committed_store_ac_79(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-79, AC-148: the four documented commands exit 0 and leave examples/data untouched."""
+    # The replay command names its graph by a path relative to the repository root.
+    monkeypatch.chdir(REPO_ROOT)
+    before = _data_state()
     runner = CliRunner()
     verbs = set()
+    outputs = {}
     for args in _readme_demo_commands():
         args = [*args[:-1], str(DEMO_STORE)]
         result = runner.invoke(app, args)
         assert result.exit_code == 0, f"{args} exited {result.exit_code}: {result.output}"
-        verbs.add(args[0] if args[0] != "forensics" else f"forensics {args[1]}")
-    assert verbs == {"tree", "forensics trace-error", "replay"}
+        verb = args[0] if args[0] != "forensics" else f"forensics {args[1]}"
+        verbs.add(verb)
+        outputs[verb] = result.output
+    assert verbs == {"tree", "forensics trace-error", "forensics failures", "replay"}
+    assert "fetch_source #1" in outputs["replay"]
+    assert "error -> ok" in outputs["replay"]
+    assert _data_state() == before, "an explore command changed examples/data"
 
 
 def test_readme_replay_id_appears_in_tree_output_ac_80() -> None:
@@ -175,3 +201,97 @@ def test_where_the_data_lives_rejects_missing_section() -> None:
     """A heading that is not in the README fails loudly instead of returning an empty body."""
     with pytest.raises(AssertionError, match="no '## Nonexistent heading' section"):
         _section("Nonexistent heading")
+
+
+def _readme_text() -> str:
+    return README_PATH.read_text(encoding="utf-8")
+
+
+def test_readme_has_source_install_and_no_pypi_install_ac_144() -> None:
+    """AC-144: the README has a source install line and no PyPI install line."""
+    text = _readme_text()
+    assert "pip install langgraph-checkpoint-relate" not in text
+    assert re.search(r'^pip install -e "\.\[dev\]"$', text, flags=re.MULTILINE)
+
+
+def test_tagline_is_plain_language_ac_145() -> None:
+    """AC-145: the tagline names a failing step, finding its cause from one file, offline."""
+    lines = _readme_text().splitlines()
+    title_at = next(i for i, line in enumerate(lines) if line.startswith("# "))
+    tagline = next(
+        line
+        for line in lines[title_at + 1 :]
+        if line.strip() and not line.lstrip().startswith(("[![", "!["))
+    )
+    lowered = tagline.lower()
+    for banned in ("wal", "dag", "graph-native", "relate-dag"):
+        assert banned not in lowered, f"tagline contains '{banned}': {tagline}"
+    assert "fail" in lowered and "step" in lowered
+    assert "one file" in lowered and "offline" in lowered
+
+
+def test_why_not_x_table_has_four_rows_ac_146() -> None:
+    """AC-146: the comparison table covers the four alternatives and says Neo4jSaver needs a server."""
+    section = _section("Why not X?")
+    lines = section.splitlines()
+    for alternative in (
+        "Neo4jSaver",
+        "SqliteSaver",
+        "LangGraph built-in time travel",
+        "Tracing tools",
+    ):
+        rows = [line for line in lines if line.startswith(f"| {alternative}")]
+        assert len(rows) == 1, f"expected exactly one '{alternative}' row, found {rows}"
+    neo4j_row = next(line for line in lines if line.startswith("| Neo4jSaver"))
+    assert "Needs a Neo4j server" in neo4j_row
+
+
+def test_why_not_x_rows_state_graph_labels_and_trace_gap_ac_146() -> None:
+    """AC-146: PREVIOUS is described as a relationship and the tracing row names the manual link."""
+    lines = _section("Why not X?").splitlines()
+    neo4j_row = next(line for line in lines if line.startswith("| Neo4jSaver"))
+    assert "`Thread`, `Checkpoint`, `Branch` and `PendingWrite` nodes" in neo4j_row
+    assert "checkpoints linked by `PREVIOUS`" in neo4j_row
+    assert "`PREVIOUS`, `Branch` nodes" not in neo4j_row
+    tracing_row = next(line for line in lines if line.startswith("| Tracing tools"))
+    assert "Traces are stored separately from the checkpoints" in tracing_row
+    assert "linking a failed trace back to the saved state is manual" in tracing_row
+
+
+def test_explore_block_holds_exactly_the_four_commands_ac_147() -> None:
+    """AC-147: the explore block has the four documented commands, every flag before --db."""
+    commands = [" ".join(args) for args in _readme_demo_commands()]
+    match = REPLAY_COMMAND.search(_readme_text())
+    assert match is not None, "README has no replay command with a checkpoint id"
+    replay_id = match["checkpoint"]
+    assert commands == [
+        "tree demo-real-api --db examples/data/demo.rl",
+        "forensics trace-error demo-real-api --db examples/data/demo.rl",
+        "forensics failures --db examples/data/demo.rl",
+        f"replay demo-tool-fail {replay_id} --graph examples/tool_agent.py:create_tool_agent_graph"
+        " --set-message 0=https://example.org/report --db examples/data/demo.rl",
+    ]
+    for args in _readme_demo_commands():
+        assert args[-2] == "--db", f"--db must be the last flag: {args}"
+
+
+def test_readme_replay_id_is_step_zero_of_demo_tool_fail_ac_149() -> None:
+    """AC-149: the README replay id is demo-tool-fail's step 0 checkpoint, not the input step."""
+    match = REPLAY_COMMAND.search(_readme_text())
+    assert match is not None, "README has no replay command with a checkpoint id"
+    assert match["thread"] == "demo-tool-fail"
+    result = CliRunner().invoke(app, ["tree", "demo-tool-fail", "--db", str(DEMO_STORE)])
+    assert result.exit_code == 0, result.output
+    # The tree wraps long lines; remove all whitespace before matching.
+    flat = re.sub(r"\s+", "", result.output)
+    step_ids = dict(re.findall(r"Step(-?\d+):source:\w+\(id:([0-9a-f-]{36})\)", flat))
+    assert "0" in step_ids and "-1" in step_ids, step_ids
+    assert match["checkpoint"] == step_ids["0"]
+    assert match["checkpoint"] != step_ids["-1"]
+
+
+def test_where_the_data_lives_names_all_four_threads_ac_150() -> None:
+    """AC-150: the data section names all four thread ids of the committed store."""
+    section = _section("Where the data lives")
+    for thread_id in ("demo-tool-fail", "demo-tool-ok", "demo-research", "demo-real-api"):
+        assert thread_id in section, f"thread {thread_id} missing"

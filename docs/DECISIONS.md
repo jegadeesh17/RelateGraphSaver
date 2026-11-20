@@ -27,6 +27,14 @@ Reference documents:
 | [ADR-0013](#adr-0013-clean-install-test-skips-only-when-the-package-index-is-unreachable) | Clean-Install Test Skips Only When the Package Index Is Unreachable | Accepted | 2026-11-17 |
 | [ADR-0014](#adr-0014-tool-call-capture-commits-without-its-own-flush) | Tool Call Capture Commits Without Its Own Flush | Accepted | 2026-11-17 |
 | [ADR-0015](#adr-0015-read-only-opening-for-inspection-commands) | Read-Only Opening for Inspection Commands | Accepted | 2026-11-18 |
+| [ADR-0016](#adr-0016-tree-status-depends-on-whether-a-checkpoint-has-a-next-step) | Tree Status Depends on Whether a Checkpoint Has a Next Step | Accepted | 2026-11-18 |
+| [ADR-0017](#adr-0017-replay-runs-user-graph-code-only-against-an-in-memory-sandbox) | Replay Runs User Graph Code Only Against an In-Memory Sandbox | Accepted | 2026-11-18 |
+| [ADR-0018](#adr-0018-argument-provenance-by-string-containment-earliest-write-wins) | Argument Provenance by String Containment, Earliest Write Wins | Accepted | 2026-11-18 |
+| [ADR-0019](#adr-0019-the-demo-store-holds-a-real-api-thread-and-its-build-needs-network-access) | The Demo Store Holds a Real-API Thread and Its Build Needs Network Access | Accepted | 2026-11-18 |
+| [ADR-0020](#adr-0020-relate-db-version-policy-decided-by-the-test-result) | relate-db Version Policy Decided by the Test Result | Accepted | 2026-11-19 |
+| [ADR-0021](#adr-0021-tool-call-root-cause-anchors-on-the-failure-checkpoint) | Tool-Call Root Cause Anchors on the Failure Checkpoint | Accepted | 2026-11-19 |
+| [ADR-0022](#adr-0022-replay-input-errors-and-message-edit-safety) | Replay Input Errors and Message-Edit Safety | Accepted | 2026-11-20 |
+| [ADR-0023](#adr-0023-replay-diff-compares-full-message-content) | Replay Diff Compares Full Message Content | Accepted | 2026-11-20 |
 
 ---
 
@@ -534,3 +542,252 @@ This amends [ADR-0002](#adr-0002-dedicated-actor-proxy-for-thread-affinity-and-s
 - **Negative:** Per relate-db's description, the read-only open loads the store once at open time. We have not measured the time or memory this takes on large stores.
 - **Negative:** Inspection never adds missing indexes, so queries against an old store scan instead of using an index until the store is opened writable once.
 - **Negative:** A custom `connection_factory` gets no read-only signal through its call. Callers who inject a driver must open it read-only themselves to keep the file unchanged.
+
+---
+
+## ADR-0016: Tree Status Depends on Whether a Checkpoint Has a Next Step
+
+Date: 2026-11-18  
+Status: Accepted
+
+### Context
+
+`relate-dag tree` tagged every checkpoint that had a stored write as `[PENDING]`. LangGraph stores each task's writes on the checkpoint the task ran from, so almost every completed step has writes, and a finished run showed nearly all of its steps as pending. An evaluator reading the tree could not tell finished steps from steps that were really waiting.
+
+### Decision
+
+The status of a checkpoint is the first of these that applies: `[ERROR]` (detected as before), `[INTERRUPT]`, `[OK]` if the checkpoint has a `[:NEXT]` child, `[PENDING]` if it has stored writes, otherwise `[OK]`. Only `[:NEXT]` children count as a next step; a checkpoint whose only child is a `[:FORKED_TO]` branch is still a leaf of its own run. Writes under a checkpoint with a next step are labelled `write:`; writes on a leaf keep the label `pending write:`. Details: [tree status rule](ARCHITECTURE.md#tree-status-rule).
+
+### Alternatives considered
+
+1. **Keep the old rule:** Rejected; it reports finished work as pending.
+2. **Ask LangGraph which tasks are still pending (`get_state(...).tasks`):** Rejected; the tree has no graph to ask, only the stored data.
+3. **Count a `[:FORKED_TO]` child as a next step:** Rejected; a branch does not finish the original step, and the original run's last step would then look done when it was not.
+4. **Add a `[TOOL ERROR]` tag for steps with a failing tool call:** Left out by the project owner; `forensics` reports tool failures.
+
+### Consequences
+
+- **Positive:** A finished run reads as finished; `[PENDING]` now means a last step that still holds writes, such as one waiting at the end of a run that stopped early.
+- **Negative:** A step that stopped with unapplied writes but already has a next checkpoint shows `[OK]`; the stored writes are still listed under it.
+- **Negative:** Output of `tree` changes for every stored run, so saved sample outputs must be refreshed.
+
+---
+
+## ADR-0017: Replay Runs User Graph Code Only Against an In-Memory Sandbox
+
+Date: 2026-11-18  
+Status: Accepted
+
+### Context
+
+`relate-dag replay` only cloned history into an in-memory store and printed a summary; nothing ran, so the command did not answer "what would have happened if this input had been different?". Re-running needs the user's graph, because the stored data holds state but not the code of the nodes. Running user code next to a user's real store risks writing speculative steps into it. [ADR-0004](#adr-0004-in-memory-graph-cloning-for-zero-side-effect-time-travel-sandboxing) and [ADR-0015](#adr-0015-read-only-opening-for-inspection-commands) already give us a read-only source and an in-memory fork.
+
+### Decision
+
+This builds on ADR-0004 and ADR-0015 and supersedes no earlier decision; no earlier ADR said that replay never runs code.
+
+1. Replay is a library function, `replay_from_checkpoint`, with a CLI front end, `relate-dag replay --graph SPEC`. The user names the graph as `path/to/file.py:attr` or `package.module:attr`; the attribute is a factory taking `checkpointer=` or an uncompiled `StateGraph`. A file path is accepted because the examples folder is not a package and the installed `relate-dag` command does not put the working directory on the import path.
+2. The graph is compiled with the fork's in-memory saver as its checkpointer. If the compiled graph's checkpointer is anything else, replay stops before any node runs. The source store is opened read-only and only read; the fork is always closed, on success and on error.
+3. Edits are applied with LangGraph's own `update_state`. A message edit reuses the original message's id, so LangGraph replaces the message instead of appending a second copy.
+4. The replayed run is compared with the recorded run (the latest leaf after the fork point). Tool calls are matched by tool name and position, because call ids are random in every run; messages by index and their first 120 characters; other channels by their printed value. Ids and timestamps are never compared.
+5. Loading a bad graph spec raises `GraphSpecError`, a `ValueError` whose message contains the spec; the CLI prints it as an `Error:` line.
+
+### Alternatives considered
+
+1. **Replay in the CLI without user graph code:** Rejected; the stored data cannot tell the CLI what the nodes do.
+2. **Run the user's graph against the real store, on a new branch:** Rejected for the reasons in ADR-0004; speculative runs would stay in the file.
+3. **Run the replay in a subprocess or container:** Rejected; much more machinery, and it still could not stop the user's own tools from calling networks or files.
+4. **Match tool calls by call id:** Rejected; ids differ in every run, so every call would appear changed.
+5. **Import only `package.module:attr` specs:** Rejected; the examples cannot be imported that way from the installed command.
+
+### Consequences
+
+- **Positive:** `relate-dag replay --graph ... --set-message 0=...` shows, for example, `fetch_source #1  error -> ok` with the argument before and after, and the source file stays byte-identical.
+- **Negative:** Replay imports and runs the user's code. Only the checkpointer is sandboxed; tools still have their real side effects (a replay of the dependency demo calls pypi.org). We document this and do not try to contain it.
+- **Negative:** A graph whose factory ignores `checkpointer=` cannot be replayed; it is refused rather than allowed to write elsewhere.
+- **Negative:** The diff is shallow by design: result text after 120 characters, message ids and tool calls trimmed from history are not compared.
+
+---
+
+## ADR-0018: Argument Provenance by String Containment, Earliest Write Wins
+
+Date: 2026-11-18  
+Status: Accepted
+
+### Context
+
+Root-cause reports named the failing tool call but not where its bad argument came from. In a typical agent the bad value is produced one or more steps earlier (a planner invents a package name; the model copies it into a tool call). The stored writes contain those earlier values, but LangGraph keeps no record of which value flowed into which argument.
+
+### Decision
+
+1. For each string argument of the failing call with at least 3 characters, we look for the earliest write on the same `[:NEXT]` path, up to the failure, whose value contains that string, case-sensitively. We search plain strings, message text, tool-call arguments and nested containers. The earliest matching write wins.
+2. The node that made the write is the one whose `versions_seen` entry changes between the write's checkpoint and the next one.
+3. Hops are counted from the checkpoint where the tool actually ran and failed, not from the earlier step that requested the call.
+4. The result fills optional fields on `RootCauseReport` (`origin_argument`, `origin_node`, `origin_step`, `origin_hops`) and feeds a store-wide `failure_summary()`. Details: [argument provenance](ARCHITECTURE.md#9-argument-provenance-and-tool-failure-summary-forensicspy).
+
+### Alternatives considered
+
+1. **Exact data-flow tracking:** Rejected; it would need instrumenting every node, which a checkpointer cannot do.
+2. **Ask a language model to explain the origin:** Rejected; needs a key, costs money and is not repeatable.
+3. **Case-insensitive or fuzzy matching:** Rejected; in the demo the user's request contains `RelateGraphSaver` while the bad argument is `relategraphsaver`, and the planner, not the user, introduced the bad name.
+4. **Latest matching write instead of earliest:** Rejected; it usually finds the model's own tool call, one step before the failure, which says nothing new.
+
+### Consequences
+
+- **Positive:** `trace-error` can say "url came from node planner (step N, H hops before failure)" from stored data alone, offline.
+- **Negative:** It is a heuristic. A short or common string can match an unrelated earlier write; values transformed on the way (case changes, joined strings) are not found; non-string arguments are not traced.
+- **Negative:** Several nodes running in one step are reported together, because the stored writes do not name their node.
+- **Negative:** `failure_summary()` traces every failed call, so its cost grows with the number of failures in the store.
+
+---
+
+## ADR-0019: The Demo Store Holds a Real-API Thread and Its Build Needs Network Access
+
+Date: 2026-11-18  
+Status: Accepted
+
+### Context
+
+The committed demo store was built offline from scripted agents, so every failure in it was staged. Evaluators look for the graph explaining a real failure. We want a failure that a real public service produced, while keeping the explore commands key-free and offline for the person cloning the repository.
+
+### Decision
+
+1. `examples/build_demo_store.py` adds a fourth thread, `demo-real-api`, produced by `examples/dependency_agent.py`. Its deterministic planner adds the package name `relategraphsaver`, which does not exist on PyPI; the lookup against the key-free PyPI JSON API returns a real 404.
+2. Building the store therefore needs network access to pypi.org. There is no offline or staged-data option for this thread. If the real lookups do not produce exactly the expected outcomes (a 404 for `relategraphsaver`, results for every other package), the build exits 1 and leaves the existing store unchanged.
+3. Reading the store stays offline and key-free, as before.
+4. The store is rebuilt once for this change; every rebuild writes new checkpoint ids, so the README and its tests are updated in the same commit.
+5. An optional run with a real language model, if the project owner approves its model and cost, goes into a separate file, `examples/data/demo-llm.rl`, so the main store never needs a key.
+
+This replaces the offline-build assumption for the demo store in the specification (AC-73, open question 8); no earlier ADR recorded it, so none is superseded.
+
+### Alternatives considered
+
+1. **Keep only staged failures:** Rejected; the demo would not show a failure the system did not stage.
+2. **An offline flag that fakes the PyPI answers:** Rejected; staged data could return unnoticed.
+3. **Record the language-model run in the main store:** Rejected; the main store must rebuild without a key.
+4. **Use an API that needs a key:** Rejected; evaluators could not re-run the build.
+
+### Consequences
+
+- **Positive:** The demo shows a real 404 from a public service, traced back to the planner step that caused it.
+- **Negative:** Rebuilding needs pypi.org, and package versions and summaries drift, so tests compare outcomes, not result text.
+- **Negative:** The demo depends on `relategraphsaver` staying absent from PyPI; if someone publishes that name, the build fails its own check and the demo must change.
+
+---
+
+## ADR-0020: relate-db Version Policy Decided by the Test Result
+
+Date: 2026-11-19  
+Status: Accepted
+
+### Context
+
+The package required `relate-db>=1.0.2`, the version on which we verified read-only opening ([ADR-0015](#adr-0015-read-only-opening-for-inspection-commands)). relate-db 1.1.0 is available. The README's benchmark numbers and the sentence that the flush cost grows with file size were measured on 1.0. Declaring a floor we have not tested, or keeping an open upper range we have not tested, can both mislead users.
+
+### Decision
+
+We ran the full test suite and `python benchmarks/bench_checkpointers.py --checkpoints 1000` in a fresh environment with relate-db 1.1.0, and the result decides:
+
+1. **If everything passes:** the requirement becomes `relate-db>=1.1.0`, the README benchmark table is replaced with numbers measured on 1.1.0, and the statement about flush cost is re-checked against them.
+2. **If anything fails:** the requirement becomes `relate-db>=1.0.2,<1.1`, and the README numbers and statements stay as they are.
+
+Outcome (2026-11-19): the requirement is now `relate-db>=1.1.0`. In a fresh virtual environment with relate-db 1.1.0 and only the `dev` extra installed, 604 tests passed and the benchmark ran to completion. The one failure was the mypy gate: strict mypy could not resolve the optional `langchain_openai` import used by `examples/openrouter_agent.py`. That defect does not involve relate-db and would fail on 1.0.2 as well. It was fixed by a mypy override that ignores the missing `langchain_openai` module, so a `dev`-only install passes without the `llm` extra, and a slow test now proves it in a fresh environment. With that fix the full suite passes on 1.1.0. The README benchmark block and table were replaced with the output of that run. The flush cost still grows with the size of the database file on 1.1.0: in a separate timing run of 1000 puts, the median put took about four times longer for the last 100 checkpoints (about 109 ms) than for the first 100 (about 26 ms), and 1.0.2 behaved the same (about 114 ms and 26 ms). The README statement was reworded to say this on 1.1.0.
+
+Either outcome keeps the README's version statements matching the requirement (AC-143).
+
+### Alternatives considered
+
+1. **Keep `>=1.0.2` with no upper bound and no test:** Rejected; users would get 1.1.0 by default without our having run anything on it.
+2. **Require 1.1.0 without testing:** Rejected for the same reason, and it would invalidate the published numbers.
+3. **Pin one exact version:** Rejected; it blocks bug-fix releases for users of a library.
+
+### Consequences
+
+- **Positive:** The declared range is always one we have run the suite on.
+- **Negative:** Users on relate-db 1.0.x can no longer install this package; the floor moved to 1.1.0 because that is the version the suite and benchmark ran on.
+- **Negative:** Future relate-db releases are not covered by this decision; whoever raises the floor or adds an upper bound must update this ADR, the requirement and the README together.
+
+## ADR-0021: Tool-Call Root Cause Anchors on the Failure Checkpoint
+
+Date: 2026-11-19  
+Status: Accepted
+
+### Context
+
+The saver links each tool call to one checkpoint with a `(:Checkpoint)-[:INVOKED]->(:ToolCall)` edge, attached by whichever save sees the call first: `put_writes()` for the step that requested the call (the edge lands on that step) or `put()` for the next checkpoint (the edge lands on the next step). LangGraph runs these two saves on different threads, so the same agent run can store the edge on either step. `trace_root_cause()` reported the `[:INVOKED]` checkpoint as `error_checkpoint_id` but started the argument-origin trace from the checkpoint where the tool failed. On runs where the edge landed on the requesting step, `origin_hops` no longer matched what `trace_argument_origin(thread_id, report.error_checkpoint_id, args)` returned, so the consistency promised by AC-119 held on some runs and not on others.
+
+### Decision
+
+When the error comes from a failing tool call, `trace_root_cause()` reports the failure checkpoint as `error_checkpoint_id`: the first checkpoint at or after the `[:INVOKED]` checkpoint on the `[:NEXT]` path whose writes hold the `ToolMessage` for the call, falling back to the `[:INVOKED]` checkpoint when none is found. That checkpoint is the same under both edge layouts, and the origin trace starts from it, so `origin_hops` and the reported error checkpoint always agree (AC-119, AC-129). Errors found through an `__error__` write or checkpoint metadata keep the checkpoint they were found on. The saver's edge placement is unchanged.
+
+### Alternatives considered
+
+1. **Make the saver's edge placement deterministic:** Rejected; it would change which checkpoint already stored runs attach to, which is an expensive-to-change contract, and it needs an ordering between the two saves that LangGraph does not guarantee.
+2. **Start the origin trace from the `[:INVOKED]` checkpoint instead:** Rejected; hops would then count from the step before the tool ran on some runs, which breaks AC-129.
+
+### Consequences
+
+- **Positive:** `error_checkpoint_id`, `origin_hops` and `trace_argument_origin()` agree on every run, whichever step the edge landed on.
+- **Positive:** No stored data changes; the committed demo store produces the same README output as before.
+- **Negative:** `causal_path_length` for tool-call failures still depends on where the `[:INVOKED]` edge attached, so it can differ by one step between two runs of the same agent.
+- **Negative:** Edge placement still decides which tool calls forensics and `failure_summary()` find, so it stays an expensive-to-change contract.
+
+---
+
+## ADR-0022: Replay Input Errors and Message-Edit Safety
+
+Date: 2026-11-20  
+Status: Accepted
+
+### Context
+
+[ADR-0017](#adr-0017-replay-runs-user-graph-code-only-against-an-in-memory-sandbox) lets replay run a user's graph with edits. Three gaps showed up. Invalid replay inputs were documented as `ValueError`, but the CLI could not tell them apart from an exception raised inside user graph code, so a crashing node and a bad argument printed the same way. A factory that does not accept `checkpointer=` failed with a bare `TypeError` instead of the spec error users already get for other bad graphs. And a `set_messages` edit relies on LangGraph's `add_messages` reducer to replace a message by id; on a graph whose `messages` channel has another reducer, or none, the same edit would append a duplicate or overwrite the whole history. We also needed to know whether a replay with no edit really re-runs the step at the fork point, because `fork_in_memory` copies that checkpoint's stored writes into the sandbox.
+
+### Decision
+
+1. Invalid replay inputs raise `ReplayInputError`, which subclasses both `RelateCheckpointError` and `ValueError`, so the documented `ValueError` contract still holds (AC-151, AC-155). The CLI prints its message as a plain `Error:` line; any other exception from user graph code prints `Error: replay failed: <Type>: <message>`.
+2. Before calling a factory, replay checks that its signature accepts `checkpointer=` (`inspect.signature(factory).bind(checkpointer=...)`). Only a failed bind raises `GraphSpecError` naming `checkpointer`, before any node runs (AC-155). A `TypeError` raised inside the factory body is the user's own error: it propagates and the CLI prints `Error: replay failed: TypeError: <message>`. A factory whose signature cannot be inspected is called directly.
+3. Before applying `set_messages`, replay checks that the compiled graph's `messages` channel is a `BinaryOperatorAggregate` reduced by LangGraph's `add_messages`. A `functools.partial` wrapper, such as the one `add_messages(format=...)` returns, is unwrapped first; the function then matches by identity, or by module `langgraph.graph.message` and name for LangGraph's wrapped reducer. A function with the same name from another module does not match, because it would append instead of replacing by id. Otherwise it raises `ReplayInputError` mentioning `add_messages`, and the graph is not run (AC-156).
+4. No code change for no-edit replays: we verified on LangGraph 1.2.22 that `invoke` from the fork checkpoint re-executes the fork step even though its writes were copied, and `updated_checkpoint_id` equals `fork_checkpoint_id`. AC-154 guards this behaviour so a LangGraph upgrade that changes it fails the suite.
+
+### Alternatives considered
+
+1. **Send the full edited message list instead of only the edited messages:** Rejected; under `add_messages` it duplicates every unedited message, and without `add_messages` it silently truncates or replaces history.
+2. **Delete the fork checkpoint's writes in the sandbox before a no-edit replay:** Rejected; LangGraph already re-runs the step, so it adds code for no observed benefit.
+3. **Use `update_state(..., as_node="__copy__")` to force a fresh step:** Rejected; it needs a LangGraph floor above our declared `>=0.2.0`.
+4. **Keep plain `ValueError` for input errors:** Rejected; the CLI could not separate input errors from failures inside user code.
+
+### Consequences
+
+- **Positive:** Code that catches `ValueError` keeps working, and the CLI now says whether the user's input or the user's graph failed.
+- **Positive:** A message edit can no longer silently corrupt the replayed history on a graph without `add_messages`.
+- **Negative:** `ReplayInputError` is also a `RelateCheckpointError`, so handlers must catch it before that base class, or it is reported as a database error.
+- **Negative:** Graphs with a custom message reducer cannot use `set_messages`; they must use `update`.
+- **Negative:** The no-edit behaviour depends on LangGraph internals; AC-154 detects a change but does not prevent it.
+
+---
+
+## ADR-0023: Replay Diff Compares Full Message Content
+
+Date: 2026-11-20  
+Status: Accepted
+
+### Context
+
+[ADR-0017](#adr-0017-replay-runs-user-graph-code-only-against-an-in-memory-sandbox) compared messages by index and their first 120 characters. Two replays whose messages differed only after character 120, or only in an AI message's tool-call names or arguments, were reported as identical, so the diff could hide the change the user was looking for.
+
+### Decision
+
+This replaces the message rule in decision 4 of ADR-0017; the rest of ADR-0017 stands. Messages are compared by index with `==`, never by `repr`: two messages are equal when they have the same type, the same content and the same sequence of tool-call `(name, arguments)` pairs (AC-159). String content is compared as is. List content is compared block by block with every `id` key removed at any nesting depth, because content blocks get fresh ids in every run. Dict key order and object reprs therefore never produce a change. Message ids and tool-call ids are never compared, because they are random in every run (AC-106); a tool argument that is itself named `id` is still compared. The text shown for a changed message stays the first 120 characters plus `...` when longer; the marker is never part of the comparison.
+
+### Alternatives considered
+
+1. **Keep the 120-character comparison:** Rejected; it hides late differences in long messages and every tool-call argument change.
+2. **Compare whole messages with `==`:** Rejected; message and tool-call ids differ in every run, so every message would appear changed.
+3. **Show the full text of changed messages:** Rejected; long messages make the CLI table unreadable.
+
+### Consequences
+
+- **Positive:** Any change in message content or requested tool calls appears in the diff.
+- **Negative:** Replays that differ only late in long messages, such as a timestamp in model output, now show a change where they showed none before.
+- **Negative:** Two messages can show the same truncated text and still be reported as `changed`; the user must inspect the stored state to see where they differ.

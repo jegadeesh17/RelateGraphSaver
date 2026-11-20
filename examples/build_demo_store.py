@@ -1,15 +1,20 @@
 """Regenerate the committed demo store at ``examples/data/demo.rl``.
 
-Runs both example agents offline (no API key, no network) into a single-file Relate store with
-exactly three threads, so an evaluator can explore real checkpoints with ``relate-dag`` straight
-after cloning (AC-69..AC-75):
+Runs the example agents into a single-file Relate store with exactly four threads, so an
+evaluator can explore real checkpoints with ``relate-dag`` straight after cloning
+(AC-69..AC-75, AC-133):
 
     demo-tool-fail   tool agent, ``fetch_source`` fails on purpose
     demo-tool-ok     tool agent, ``fetch_source`` succeeds
     demo-research    research agent, human review auto-approved
+    demo-real-api    dependency agent, real PyPI lookups; the ``relategraphsaver`` lookup
+                     returns HTTP 404
 
-The store is built beside its destination and moved into place only after the saver is closed,
-so an existing file is never left half-written and no sidecar files remain.
+The first three threads need no API key and no network. The fourth calls https://pypi.org, so
+rebuilding the store needs network access (ADR-0019); there is no offline option. The store is
+built beside its destination and moved into place only after the saver is closed and the PyPI
+lookups are checked, so an existing file is never left half-written or replaced by a store
+recorded during an outage, and no sidecar files remain (AC-136).
 
 Usage:
     python examples/build_demo_store.py [--out PATH]
@@ -22,21 +27,33 @@ import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 # Allow ``python examples/build_demo_store.py`` to import the sibling example modules.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from examples import dependency_agent  # noqa: E402
+from examples.dependency_agent import FetchJson, run_dependency_agent  # noqa: E402
 from examples.research_agent import run_research_workflow  # noqa: E402
 from examples.tool_agent import run_tool_agent  # noqa: E402
 
-from langgraph_checkpoint_relate.saver import RelateSaver  # noqa: E402
+from langgraph_checkpoint_relate.saver import RelateSaver, _extract_bytes  # noqa: E402
 
 DEFAULT_OUT_PATH = Path(__file__).resolve().parent / "data" / "demo.rl"
 TOOL_FAIL_THREAD = "demo-tool-fail"
 TOOL_OK_THREAD = "demo-tool-ok"
 RESEARCH_THREAD = "demo-research"
-DEMO_THREADS = (TOOL_FAIL_THREAD, TOOL_OK_THREAD, RESEARCH_THREAD)
+REAL_API_THREAD = "demo-real-api"
+DEMO_THREADS = (TOOL_FAIL_THREAD, TOOL_OK_THREAD, RESEARCH_THREAD, REAL_API_THREAD)
+MISSING_PACKAGE = "relategraphsaver"
 STORE_SUFFIX = ".rl"
+# The recorded LLM run lives in its own store; this script must never replace it (AC-141).
+PROTECTED_STORE_NAME = "demo-llm.rl"
+
+
+def _is_protected(out_path: Path | str) -> bool:
+    """True when ``out_path`` names the recorded LLM store, ignoring letter case."""
+    return Path(out_path).name.casefold() == PROTECTED_STORE_NAME.casefold()
 
 
 def _remove_if_exists(path: Path) -> None:
@@ -64,24 +81,82 @@ def _cleanup_staging(staging: Path) -> None:
         print(f"[WARN] Could not remove leftover {staging}: {exc}", file=sys.stderr)
 
 
-def build_demo_store(out_path: Path | str = DEFAULT_OUT_PATH) -> Path:
-    """Build the three-thread demo store at ``out_path``, replacing any existing file.
+class PyPIUnreachableError(RuntimeError):
+    """The real-API thread did not record the expected PyPI lookups (AC-136)."""
+
+
+def _check_real_api_lookups(saver: RelateSaver) -> None:
+    """Fail unless the ``relategraphsaver`` lookup holds a 404 error and the rest a result.
+
+    ``ToolNode`` turns a network error into a tool error, so a run during an outage completes
+    normally; the recorded tool calls are the only place the outage shows (AC-135).
+
+    Raises:
+        PyPIUnreachableError: With the first unexpected tool error, or a short description when
+            a lookup is missing, holds neither a result nor the expected 404, or recorded
+            arguments that are missing, undecodable or not a dict.
+    """
+    rows: list[dict[str, Any]] = saver.proxy.execute_read(
+        "MATCH (c:Checkpoint {thread_id: $tid})-[:INVOKED]->(tc:ToolCall) "
+        "RETURN tc.args_blob AS args, tc.error AS error, tc.result_blob AS result",
+        {"tid": REAL_API_THREAD},
+    )
+    lookups: list[tuple[str, str | None, bool]] = []
+    for row in rows:
+        try:
+            args = saver.serde.loads(_extract_bytes(row["args"]))
+        except Exception as exc:  # a missing or corrupt blob means the run is unusable
+            raise PyPIUnreachableError("a lookup recorded unreadable arguments") from exc
+        if not isinstance(args, dict):
+            raise PyPIUnreachableError("a lookup recorded unreadable arguments")
+        # ToolNode appends a retry hint on a second line; the first line names the failure.
+        error_lines = (row["error"] or "").strip().splitlines()
+        error = error_lines[0].strip() if error_lines else None
+        lookups.append((str(args.get("name", "")), error, row["result"] is not None))
+    names = [name for name, _, _ in lookups]
+    for name, error, has_result in lookups:
+        if name == MISSING_PACKAGE:
+            if error is None or "404" not in error:
+                raise PyPIUnreachableError(error or f"the {name} lookup did not fail with 404")
+        elif error is not None:
+            raise PyPIUnreachableError(error)
+        elif not has_result:
+            raise PyPIUnreachableError(f"the {name} lookup recorded no result")
+    if MISSING_PACKAGE not in names or len(names) < 2:
+        raise PyPIUnreachableError("the dependency lookups were not recorded")
+
+
+def build_demo_store(
+    out_path: Path | str = DEFAULT_OUT_PATH, *, fetch_json: FetchJson | None = None
+) -> Path:
+    """Build the four-thread demo store at ``out_path``, replacing any existing file.
 
     Args:
         out_path: Destination of the single-file store; it must end in ``.rl``. Parent
             directories are created.
+        fetch_json: Fetcher the ``demo-real-api`` thread calls for each package name. ``None``
+            means ``examples.dependency_agent.fetch_pypi_json``, looked up when called.
 
     Returns:
         The destination path, holding a closed store; the build leaves no other file beside it.
 
     Raises:
-        ValueError: If ``out_path`` is empty or does not end in ``.rl``. Nothing is created.
+        ValueError: If ``out_path`` is empty, does not end in ``.rl`` or is named
+            ``demo-llm.rl``, the recorded LLM store. Nothing is created or changed.
+        PyPIUnreachableError: If the lookups do not hold the expected 404 and results. The
+            existing store, if any, is left unchanged and no staging file remains.
     """
     destination = Path(out_path)
     if not str(out_path).strip():
         raise ValueError("out_path must be a non-empty path")
     if destination.suffix != STORE_SUFFIX:
         raise ValueError(f'out_path "{out_path}" must end in "{STORE_SUFFIX}"')
+    if _is_protected(destination):
+        raise ValueError(
+            f'out_path "{out_path}" is the recorded LLM store "{PROTECTED_STORE_NAME}"; '
+            "this script builds demo.rl only"
+        )
+    fetcher = fetch_json if fetch_json is not None else dependency_agent.fetch_pypi_json
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     # Relate picks single-file mode from the ``.rl`` suffix, so the staging name must keep it.
@@ -98,6 +173,8 @@ def build_demo_store(out_path: Path | str = DEFAULT_OUT_PATH) -> Path:
                 saver=saver,
                 print_output=False,
             )
+            run_dependency_agent(saver, REAL_API_THREAD, fetch_json=fetcher)
+            _check_real_api_lookups(saver)
         finally:
             saver.close()
         os.replace(staging, destination)
@@ -110,7 +187,7 @@ def build_demo_store(out_path: Path | str = DEFAULT_OUT_PATH) -> Path:
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse command line arguments for the demo store builder."""
     parser = argparse.ArgumentParser(
-        description="Regenerate the committed Relate demo store without API keys or network",
+        description="Regenerate the committed Relate demo store (needs network access to pypi.org)",
     )
     parser.add_argument(
         "--out",
@@ -124,8 +201,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI entry point: build the store and report where it was written."""
     args = parse_args(argv)
+    if _is_protected(args.out):
+        print(
+            f"Error: refusing to write {PROTECTED_STORE_NAME}, the recorded LLM store; "
+            "this script builds demo.rl only. Choose another --out path.",
+            file=sys.stderr,
+        )
+        return 1
     try:
         written = build_demo_store(args.out)
+    except PyPIUnreachableError as exc:
+        print(f"Error: could not reach pypi.org: {exc}", file=sys.stderr)
+        return 1
     except Exception as exc:
         print(f"[ERROR] Could not build the demo store: {exc}", file=sys.stderr)
         return 1

@@ -16,13 +16,17 @@ import tempfile
 import time
 from collections.abc import Generator
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Annotated, Any, TypedDict
+from unittest.mock import patch
 
 import pytest
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import tool
 from langgraph.checkpoint.base import empty_checkpoint
 from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
 
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
 _SRC_DIR = str(Path(__file__).resolve().parents[2] / "src")
@@ -485,3 +489,310 @@ class TestRelateForensics:
         assert report.root_tool_name == "slow_api"
         assert report.causal_path_length == chain_length - 1
         assert elapsed < 1.0
+
+
+class ProvenanceState(TypedDict):
+    """State for the argument provenance graph: a planner-chosen target and a message log."""
+
+    target: str
+    messages: Annotated[list[AnyMessage], add_messages]
+
+
+PLANNED_TARGET = "pkg-alpha-9000"
+FETCH_CALL_ID = "call-provenance-1"
+
+
+@tool
+def fetch_package(url: str, retries: int = 1) -> str:
+    """Fetch a package; fails for every url unless it ends with 'ok'."""
+    if not url.endswith("ok"):
+        raise RuntimeError(f"no such package: {url}")
+    return f"fetched {url} after {retries} tries"
+
+
+def _run_provenance_graph(saver: RelateSaver, thread_id: str, target: str) -> None:
+    """Run planner -> agent -> tools; the planner writes ``target`` and the tool consumes it."""
+
+    def planner(state: ProvenanceState) -> dict[str, Any]:
+        return {"target": target}
+
+    def agent(state: ProvenanceState) -> dict[str, Any]:
+        call = {
+            "id": FETCH_CALL_ID,
+            "name": "fetch_package",
+            "args": {"url": state["target"], "retries": 5},
+        }
+        return {"messages": [AIMessage(content="", tool_calls=[call])]}
+
+    builder = StateGraph(ProvenanceState)
+    builder.add_node("planner", planner)
+    builder.add_node("agent", agent)
+    builder.add_node("tools", ToolNode([fetch_package], handle_tool_errors=True))
+    builder.add_edge(START, "planner")
+    builder.add_edge("planner", "agent")
+    builder.add_edge("agent", "tools")
+    builder.add_edge("tools", END)
+    graph = builder.compile(checkpointer=saver)
+    graph.invoke(
+        {"messages": [HumanMessage(content="please look the package up")], "target": ""},
+        {"configurable": {"thread_id": thread_id}},
+    )
+
+
+class TestArgumentProvenance:
+    """Argument provenance: which step first held a failing tool's argument (ADR-0018)."""
+
+    THREAD = "thread-provenance"
+
+    @staticmethod
+    def _failure_checkpoint_id(saver: RelateSaver, thread_id: str) -> str:
+        """Return the checkpoint whose writes hold the failing tool's ToolMessage."""
+        rows = saver.proxy.execute_read(
+            "MATCH (c:Checkpoint {thread_id: $t})-[:HAS_WRITE]->(w:Write) "
+            "WHERE w.channel = 'messages' RETURN c.checkpoint_id AS id, c.step AS step, "
+            "w.write_blob AS blob ORDER BY c.step",
+            {"t": thread_id},
+        )
+        for row in rows:
+            value = saver.serde.loads(bytes(row["blob"]))
+            if any(isinstance(m, ToolMessage) for m in value):
+                return str(row["id"])
+        raise AssertionError("no ToolMessage write found")
+
+    def test_origin_names_node_step_and_hops_of_earliest_write_ac_119(self) -> None:
+        """AC-119: the planner's write, not the later model message, is the origin."""
+        with RelateSaver(":memory:") as saver:
+            _run_provenance_graph(saver, self.THREAD, PLANNED_TARGET)
+            failure_cp = self._failure_checkpoint_id(saver, self.THREAD)
+
+            with RelateForensics(saver) as forensics:
+                origin = forensics.trace_argument_origin(
+                    self.THREAD, failure_cp, {"url": PLANNED_TARGET, "retries": 5}
+                )
+
+        assert origin is not None
+        assert origin.argument == "url"
+        assert origin.value == PLANNED_TARGET
+        assert origin.node == "planner"
+        # The planner ran from the step 0 checkpoint; the tool ran from the step 2 checkpoint.
+        assert origin.step == 0
+        assert origin.hops == 2
+
+    def test_origin_is_case_sensitive_ac_119(self) -> None:
+        """AC-119: containment is case-sensitive, so a different case finds nothing."""
+        with RelateSaver(":memory:") as saver:
+            _run_provenance_graph(saver, self.THREAD, PLANNED_TARGET)
+            failure_cp = self._failure_checkpoint_id(saver, self.THREAD)
+
+            with RelateForensics(saver) as forensics:
+                origin = forensics.trace_argument_origin(
+                    self.THREAD, failure_cp, {"url": PLANNED_TARGET.upper()}
+                )
+
+        assert origin is None
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            {"retries": 5, "flag": True, "items": ["pkg-alpha-9000"]},
+            {"url": "pk"},
+            {"url": "never-written-anywhere"},
+            {},
+        ],
+        ids=["non-string", "shorter-than-3", "untraceable", "empty"],
+    )
+    def test_untraceable_arguments_return_none_ac_120(self, args: dict[str, Any]) -> None:
+        """AC-120: non-string, short and untraceable arguments give no origin."""
+        with RelateSaver(":memory:") as saver:
+            _run_provenance_graph(saver, self.THREAD, PLANNED_TARGET)
+            failure_cp = self._failure_checkpoint_id(saver, self.THREAD)
+
+            with RelateForensics(saver) as forensics:
+                assert forensics.trace_argument_origin(self.THREAD, failure_cp, args) is None
+
+    def test_invalid_identifiers_are_rejected_ac_120(self) -> None:
+        """AC-120: an empty thread or checkpoint id raises instead of returning a guess."""
+        with RelateSaver(":memory:") as saver, RelateForensics(saver) as forensics:
+            with pytest.raises(CheckpointNotFoundError):
+                forensics.trace_argument_origin("", "cp-1", {"url": "abcdef"})
+            with pytest.raises(CheckpointNotFoundError):
+                forensics.trace_argument_origin("thread", " ", {"url": "abcdef"})
+
+    def test_trace_root_cause_fills_origin_for_failing_tool_ac_121(self) -> None:
+        """AC-121: the report names the argument, node, step and hops from the failing call."""
+        with RelateSaver(":memory:") as saver:
+            _run_provenance_graph(saver, self.THREAD, PLANNED_TARGET)
+
+            with RelateForensics(saver) as forensics:
+                report = forensics.trace_root_cause(self.THREAD)
+
+        assert report.root_tool_call_id == FETCH_CALL_ID
+        assert report.origin_argument == "url"
+        assert report.origin_node == "planner"
+        assert report.origin_step == 0
+        assert report.origin_hops == 2
+        assert "planner" not in report.diagnostic_summary
+
+    def test_trace_root_cause_leaves_origin_empty_without_failure_ac_121(self) -> None:
+        """AC-121: a thread whose tool call succeeds has no origin fields."""
+        with RelateSaver(":memory:") as saver:
+            _run_provenance_graph(saver, self.THREAD, "pkg-ok")
+
+            with RelateForensics(saver) as forensics:
+                report = forensics.trace_root_cause(self.THREAD)
+
+        assert report.error_message == "No error detected"
+        assert report.origin_argument is None
+        assert report.origin_node is None
+        assert report.origin_step is None
+        assert report.origin_hops is None
+
+    def test_ac121_root_cause_resolves_the_failure_checkpoint_once(self) -> None:
+        """AC-121: one root-cause trace anchors on the failure checkpoint once (ADR-0021)."""
+        original = RelateForensics._failure_checkpoint_id
+        with RelateSaver(":memory:") as saver:
+            _run_provenance_graph(saver, self.THREAD, PLANNED_TARGET)
+
+            with RelateForensics(saver) as forensics:
+                with patch.object(
+                    RelateForensics,
+                    "_failure_checkpoint_id",
+                    autospec=True,
+                    side_effect=original,
+                ) as anchor:
+                    report = forensics.trace_root_cause(self.THREAD)
+
+        assert report.root_tool_call_id == FETCH_CALL_ID
+        assert report.origin_node == "planner"
+        assert anchor.call_count == 1
+
+
+@tool
+def parse_manifest(url: str) -> str:
+    """Parse a manifest; always fails."""
+    raise RuntimeError(f"cannot parse manifest at {url}")
+
+
+@tool
+def alpha_check(url: str) -> str:
+    """Check a package; always fails."""
+    raise RuntimeError(f"check failed for {url}")
+
+
+@tool
+def echo_value(url: str) -> str:
+    """Echo the url; never fails."""
+    return f"echo {url}"
+
+
+SUMMARY_TOOLS = [fetch_package, parse_manifest, alpha_check, echo_value]
+
+
+def _run_summary_thread(
+    saver: RelateSaver, thread_id: str, call_id: str, tool_name: str, target: str
+) -> None:
+    """Run planner -> agent -> tools where the agent calls ``tool_name`` with the planned target."""
+
+    def planner(state: ProvenanceState) -> dict[str, Any]:
+        return {"target": target}
+
+    def agent(state: ProvenanceState) -> dict[str, Any]:
+        call = {"id": call_id, "name": tool_name, "args": {"url": state["target"]}}
+        return {"messages": [AIMessage(content="", tool_calls=[call])]}
+
+    builder = StateGraph(ProvenanceState)
+    builder.add_node("planner", planner)
+    builder.add_node("agent", agent)
+    builder.add_node("tools", ToolNode(SUMMARY_TOOLS, handle_tool_errors=True))
+    builder.add_edge(START, "planner")
+    builder.add_edge("planner", "agent")
+    builder.add_edge("agent", "tools")
+    builder.add_edge("tools", END)
+    builder.compile(checkpointer=saver).invoke(
+        {"messages": [HumanMessage(content="please look it up")], "target": ""},
+        {"configurable": {"thread_id": thread_id}},
+    )
+
+
+class TestFailureSummary:
+    """Tool failures summarized across every thread of a store (AC-123)."""
+
+    def test_summary_counts_threads_origins_and_order_ac_123(self) -> None:
+        """AC-123: one entry per failing tool, ordered by failures then name, ok tools omitted."""
+        with RelateSaver(":memory:") as saver:
+            _run_summary_thread(saver, "t-a", "call-a", "fetch_package", "pkg-alpha-9000")
+            _run_summary_thread(saver, "t-b", "call-b", "fetch_package", "pkg-beta-9000")
+            _run_summary_thread(saver, "t-c", "call-c", "fetch_package", "pkg-ok")
+            _run_summary_thread(saver, "t-d", "call-d", "parse_manifest", "manifest-url-1")
+            _run_summary_thread(saver, "t-e", "call-e", "alpha_check", "check-target-1")
+            _run_summary_thread(saver, "t-f", "call-f", "echo_value", "echo-target-1")
+
+            with RelateForensics(saver) as forensics:
+                summary = forensics.failure_summary()
+
+        assert [s.tool_name for s in summary] == ["fetch_package", "alpha_check", "parse_manifest"]
+        fetch, alpha, manifest = summary
+        assert (fetch.failures, fetch.total_calls) == (2, 3)
+        assert fetch.threads == ("t-a", "t-b")
+        assert fetch.origin_nodes == ("planner",)
+        assert (alpha.failures, alpha.total_calls, alpha.threads) == (1, 1, ("t-e",))
+        assert alpha.origin_nodes == ("planner",)
+        assert (manifest.failures, manifest.total_calls, manifest.threads) == (1, 1, ("t-d",))
+        assert manifest.origin_nodes == ("planner",)
+
+    def test_summary_is_empty_without_failures_ac_123(self) -> None:
+        """AC-123: a store whose tool calls all succeed, and an empty store, give no entries."""
+        with RelateSaver(":memory:") as saver:
+            with RelateForensics(saver) as forensics:
+                assert forensics.failure_summary() == []
+            _run_summary_thread(saver, "t-ok", "call-ok", "echo_value", "echo-target-1")
+            with RelateForensics(saver) as forensics:
+                assert forensics.failure_summary() == []
+
+    def test_ac158_failure_summary_counts_calls_linked_through_a_write(self) -> None:
+        """AC-158/AC-123: a tool call linked only by (:Write)-[:INVOKED] is summarized too."""
+        thread_id, call_id = "t-write", "call-write"
+        with RelateSaver(":memory:") as saver:
+            _run_summary_thread(saver, thread_id, call_id, "parse_manifest", "manifest-url-1")
+            rows = saver.proxy.execute_read(
+                "MATCH (c:Checkpoint)-[:INVOKED]->(tc:ToolCall {call_id: $call_id}) "
+                "RETURN c.checkpoint_id AS checkpoint_id",
+                {"call_id": call_id},
+            )
+            assert rows, "the run must record the failing call on a checkpoint"
+            checkpoint_id = str(rows[0]["checkpoint_id"])
+
+            # Move the link from the checkpoint to one of its writes (the reserved edge).
+            saver.proxy.execute_write(
+                "MATCH (:Checkpoint)-[r:INVOKED]->(:ToolCall {call_id: $call_id}) DELETE r",
+                {"call_id": call_id},
+            )
+            for write_id, channel in (("w-reserved", "results"), ("w-error", "__error__")):
+                saver.proxy.execute_write(
+                    "MATCH (c:Checkpoint {checkpoint_id: $cid}) "
+                    "CREATE (w:Write {write_id: $write_id, thread_id: $thread_id, "
+                    "  checkpoint_ns: '', checkpoint_id: $cid, task_id: 'task-w', "
+                    "  channel: $channel, idx: 0}) "
+                    "CREATE (c)-[:HAS_WRITE]->(w)",
+                    {
+                        "cid": checkpoint_id,
+                        "write_id": write_id,
+                        "thread_id": thread_id,
+                        "channel": channel,
+                    },
+                )
+            saver.proxy.execute_write(
+                "MATCH (w:Write {write_id: 'w-reserved'}), (tc:ToolCall {call_id: $call_id}) "
+                "CREATE (w)-[:INVOKED]->(tc)",
+                {"call_id": call_id},
+            )
+
+            with RelateForensics(saver) as forensics:
+                summary = forensics.failure_summary()
+                report = forensics.trace_root_cause(thread_id)
+
+        assert [(s.tool_name, s.failures, s.total_calls, s.threads) for s in summary] == [
+            ("parse_manifest", 1, 1, (thread_id,))
+        ]
+        assert report.root_tool_call_id == call_id
+        assert report.root_tool_name == summary[0].tool_name

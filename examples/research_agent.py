@@ -67,9 +67,9 @@ def researcher(state: ResearchState) -> dict[str, Any]:
     topic = (state.get("topic") or "").strip() or DEFAULT_TOPIC
     research_notes = [
         f"Primary finding for '{topic}': Property graphs model state lineages as first-class entities.",
-        "Relate DB embedded engine achieves sub-millisecond checkpoint persistence with zero external daemons.",
-        "Causal :NEXT relationships eliminate branch-tracking ambiguities across concurrent LangGraph workers.",
-        "Embedded Cypher queries enable instantaneous cycle and root-cause error diagnostics in execution history.",
+        "Relate stores checkpoints in one local file and needs no separate database server.",
+        "[:NEXT] relationships record which checkpoint followed which.",
+        "Cypher queries over that history find loops and the step a failure came from.",
     ]
     return {
         "research_notes": research_notes,

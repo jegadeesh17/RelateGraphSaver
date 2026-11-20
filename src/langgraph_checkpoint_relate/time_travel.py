@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from langgraph_checkpoint_relate.errors import (
@@ -13,6 +14,8 @@ from langgraph_checkpoint_relate.saver import _extract_bytes, _utc_now_iso
 from langgraph_checkpoint_relate.tool_calls import extract_tool_events
 
 if TYPE_CHECKING:
+    from langgraph_checkpoint_relate.models import ReplayResult
+    from langgraph_checkpoint_relate.replay import GraphFactory
     from langgraph_checkpoint_relate.saver import RelateSaver
 
 logger = logging.getLogger(__name__)
@@ -373,6 +376,33 @@ class TimeTravelEngine:
         in_memory_saver.proxy.execute_batch(statements)
 
         return in_memory_saver
+
+    @staticmethod
+    def replay(
+        source_saver: RelateSaver,
+        thread_id: str,
+        checkpoint_id: str,
+        factory: GraphFactory,
+        *,
+        update: dict[str, Any] | None = None,
+        as_node: str | None = None,
+        set_messages: Mapping[int, str] | None = None,
+    ) -> ReplayResult:
+        """Replay the thread from a checkpoint in a sandbox and diff it (AC-108).
+
+        Delegates to ``replay_from_checkpoint`` with the same arguments.
+        """
+        from langgraph_checkpoint_relate.replay import replay_from_checkpoint
+
+        return replay_from_checkpoint(
+            source_saver,
+            thread_id,
+            checkpoint_id,
+            factory,
+            update=update,
+            as_node=as_node,
+            set_messages=set_messages,
+        )
 
 
 def fork_in_memory(

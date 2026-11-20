@@ -78,20 +78,21 @@ def test_index_unreachable_ignores_other_failures_ac_33(output: str) -> None:
     assert _index_unreachable(output) is None
 
 
-@pytest.mark.slow
-def test_clean_install_relate_dag_help_ac_33(tmp_path: Path) -> None:
-    """AC-33: pip install in a fresh venv, then relate-dag --help exits 0 with subcommands."""
-    env_dir = tmp_path / "clean-venv"
+def _fresh_venv(env_dir: Path) -> tuple[Path, Path]:
+    """Create a virtual environment with pip; return its python executable and script directory."""
     venv.create(env_dir, with_pip=True)
     bin_dir = env_dir / ("Scripts" if sys.platform == "win32" else "bin")
     suffix = ".exe" if sys.platform == "win32" else ""
-    python = bin_dir / f"python{suffix}"
-    relate_dag = bin_dir / f"relate-dag{suffix}"
+    return bin_dir / f"python{suffix}", bin_dir
 
+
+def _pip_install_or_skip(python: Path, pip_args: list[str], cwd: Path | None = None) -> None:
+    """Run pip install in the environment; skip only when the package index is unreachable."""
     install = subprocess.run(
-        [str(python), "-m", "pip", "install", str(_REPO_ROOT)],
+        [str(python), "-m", "pip", "install", *pip_args],
         capture_output=True,
         text=True,
+        cwd=cwd,
         timeout=_INSTALL_TIMEOUT_SECONDS,
     )
     install_output = f"{install.stdout}\n{install.stderr}"
@@ -102,6 +103,16 @@ def test_clean_install_relate_dag_help_ac_33(tmp_path: Path) -> None:
                 f"package index unreachable, clean install not verified: {unreachable_line}"
             )
     assert install.returncode == 0, f"pip install failed:\n{install_output}"
+
+
+@pytest.mark.slow
+def test_clean_install_relate_dag_help_ac_33(tmp_path: Path) -> None:
+    """AC-33: pip install in a fresh venv, then relate-dag --help exits 0 with subcommands."""
+    python, bin_dir = _fresh_venv(tmp_path / "clean-venv")
+    suffix = ".exe" if sys.platform == "win32" else ""
+    relate_dag = bin_dir / f"relate-dag{suffix}"
+
+    _pip_install_or_skip(python, [str(_REPO_ROOT)])
     assert relate_dag.exists(), f"relate-dag executable not found at {relate_dag}"
 
     result = subprocess.run(
@@ -116,3 +127,41 @@ def test_clean_install_relate_dag_help_ac_33(tmp_path: Path) -> None:
         assert subcommand in result.stdout, f"Subcommand {subcommand!r} missing from help output"
     assert "ImportError" not in output
     assert "ModuleNotFoundError" not in output
+
+
+_MYPY_TIMEOUT_SECONDS = 900
+
+
+@pytest.mark.slow
+def test_dev_extra_install_passes_mypy_gate_without_llm_extra_ac_37(tmp_path: Path) -> None:
+    """AC-37: in a venv with only the dev extra (no langchain-openai), `mypy src tests` exits 0.
+
+    The check first proves the venv really lacks langchain_openai, so a pass cannot come from
+    an extra that happens to be installed.
+    """
+    python, _ = _fresh_venv(tmp_path / "dev-venv")
+    _pip_install_or_skip(python, ["-e", ".[dev]"], cwd=_REPO_ROOT)
+
+    probe = subprocess.run(
+        [
+            str(python),
+            "-c",
+            "import importlib.util, sys; "
+            "sys.exit(importlib.util.find_spec('langchain_openai') is not None)",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=_HELP_TIMEOUT_SECONDS,
+    )
+    assert probe.returncode == 0, "langchain_openai is installed; this venv is not dev-only"
+
+    mypy = subprocess.run(
+        [str(python), "-m", "mypy", "src", "tests"],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=_MYPY_TIMEOUT_SECONDS,
+    )
+    output = f"{mypy.stdout}{mypy.stderr}"
+    assert mypy.returncode == 0, f"mypy failed in a dev-only install:\n{output}"
+    assert "Success:" in output

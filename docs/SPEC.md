@@ -31,6 +31,7 @@ The product capabilities are structured across four delivery milestones:
 - **Milestone 2:** Core Flows & Time-Travel Debugger (`put_writes` human-in-the-loop, `checkpoint_ns` subgraphs, `:memory:` sandboxed replay, `relate-dag tree` terminal visualizer).
 - **Milestone 3:** Forensic Diagnostics & Production Polish (Cypher loop detection, poison-tool root-cause analysis, multi-agent demo application, PyPI packaging).
 - **Milestone 4:** Judge Readiness (clean-install CLI fix, lint and type-check baseline, README Relate rationale and limits, `:ToolCall` capture from real runs, async checkpointer methods, SQLite comparison benchmark).
+- **Judge Impact:** tree status fix, graph re-execution replay with a run diff, argument provenance, cross-thread tool failures, a key-free real-API demo thread, README and metadata corrections (updated 2026-11-18).
 
 ### 2.1 Milestone 1: MVP Vertical Slice
 
@@ -156,6 +157,52 @@ New journey; no prior behavior.
 3. The script prints the four metrics for both savers and exits with code 0.
 4. The README publishes the measured numbers as measured, including metrics where SQLite is faster.
 
+### 2.5 Judge Impact
+
+These journeys change the finished package so that replay re-runs the graph, forensics traces a bad argument back to the step that produced it and across threads, the committed store holds a failure from a real public API, and the README is correct for a first-time evaluator. Synchronous checkpointer behavior and the graph schema stay unchanged.
+
+#### Journey 18: Reading Step Status in the Tree
+Starts from Journey 8, where every checkpoint with a stored write was tagged `[PENDING]`, including completed steps.
+1. The developer runs `relate-dag tree <thread>` on a finished run.
+2. Completed steps that have a next step show `[OK]`; their writes are labelled `write:`.
+3. Only a last step (no next checkpoint) that still holds writes shows `[PENDING]`; errors and interrupts keep their tags.
+
+#### Journey 19: Replaying a Run with an Edit from the CLI
+Starts from Journey 7, where `relate-dag replay` only cloned history into `:memory:` and did not run anything.
+1. The developer runs `relate-dag replay <thread> <checkpoint_id>` without `--graph` and sees the same summary as before plus a hint about `--graph`.
+2. The developer adds `--graph path/to/file.py:factory` and an edit (`--set-message INDEX=TEXT`, or `--update JSON` with optional `--as-node NAME`).
+3. The CLI re-runs the graph from that checkpoint in an in-memory sandbox and prints the replay result, a tool-call table (for example `fetch_source #1  error -> ok`) and the final state changes.
+4. Bad input prints an `Error:` line and exits with code 1. The source store is never modified.
+
+#### Journey 20: Replaying from Python
+1. The developer calls `replay_from_checkpoint(saver, thread_id, checkpoint_id, factory, set_messages=...)`.
+2. The result holds the fork, updated and final checkpoint ids, whether the run stopped at an interrupt, and a diff against the recorded run.
+3. The developer calls `diff_runs(recorded, replayed)` on two run snapshots to compare any two runs.
+
+#### Journey 21: Finding Where a Bad Argument Came From
+Starts from Journey 15, where the root-cause report named the failing tool call only.
+1. A tool fails on an argument that an earlier node produced.
+2. The developer runs `relate-dag forensics trace-error <thread>`.
+3. The report adds a line naming the node and step that first wrote the argument, and how many steps before the failure that was.
+
+#### Journey 22: Tool Failures Across Threads
+1. The developer runs `relate-dag forensics failures --db <store>`.
+2. A table lists each failing tool with its failure count, total calls, the threads it failed in, and the nodes its bad arguments came from.
+
+#### Journey 23: Exploring a Real-API Failure in the Committed Store
+1. The evaluator clones the repository and, without API keys, runs the README's four explore commands against `examples/data/demo.rl`.
+2. Thread `demo-real-api` shows a dependency audit whose planner added a package name that does not exist on PyPI; the lookup failed with a real 404.
+3. `trace-error` traces the bad name back to the planner, `forensics failures` lists the failing lookup, and the replay command turns `fetch_source` from error to ok. The store stays byte-identical.
+
+#### Journey 24: Evaluator Reads the README
+Starts from Journey 14 and the committed-store README.
+1. The evaluator reads a plain-language tagline, installs from source (no PyPI install line), and reads a "Why not X?" table comparing Neo4jSaver, SqliteSaver, LangGraph's built-in time travel and tracing tools.
+2. The project URLs in the package metadata lead to the real repository.
+
+#### Journey 25 (optional, only if the project owner approves): Recorded LLM Run
+1. The developer sets `OPENROUTER_API_KEY` in the environment, installs the `llm` extra, and runs `examples/openrouter_agent.py --model <model>`.
+2. The run is stored once in `examples/data/demo-llm.rl`, separate from the key-free store.
+
 ---
 
 ## 3. Acceptance Criteria
@@ -265,7 +312,7 @@ AC-69: Given a fresh clone of the repository, When the working tree is listed, T
 AC-70: Given a fresh clone with no other files created, When `relate-dag forensics trace-error demo-tool-fail --db examples/data/demo.rl` is run, Then it exits with code 0 and the report names `fetch_source` and its call id.
 AC-71: Given a fresh clone, When `relate-dag forensics trace-error demo-tool-ok --db examples/data/demo.rl` is run, Then it exits with code 0 and reports no tool failure.
 AC-72: Given a fresh clone, When `relate-dag tree demo-research --db examples/data/demo.rl` is run, Then it exits with code 0 and shows at least one checkpoint.
-AC-73: Given an environment with no LLM API keys set and no network access, When `python examples/build_demo_store.py` is run, Then it exits with code 0 and writes a closed single-file store at `examples/data/demo.rl` containing exactly the threads `demo-tool-fail`, `demo-tool-ok` and `demo-research`, with no sidecar files left beside it.
+AC-73: Given an environment with no LLM API keys set and no network access, When `python examples/build_demo_store.py` is run, Then it exits with code 0 and writes a closed single-file store at `examples/data/demo.rl` containing exactly the threads `demo-tool-fail`, `demo-tool-ok` and `demo-research`, with no sidecar files left beside it. (Superseded by AC-134 and AC-136: the store now also holds `demo-real-api`, which needs network access to pypi.org.)
 AC-74: Given two runs of `python examples/build_demo_store.py`, When the resulting stores are compared, Then they hold the same thread ids, the same number of checkpoints per thread, and the same `:ToolCall` tool names, call ids and error/no-error outcomes (checkpoint ids and timestamps may differ).
 AC-75: Given `examples/data/demo.rl` is read by any `relate-dag` command, When the command finishes, Then the tracked file is unchanged (`git status` reports no modification to it) and no sidecar file remains beside it.
 
@@ -286,6 +333,118 @@ AC-85: Given a path that does not exist, When `RelateSaver(path, read_only=True)
 AC-86: Given `read_only=True` with `":memory:"` or with a passed writable proxy, When the saver is constructed, Then `ValueError` is raised.
 AC-87: Given `RelateSaver(path)` without `read_only`, When a graph runs and the saver is closed and reopened, Then schema setup, saves and flush-on-close behave as before and the saved checkpoints are readable after reopening.
 
+### 3.6 Judge Impact
+
+#### Tree step status
+AC-88: Given a checkpoint with stored writes that has a child linked by `[:NEXT]` and is neither an error nor an interrupt, When `relate-dag tree <thread>` is run, Then that checkpoint is tagged `[OK]` and not `[PENDING]`.
+AC-89: Given a checkpoint with stored writes and no `[:NEXT]` child (a leaf) that is neither an error nor an interrupt, When `relate-dag tree <thread>` is run, Then it is tagged `[PENDING]`.
+AC-90: Given an error checkpoint, with or without writes or a `[:NEXT]` child, When the tree is rendered, Then it is tagged `[ERROR]` (error outranks every other status).
+AC-91: Given an interrupted checkpoint that is not an error, with or without writes or a `[:NEXT]` child, When the tree is rendered, Then it is tagged `[INTERRUPT]`.
+AC-92: Given a checkpoint whose only child is linked by `[:FORKED_TO]` (no `[:NEXT]` child) and that has stored writes, When the tree is rendered, Then it is tagged `[PENDING]`.
+AC-93: Given writes on a checkpoint with a `[:NEXT]` child, When the tree is rendered, Then each write is labelled `write: channel=..., task_id=...`; writes on a leaf keep the label `pending write:`.
+
+#### Replay engine (Python API)
+AC-94: Given a graph spec `path/to/file.py:attr` relative to the working directory, When `load_graph_factory(spec)` is called from a process whose `sys.path` does not contain the working directory, Then it returns the attribute loaded from that file.
+AC-95: Given a graph spec `package.module:attr` for an importable module, When `load_graph_factory(spec)` is called, Then it returns that attribute.
+AC-96: Given an attribute that is either a factory accepting `checkpointer=` or an uncompiled `StateGraph`, When it is passed to `replay_from_checkpoint`, Then the replay compiles it against the sandbox saver and completes in both cases.
+AC-97: Given a spec with no `:`, a missing file or module, a missing attribute, or an attribute that is neither callable nor a `StateGraph`, When `load_graph_factory(spec)` is called, Then a `ValueError` (or subclass) is raised whose message contains the spec.
+AC-98: Given the recorded failing tool-agent thread, When `replay_from_checkpoint` runs from its first checkpoint with no update and no message edit, Then the returned `ReplayResult.diff` has no tool-call changes, no message changes and no channel changes.
+AC-99: Given the recorded failing tool-agent thread, When `replay_from_checkpoint` runs from its step 0 checkpoint (the first checkpoint whose state holds the human message) with `set_messages={0: <working URL>}`, Then the diff reports `fetch_source` call 1 changing from error to ok with its `url` argument before and after, and the final answer message differs from the recorded one.
+AC-100: Given a replay with `set_messages={0: <text>}`, When the replayed run finishes, Then its message list holds exactly one human message at index 0, with the new text, and no copy of the original human message.
+AC-156: Given a graph whose `messages` channel is not reduced by `add_messages`, When `replay_from_checkpoint` is called with `set_messages`, Then `ReplayInputError` is raised mentioning `add_messages`, the graph is not run, and the source store is unchanged ([ADR-0022](DECISIONS.md#adr-0022-replay-input-errors-and-message-edit-safety)).
+AC-101: Given `update=<dict>` and `as_node=<node>`, When `replay_from_checkpoint` runs, Then `updated_checkpoint_id` differs from `fork_checkpoint_id` and the replayed run continues from the updated checkpoint.
+AC-154: Given a recorded run and a checkpoint whose next task already has stored writes, When `replay_from_checkpoint` is called with no edits, Then that task's node executes again on the sandbox, and `updated_checkpoint_id` equals `fork_checkpoint_id` ([ADR-0022](DECISIONS.md#adr-0022-replay-input-errors-and-message-edit-safety)).
+AC-102: Given a research-agent thread and a checkpoint before its human-review interrupt, When `replay_from_checkpoint` runs, Then it returns normally with `interrupted=True` and a diff covering the steps that ran.
+AC-103: Given a file store, When `replay_from_checkpoint` completes or raises, Then the file's sha256 and its directory listing are unchanged and the sandbox saver is closed.
+AC-104: Given two run snapshots whose tool calls have different call ids but the same tool names in the same order and the same outcomes, When `diff_runs` is called, Then no tool-call change is reported.
+AC-105: Given two run snapshots, When the second has an extra call to a tool, lacks a call, or a call whose arguments or outcome differ (matched by tool name and ordinal), Then `diff_runs` reports that call as added, removed or changed respectively.
+AC-106: Given two run snapshots that differ only in checkpoint ids, timestamps, message ids, tool-call ids, or channels named `__*` or `branch:*`, When `diff_runs` is called, Then the diff is empty ([ADR-0023](DECISIONS.md#adr-0023-replay-diff-compares-full-message-content)).
+AC-159: Given two run snapshots whose messages differ only after the first 120 characters, or only in an AI message's tool-call names or arguments, When `diff_runs` is called, Then that message is reported as `changed`, and the shown before/after text is truncated to 120 characters plus `...` ([ADR-0023](DECISIONS.md#adr-0023-replay-diff-compares-full-message-content)).
+AC-107: Given a fork point with several descendant branches, When a replay builds the recorded run, Then it uses the latest `[:NEXT]` leaf that descends from the fork point.
+AC-108: Given the package, When `replay_from_checkpoint`, `diff_runs`, `ReplayResult` and `RunDiff` are imported from `langgraph_checkpoint_relate` and `TimeTravelEngine.replay(...)` is called with the same inputs, Then the imports succeed and both calls return equal diffs.
+
+#### Replay CLI
+AC-109: Given a stored thread, When `relate-dag replay <thread> <checkpoint_id>` is run without `--graph`, Then it exits with code 0, prints the same six summary lines as before, and prints one further line that mentions `--graph`.
+AC-110: Given the committed store, When `relate-dag replay demo-tool-fail <step 0 checkpoint id> --graph examples/tool_agent.py:create_tool_agent_graph --set-message 0=https://example.org/report --db examples/data/demo.rl` is run, Then it exits with code 0 and prints a success line, a "Replay result" section with the new and recorded final checkpoints, a tool-call table containing `fetch_source #1` and `error -> ok` with the argument before and after, and a final state changes table.
+AC-111: Given `--graph` and no edit flags, When `relate-dag replay` is run on an unchanged graph, Then it exits with code 0 and states that no tool calls or state changed.
+AC-112: Given any of `--update`, `--set-message` or `--as-node` without `--graph`, When `relate-dag replay` is run, Then it exits with code 1 and prints an `Error:` line naming `--graph`.
+AC-113: Given `--update` whose value is not valid JSON or not a JSON object, When `relate-dag replay --graph ...` is run, Then it exits with code 1 and prints an `Error:` line.
+AC-114: Given `--set-message` without `=`, with a non-integer index, or with an index outside the message list, When `relate-dag replay --graph ...` is run, Then it exits with code 1 and prints an `Error:` line.
+AC-152: Given `--graph` and `--as-node` but no effective edit (neither `--update` nor `--set-message`, or `--update '{}'`), When `relate-dag replay` is run, Then it exits with code 1, prints an `Error:` line saying `--as-node` needs an edit, and does not run the graph (no "Replay result" section is printed).
+AC-153: Given `--set-message` repeated with the same INDEX, When `relate-dag replay --graph ...` is run, Then it exits with code 1, prints an `Error:` line naming the duplicate index, and does not run the graph (no "Replay result" section is printed).
+AC-115: Given a `--graph` spec that fails to load (AC-97), When `relate-dag replay` is run, Then it exits with code 1, prints an `Error:` line containing the spec, and prints no Python traceback.
+AC-116: Given `--as-node` naming a node the graph rejects for the update, When `relate-dag replay --graph ...` is run, Then it exits with code 1 and prints an `Error:` line with a hint about `--as-node`.
+AC-155: Given a `--graph` factory that does not accept `checkpointer=`, When replay runs, Then `GraphSpecError` is raised naming `checkpointer`; Given a graph node that raises an exception during replay, When `relate-dag replay --graph ...` is run, Then it exits with code 1 and prints `Error: replay failed: <ExceptionType>: <message>`; and invalid replay inputs raise `ReplayInputError`, a `ValueError` subclass, with their existing messages (AC-151) ([ADR-0022](DECISIONS.md#adr-0022-replay-input-errors-and-message-edit-safety)).
+AC-117: Given a closed file store, When `relate-dag replay` runs with or without `--graph`, succeeding or failing, Then the store's sha256 and its directory listing are unchanged.
+AC-118: Given stdout encoded as cp1252, When the AC-110 command is run, Then it exits with code 0 without `UnicodeEncodeError` and its output contains `error -> ok`.
+
+#### Argument provenance
+AC-119: Given a failing tool call whose string argument (3 or more characters) first appears in a write of an earlier checkpoint on the same `[:NEXT]` path (in message content or in tool-call arguments), When `trace_argument_origin(thread_id, error_checkpoint_id, args)` is called, Then it returns the node, step and hop count (steps between that checkpoint and the error checkpoint) of the earliest such write.
+AC-120: Given arguments that are not strings, are shorter than 3 characters, or appear in no earlier write, When `trace_argument_origin` is called, Then it returns `None`.
+AC-121: Given a thread whose root cause is a failing tool call with a traceable argument, When `trace_root_cause` runs, Then `origin_node`, `origin_step` and `origin_hops` are set; for a thread with no failure or no traceable argument they are `None`, and `RootCauseReport` can still be built without them.
+AC-122: Given a root cause with an origin, When `relate-dag forensics trace-error <thread>` is run, Then it prints `Bad argument origin: <arg> came from node <node> (step <N>, <H> hops before failure)`, followed by a note saying what the hops count, and `Causal Path Length:` is followed by a note saying what it counts; without an origin no origin line is printed.
+
+#### Cross-thread tool failures
+AC-123: Given a store with failing tool calls in several threads, When `failure_summary()` is called, Then it returns one entry per tool with at least one failure, holding `tool_name`, `failures`, `total_calls`, the `threads` it failed in and the `origin_nodes` of its bad arguments, ordered by `failures` descending; tools that never failed are omitted.
+AC-158: Given a failing tool call linked only through `(:Checkpoint)-[:HAS_WRITE]->(:Write)-[:INVOKED]->(:ToolCall)`, When `failure_summary()` is called, Then that call is counted.
+AC-124: Given the committed store, When `relate-dag forensics failures --db examples/data/demo.rl` is run, Then it exits with code 0 and prints a table whose rows include `fetch_source` and `lookup_pypi_package`.
+AC-125: Given a store with no failing tool call, When `relate-dag forensics failures --db <store>` is run, Then it exits with code 0 and prints an ASCII no-failures message.
+
+#### Stored text in forensics output
+AC-160: Given stored error text or a thread id containing Rich markup such as `[/b]` or `[red]`, When `relate-dag forensics trace-error <thread>` or `relate-dag forensics <thread>` (the `diagnose` command) is run, Then the text prints literally and the command does not crash.
+
+#### Research agent notes
+AC-126: Given `examples/research_agent.py`, When its generated notes text is read, Then it contains none of "sub-millisecond", "instantaneous" or "eliminate branch-tracking ambiguities", nor any other latency or speed claim.
+
+#### Key-free dependency agent
+AC-127: Given a fake fetcher, When `run_dependency_agent(saver, thread_id, fetch_json=fake)` runs the request "Audit the dependencies of RelateGraphSaver", Then the stored run visits `intake`, `planner`, `agent`, `tools`, `agent`, `report` in that order and the planner's package list includes `relategraphsaver`.
+AC-128: Given a fake fetcher that raises a 404 for `relategraphsaver`, When the dependency agent runs, Then the `lookup_pypi_package` call for that name is stored with an error, the run still reaches `report`, and the report mentions the failed lookup.
+AC-129: Given the AC-128 thread, When `trace_root_cause` runs, Then the root tool is `lookup_pypi_package`, `origin_node` is `planner` and `origin_hops` is at least 2.
+AC-130: Given a stubbed `urlopen`, When `fetch_pypi_json(name)` is called, Then it requests the PyPI JSON URL for that name with a 10 second timeout and a generic User-Agent containing no personal data, and returns only `name`, `version` and `summary`.
+AC-131: Given the default `pytest` run, When tests are collected, Then the test marked `network` is deselected and no unknown-marker warning appears; When `pytest -m network` is run with network access, Then the live test gets a real 404 for `relategraphsaver`.
+AC-132: Given an environment with no LLM API key set, When the dependency agent runs, Then it completes without reading any key.
+
+#### Committed demo store with a real-API thread
+AC-133: Given `examples/data/demo.rl`, When the AC-70, AC-71 and AC-72 commands are run, Then they still pass and the store also holds thread `demo-real-api`.
+AC-134: Given network access to pypi.org, When `python examples/build_demo_store.py` is run, Then it exits with code 0 and writes a closed single-file store containing exactly `demo-tool-fail`, `demo-tool-ok`, `demo-research` and `demo-real-api`, with no sidecar files.
+AC-135: Given the committed store, When the `demo-real-api` tool calls are read, Then a `lookup_pypi_package` call for `relategraphsaver` holds an error recording a 404 and at least one other lookup holds a result.
+AC-136: Given an existing store at the output path and a fetcher that cannot reach the network, When `build_demo_store` runs, Then it exits with code 1 with a message naming the network failure, the existing store's sha256 is unchanged, and no staging file is left.
+AC-137: Given two builds, When the stores are compared, Then all four threads have the same checkpoint counts per thread and the same tool names and error/no-error outcomes; tool result text may differ.
+AC-138: Given a fresh clone, When `relate-dag tree demo-real-api`, `relate-dag forensics trace-error demo-real-api` and `relate-dag forensics failures` are run with `--db examples/data/demo.rl`, Then each exits with code 0, trace-error prints a `Bad argument origin:` line at least 2 hops back, the tree shows completed steps as `[OK]`, and the store is byte-identical afterwards.
+
+#### Optional recorded LLM run (only if the project owner approves)
+AC-139: (optional) Given `pyproject.toml`, When dependencies are read, Then an `llm` extra declares `langchain-openai` and `[project].dependencies` does not.
+AC-140: (optional) Given no `OPENROUTER_API_KEY` in the environment, When `examples/openrouter_agent.py` is run, Then it exits with code 1 with an `Error:` line and makes no network call; `.env.example` lists `OPENROUTER_API_KEY=`.
+AC-141: (optional) Given `examples/data/`, When it is listed, Then it holds `demo.rl` and at most `demo-llm.rl`, and `build_demo_store.py` never writes or reads `demo-llm.rl`.
+
+#### Package metadata
+AC-142: Given `pyproject.toml`, When `[project.urls]` is read, Then every URL starts with `https://github.com/jegadeesh17/RelateGraphSaver` and the `Issues` URL ends with `/issues`.
+AC-143: Given `pyproject.toml`, When the `relate-db` requirement is read, Then it is either `>=1.1.0` (and the full suite passes on 1.1.0 and the README benchmark numbers come from 1.1.0) or `>=1.0.2,<1.1`, and the README's statements about the relate-db version match it.
+
+#### README
+AC-144: Given `README.md`, When it is read, Then it contains no `pip install langgraph-checkpoint-relate` line and contains a source install line `pip install -e ".[dev]"`.
+AC-145: Given `README.md`, When the tagline under the title is read, Then it names a failing agent step and finding its cause from one file offline, and contains none of "WAL", "DAG" or "graph-native".
+AC-146: Given `README.md`, When the "Why not X?" section is read, Then its table has rows for Neo4jSaver, SqliteSaver, LangGraph built-in time travel and tracing tools, and the Neo4jSaver row states that it needs a Neo4j server.
+AC-147: Given `README.md`, When its explore section is read, Then it holds exactly four `relate-dag` commands: `tree demo-real-api`, `forensics trace-error demo-real-api`, `forensics failures`, and `replay demo-tool-fail <step 0 checkpoint id> --graph examples/tool_agent.py:create_tool_agent_graph --set-message 0=https://example.org/report --db examples/data/demo.rl`, with every flag before `--db`.
+AC-148: Given a fresh clone after a source install, When the four explore commands are run in order, Then each exits with code 0, the replay prints `fetch_source #1` and `error -> ok`, and `git status` shows no change.
+AC-149: Given the README replay command, When its checkpoint id is compared with `relate-dag tree demo-tool-fail` on the committed store, Then it is the id of that thread's step 0 checkpoint (the second checkpoint in the tree, the first whose state holds the human message), not the step -1 input checkpoint.
+AC-150: Given `README.md`, When "Where the data lives" is read, Then it names all four thread ids of the committed store.
+AC-151: Given a checkpoint whose state holds no messages yet (such as the step -1 input checkpoint), When `relate-dag replay <thread> <checkpoint id> --graph SPEC --set-message 0=TEXT` is run, or `replay_from_checkpoint(..., set_messages={0: TEXT})` is called, Then the CLI exits with code 1 and prints an `Error:` line (the API raises `ValueError` with the same message) saying the checkpoint holds no messages yet and suggesting the next (step 0) checkpoint, and the source store is unchanged.
+
+### 3.7 Regression Criteria
+
+RC-01: Given a thread with branches, When `relate-dag tree` is run, Then branch points still show `Branch: [BRANCH]` and an unknown thread still exits non-zero with a not-found error (AC-23, AC-24).
+RC-02: Given `relate-dag replay` without `--graph`, When the checkpoint id is empty or unknown, Then it still exits with code 1 and prints `checkpoint_id must be a non-empty string` or `Available checkpoints:` respectively.
+RC-03: Given `TimeTravelEngine.fork_in_memory` and module `fork_in_memory`, When called with the same arguments as before, Then they return an in-memory saver with the cloned history and run no graph code.
+RC-04: Given the committed store, When `relate-dag forensics <thread>`, `forensics loops <thread>`, `forensics trace-error <thread>` and `forensics trace <thread>` are run, Then they behave as before; `failures` is not taken as a thread id.
+RC-05: Given `demo-tool-fail` and `demo-tool-ok`, When `trace-error` runs on each, Then the first still names `fetch_source` and its call id and the second still reports no failure (AC-70, AC-71).
+RC-06: Given a rebuilt store, When `demo-tool-fail`, `demo-tool-ok` and `demo-research` are compared with the previous store, Then their checkpoint counts, tool names and outcomes are unchanged.
+RC-07: Given `build_demo_store.py --out` with an empty value or a path without the `.rl` suffix, When run, Then it is still rejected.
+RC-08: Given `examples/tool_agent.py` and `examples/research_agent.py`, When run with their existing options, Then they accept the same options and print the same kind of output.
+RC-09: Given the package, When every previously public name in `langgraph_checkpoint_relate` is imported, Then each import succeeds.
+RC-10: Given `README.md` and `pyproject.toml`, When the strings asserted before this change are checked (for example "How we use Relate, and why", `Mode: single file`, "Use case", `RelateSaver`, `fork_in_memory`, `pip install`, the three `relate-dag` commands, and the URL keys `Homepage`, `Repository`, `Issues`), Then all are still present.
+RC-11: Given no network access, When `pytest -m "not slow"` is run, Then it passes.
+
 ---
 
 ## 4. Non-Goals
@@ -303,6 +462,18 @@ AC-87: Given `RelateSaver(path)` without `read_only`, When a graph runs and the 
 11. **Judge-run fixes: Byte-Identical Demo Store:** Regenerating `examples/data/demo.rl` reproduces the same threads and tool-call outcomes, not a byte-identical file; checkpoint ids are time-based.
 12. **Judge-run fixes: Fork and Capture Limits:** Forks that miss tool results after trimmed message history, unbounded growth of the applied-tool-call set in long-lived savers, a resent INVOKED edge landing one step late, and silent fork writes-read failures remain documented known limits, not fixes.
 13. **Judge-run fixes: Submission Assets:** Making the repository public, the demo video and the Devpost description are outside this specification.
+
+Judge impact non-goals:
+
+14. **Publishing to PyPI:** the package is installed from source; no release is published.
+15. **Making the repository public, recording the video, submitting on Devpost:** the project owner does these.
+16. **Web or WASM UI:** the terminal CLI stays the only interface.
+17. **`[TOOL ERROR]` tree tag:** failing tool calls are not tagged in the tree; `forensics` reports them.
+18. **Multi-process support:** RelateSaver stays single-process.
+19. **Replay without user graph code:** the CLI cannot know a graph, so re-execution requires `--graph`.
+20. **Offline build of `demo-real-api`:** no offline or staged-data flag; the real-API thread needs pypi.org.
+21. **Exact provenance:** argument origin is a heuristic (string containment, earliest write), not data-flow tracking.
+22. **Refactors not required by these criteria.**
 
 ---
 
@@ -355,3 +526,31 @@ AC-87: Given `RelateSaver(path)` without `read_only`, When a graph runs and the 
 7. **Milestone 4: Which Writes Are Scanned for Tool Calls:**
    - *Question:* Are tool calls extracted from `put_writes` writes, from `put` checkpoint channel values, or both?
    - *Assumption:* Both: any message list written through `put_writes` or contained in the channel values passed to `put` is scanned. The `call_id` uniqueness constraint makes the overlap harmless (AC-48).
+
+12. **Judge impact: Editing the first human message:**
+    - *Question:* Can a sandbox fork replace the first human message through `update_state` with `as_node="__start__"`?
+    - *Answer (verified):* Yes, at the step 0 checkpoint, when the new message reuses the original message id (messages are replaced by id; a new id would append a duplicate, AC-100). The step -1 checkpoint holds no messages yet, so the set-message path forks at step 0 (AC-99, AC-110, AC-147, AC-149) and step -1 is an input error (AC-151).
+
+13. **Judge impact: Graph spec errors:**
+    - *Question:* Which exception does `load_graph_factory` raise for a bad spec?
+    - *Assumption:* `ValueError` or a subclass, with the spec in the message (AC-97); the CLI turns it into an `Error:` line (AC-115).
+
+14. **Judge impact: Failure summary contents:**
+    - *Question:* Does `failure_summary()` include tools that never failed?
+    - *Assumption:* No; only tools with at least one failure, ordered by failure count (AC-123).
+
+15. **Judge impact: Provenance false matches:**
+    - *Question:* A short or common argument string can appear in an unrelated earlier write.
+    - *Assumption:* Accepted as a documented heuristic limit; arguments under 3 characters are ignored and the earliest containing write wins (AC-119, AC-120).
+
+16. **Judge impact: Rebuilding the store depends on pypi.org:**
+    - *Question:* The committed store can now only be rebuilt with network access, and PyPI data drifts.
+    - *Assumption:* Accepted: the store is rebuilt once, comparisons use outcomes not result text (AC-137), and a failed fetch leaves the existing store untouched (AC-136). The test for AC-73's offline build is replaced accordingly.
+
+17. **Judge impact: relate-db version:**
+    - *Question:* Should the package require relate-db 1.1.0?
+    - *Assumption:* Decided by running the full suite and benchmark on 1.1.0 in a fresh environment; either outcome satisfies AC-143.
+
+18. **Judge impact: Homepage URL form:**
+    - *Question:* Should `Homepage` point at the repository root or its `#readme` anchor?
+    - *Assumption:* `Homepage` uses `#readme`, `Repository` the root, `Issues` `/issues`; AC-142 accepts any URL under the repository.
