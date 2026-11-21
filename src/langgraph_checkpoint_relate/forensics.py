@@ -142,6 +142,46 @@ def _holds_tool_message(value: Any, tool_call_id: str) -> bool:
     return False
 
 
+def _expand_causal_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Expand rows with direct and/or write-linked tool calls into separate causal rows.
+
+    Prevents coalescing direct and linked tool calls from distinct invocations into a single
+    inconsistent row (AC-171).
+    """
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        base = {
+            k: v
+            for k, v in row.items()
+            if not k.startswith("direct_") and not k.startswith("linked_")
+        }
+        has_direct = row.get("direct_call_id") is not None
+        has_linked = row.get("linked_call_id") is not None
+
+        if has_direct:
+            d_row = dict(base)
+            d_row["tool_call_id"] = row["direct_call_id"]
+            d_row["tool_error"] = row.get("direct_error")
+            d_row["tool_name"] = row.get("direct_tool_name")
+            out.append(d_row)
+
+        if has_linked:
+            l_row = dict(base)
+            l_row["tool_call_id"] = row["linked_call_id"]
+            l_row["tool_error"] = row.get("linked_error")
+            l_row["tool_name"] = row.get("linked_tool_name")
+            out.append(l_row)
+
+        if not has_direct and not has_linked:
+            n_row = dict(base)
+            n_row["tool_call_id"] = None
+            n_row["tool_error"] = None
+            n_row["tool_name"] = None
+            out.append(n_row)
+
+    return out
+
+
 class RelateForensics:
     """Forensic diagnostic engine for analyzing LangGraph execution graphs in Relate."""
 
@@ -782,9 +822,12 @@ class RelateForensics:
             "       w.channel AS channel, "
             "       w.task_id AS task_id, "
             "       w.write_blob AS write_blob, "
-            "       coalesce(tc1.call_id, tc2.call_id) AS tool_call_id, "
-            "       coalesce(tc1.error, tc2.error) AS tool_error, "
-            "       coalesce(tc1.tool_name, tc2.tool_name) AS tool_name "
+            "       tc1.call_id AS direct_call_id, "
+            "       tc1.error AS direct_error, "
+            "       tc1.tool_name AS direct_tool_name, "
+            "       tc2.call_id AS linked_call_id, "
+            "       tc2.error AS linked_error, "
+            "       tc2.tool_name AS linked_tool_name "
             "ORDER BY distance_to_error ASC"
         )
         causal_rows = self._saver.proxy.execute_read(
@@ -794,6 +837,7 @@ class RelateForensics:
                 "error_checkpoint_id": error_checkpoint_id,
             },
         )
+        causal_rows = _expand_causal_rows(causal_rows)
 
         root_tool_call_id: str | None = None
         root_tool_name: str | None = None

@@ -852,6 +852,55 @@ class TestFailureSummary:
         ]
         assert report.root_tool_name == summary[0].tool_name
 
+    def test_ac171_root_cause_names_failing_write_linked_call_not_direct_ok_call(self) -> None:
+        """AC-171: a checkpoint with a direct ok tool call and write-linked failing tool call."""
+        thread_id, call_id = "t-ac171-fail", "call-ac171-fail"
+        with RelateSaver(":memory:") as saver:
+            _run_summary_thread(saver, thread_id, call_id, "parse_manifest", "manifest-url-1")
+            rows = saver.proxy.execute_read(
+                "MATCH (c:Checkpoint)-[:INVOKED]->(tc:ToolCall {call_id: $call_id}) "
+                "RETURN c.checkpoint_id AS checkpoint_id",
+                {"call_id": call_id},
+            )
+            assert rows, "the run must record the failing call on a checkpoint"
+            checkpoint_id = str(rows[0]["checkpoint_id"])
+
+            # Move the link from the checkpoint to a Write node (without creating any __error__ write).
+            saver.proxy.execute_write(
+                "MATCH (:Checkpoint)-[r:INVOKED]->(:ToolCall {call_id: $call_id}) DELETE r",
+                {"call_id": call_id},
+            )
+            saver.proxy.execute_write(
+                "MATCH (c:Checkpoint {checkpoint_id: $cid}) "
+                "CREATE (w:Write {write_id: 'w-ac171', thread_id: $thread_id, "
+                "  checkpoint_ns: '', checkpoint_id: $cid, task_id: 'task-w', "
+                "  channel: 'results', idx: 0}) "
+                "CREATE (c)-[:HAS_WRITE]->(w)",
+                {
+                    "cid": checkpoint_id,
+                    "thread_id": thread_id,
+                },
+            )
+            saver.proxy.execute_write(
+                "MATCH (w:Write {write_id: 'w-ac171'}), (tc:ToolCall {call_id: $call_id}) "
+                "CREATE (w)-[:INVOKED]->(tc)",
+                {"call_id": call_id},
+            )
+            # Create a successful :ToolCall {call_id: 'call-ok', tool_name: 'ok_tool'} (no error)
+            # and link it directly to the checkpoint.
+            saver.proxy.execute_write(
+                "MATCH (c:Checkpoint {checkpoint_id: $cid}) "
+                "CREATE (tc_ok:ToolCall {call_id: 'call-ok', tool_name: 'ok_tool'}) "
+                "CREATE (c)-[:INVOKED]->(tc_ok)",
+                {"cid": checkpoint_id},
+            )
+
+            with RelateForensics(saver) as forensics:
+                report = forensics.trace_root_cause(thread_id)
+
+        assert report.root_tool_call_id == call_id
+        assert report.root_tool_name == "parse_manifest"
+
     def test_ac164_failure_summary_fanout_origin_nodes_listed_separately(self) -> None:
         """AC-164: a fan-out step with multiple concurrent writing nodes lists origin nodes separately."""
 
