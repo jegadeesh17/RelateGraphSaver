@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import typing
 from collections.abc import Generator
 from pathlib import Path
 from typing import Annotated, Any, TypedDict
@@ -50,6 +51,7 @@ from langgraph_checkpoint_relate.errors import (
 )
 from langgraph_checkpoint_relate.models import RunDiff, RunSnapshot
 from langgraph_checkpoint_relate.replay import (
+    GraphFactory,
     is_update_state_error,
     load_graph_factory,
     replay_from_checkpoint,
@@ -948,6 +950,9 @@ def test_ac162_import_succeeds_when_state_graph_not_subscriptable() -> None:
         import langgraph_checkpoint_relate
         import langgraph_checkpoint_relate.replay
         from langgraph_checkpoint_relate.replay import GraphFactory
+
+        assert not isinstance(GraphFactory, str)
+        _ = GraphFactory | None
         """
     )
     env = {**os.environ, "PYTHONPATH": _SRC_DIR}
@@ -959,6 +964,19 @@ def test_ac162_import_succeeds_when_state_graph_not_subscriptable() -> None:
         timeout=30,
     )
     assert result.returncode == 0, f"Import failed with stderr:\n{result.stderr}"
+
+
+def test_ac170_graph_factory_is_a_runtime_type() -> None:
+    """GraphFactory is a real type at runtime, supporting unions and typing.get_type_hints (AC-170)."""
+    assert not isinstance(GraphFactory, str)
+    union_type = GraphFactory | None
+    assert union_type is not None
+
+    def f(g: GraphFactory) -> None:
+        pass
+
+    hints = typing.get_type_hints(f)
+    assert hints.get("g") is not None
 
 
 def test_ac165_file_spec_without_attribute_delimiter_is_rejected() -> None:

@@ -50,7 +50,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-GraphFactory: TypeAlias = "Callable[..., Any] | StateGraph[Any, Any, Any, Any]"
+if TYPE_CHECKING:
+    GraphFactory: TypeAlias = Callable[..., Any] | StateGraph[Any, Any, Any, Any]
+else:
+    GraphFactory = Callable[..., Any] | StateGraph
 
 _DETAIL_LIMIT = 120
 _MESSAGE_LIMIT = 120
