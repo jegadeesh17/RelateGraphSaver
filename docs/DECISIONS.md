@@ -36,6 +36,7 @@ Reference documents:
 | [ADR-0022](#adr-0022-replay-input-errors-and-message-edit-safety) | Replay Input Errors and Message-Edit Safety | Accepted | 2026-11-20 |
 | [ADR-0023](#adr-0023-replay-diff-compares-full-message-content) | Replay Diff Compares Full Message Content | Accepted | 2026-11-20 |
 | [ADR-0024](#adr-0024-replay-diff-compares-channel-values-not-repr) | Replay Diff Compares Channel Values, Not Repr | Accepted | 2026-11-20 |
+| [ADR-0025](#adr-0025-typed-channel-keys-write-level-origin-nodes-and-an-attribute-tag-for-update_state-errors) | Typed Channel Keys, Write-Level Origin Nodes and an Attribute Tag for update_state Errors | Accepted | 2026-11-21 |
 
 ---
 
@@ -613,7 +614,8 @@ This builds on ADR-0004 and ADR-0015 and supersedes no earlier decision; no earl
 ## ADR-0018: Argument Provenance by String Containment, Earliest Write Wins
 
 Date: 2026-11-18  
-Status: Accepted
+Status: Accepted  
+Amended by: [ADR-0025](#adr-0025-typed-channel-keys-write-level-origin-nodes-and-an-attribute-tag-for-update_state-errors)
 
 ### Context
 
@@ -799,7 +801,8 @@ This replaces the message rule in decision 4 of ADR-0017; the rest of ADR-0017 s
 ## ADR-0024: Replay Diff Compares Channel Values, Not Repr
 
 Date: 2026-11-20  
-Status: Accepted
+Status: Accepted  
+Amended by: [ADR-0025](#adr-0025-typed-channel-keys-write-level-origin-nodes-and-an-attribute-tag-for-update_state-errors)
 
 ### Context
 
@@ -835,3 +838,47 @@ This amends ADR-0023's channel comparison rule and clarifies replay exception pr
 - **Positive:** The CLI accurately distinguishes replay setup errors from graph execution errors without modifying LangGraph exception types or public API contracts (AC-166).
 - **Negative:** Non-primitive objects not covered by `_channel_key` (e.g. custom classes) still fall back to `repr()`.
 - **Negative:** Exception notes require Python 3.11+, which is already the minimum supported Python version for this project.
+
+---
+
+## ADR-0025: Typed Channel Keys, Write-Level Origin Nodes and an Attribute Tag for update_state Errors
+
+Date: 2026-11-21  
+Status: Accepted
+
+### Context
+
+Hardening of replay and forensics revealed three subtle edge cases:
+1. Under ADR-0024, primitive scalar values mapped directly to themselves in `_channel_key`. In Python, values of different types can compare equal under `==` (for example, `0 == False`, `1 == True`, and `1 == 1.0`). When a replay execution changed a channel value across these types, `_diff_channels` reported no change. In addition, `float('nan') == float('nan')` evaluates to `False`, causing identical NaN values across runs to be reported as spurious channel changes.
+2. In fan-out workflows where concurrent nodes run in parallel, attributing argument origins solely to `versions_seen` differences between checkpoints (ADR-0018) attributed the write to all nodes that updated versions in that step, even if only one branch wrote the argument payload.
+3. Attaching diagnostic information to `update_state` exceptions via `add_note` (ADR-0024) caused notes to appear in tracebacks during standard application execution and testing, even though the annotation was intended only for CLI scoping.
+
+### Decision
+
+This amends ADR-0018 and ADR-0024:
+
+1. **Typed channel keys in replay diffs:**
+   - Primitive scalar values (`int`, `float`, `bool`, `str`, `None`) map to `(type(value).__name__, value)` tuples (applied recursively through lists and dicts).
+   - Because `bool` is a subclass of `int` in Python, distinguishing by type name ensures `("bool", False) != ("int", 0)` and `("int", 1) != ("float", 1.0)`.
+   - `float('nan')` is normalized to `("float", "nan")`, ensuring two NaN values compare equal under `==` and produce no false diff.
+2. **Write-level origin node resolution:**
+   - Origin nodes are determined by taking the `task_path` node of each matching write in the earliest matching checkpoint and intersecting them with the nodes whose `versions_seen` changed between that checkpoint and the next.
+   - When `task_path` is empty or the intersection is empty, it falls back to the `versions_seen` nodes.
+3. **Attribute tagging for `update_state` errors:**
+   - `update_state` failures are tagged using a private attribute `_relate_update_state_error` instead of calling `add_note`.
+   - The CLI and helpers check this attribute via `is_update_state_error` to determine whether to display the `--as-node` hint without polluting exception tracebacks with note text.
+
+### Alternatives considered
+
+1. **Raw repr comparison:** Rejected; Python dictionary key ordering differences would produce false diffs for nested dicts.
+2. **math.isclose comparison:** Rejected; state diffs must be exact, and diffing should not treat distinct numbers as equivalent.
+3. **UNION Cypher query:** Rejected; `UNION` support in relate-db Cypher engine is unverified; filtering and intersecting writes in Python keeps database queries simple and robust.
+4. **add_note with readable sentence:** Rejected; exception notes are unconditionally printed in tracebacks and error reports.
+
+### Consequences
+
+- **Positive:** Type shifts between equal-under-`==` values (e.g. `0` vs `False`, `1` vs `1.0`) are reliably detected in channel diffs (AC-168).
+- **Positive:** Identical `float('nan')` values across runs compare as equal without false diffs (AC-169).
+- **Positive:** Argument provenance narrows down to the specific node that wrote the argument in concurrent fan-out steps (AC-172).
+- **Positive:** `InvalidUpdateError` carries no added note in tracebacks while preserving CLI hint detection (AC-172).
+- **Negative:** `_channel_key` produces slightly larger tuples in memory during replay diffing.

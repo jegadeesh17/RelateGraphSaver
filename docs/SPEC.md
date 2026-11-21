@@ -26,13 +26,13 @@ AI Agent Engineers building, debugging, and observing autonomous workflows in La
 
 ## 2. User Journeys
 
-The product capabilities are structured across four delivery milestones:
+The product capabilities were delivered in these stages:
 - **Milestone 1:** MVP Vertical Slice (Core `RelateSaver` engine, `RelateThreadProxy` actor, single-file WAL persistence, `put`/`get_tuple`/`list`).
 - **Milestone 2:** Core Flows & Time-Travel Debugger (`put_writes` human-in-the-loop, `checkpoint_ns` subgraphs, `:memory:` sandboxed replay, `relate-dag tree` terminal visualizer).
 - **Milestone 3:** Forensic Diagnostics & Production Polish (Cypher loop detection, poison-tool root-cause analysis, multi-agent demo application, PyPI packaging).
 - **Milestone 4:** Judge Readiness (clean-install CLI fix, lint and type-check baseline, README Relate rationale and limits, `:ToolCall` capture from real runs, async checkpointer methods, SQLite comparison benchmark).
 - **Judge Impact:** tree status fix, graph re-execution replay with a run diff, argument provenance, cross-thread tool failures, a key-free real-API demo thread, README and metadata corrections (updated 2026-11-18).
-- **Code-Review Fixes:** CLI markup escaping, import type-annotation robustness, indirect tool-call root-cause parity, fan-out origin node splitting, path spec validation, update-state hint scoping, and console width restoration (updated 2026-11-20).
+- **Replay and forensics hardening (AC-161..AC-172):** CLI markup escaping, import type-annotation robustness, indirect tool-call root-cause parity, fan-out origin nodes, path spec validation, update-state hint scoping, console width restoration, and typed replay channel comparison (updated 2026-11-21).
 
 ### 2.1 Milestone 1: MVP Vertical Slice
 
@@ -204,7 +204,7 @@ Starts from Journey 14 and the committed-store README.
 1. The developer sets `OPENROUTER_API_KEY` in the environment, installs the `llm` extra, and runs `examples/openrouter_agent.py --model <model>`.
 2. The run is stored once in `examples/data/demo-llm.rl`, separate from the key-free store.
 
-### 2.6 Code-Review Fixes
+### 2.6 Replay and Forensics Hardening
 
 These journeys define the expected user and API behavior across code-review hardening fixes, ensuring reliable CLI markup rendering, import stability, forensic root-cause tracing, graph spec validation, update-state error scoping, and terminal console width management.
 
@@ -445,7 +445,7 @@ AC-149: Given the README replay command, When its checkpoint id is compared with
 AC-150: Given `README.md`, When "Where the data lives" is read, Then it names all four thread ids of the committed store.
 AC-151: Given a checkpoint whose state holds no messages yet (such as the step -1 input checkpoint), When `relate-dag replay <thread> <checkpoint id> --graph SPEC --set-message 0=TEXT` is run, or `replay_from_checkpoint(..., set_messages={0: TEXT})` is called, Then the CLI exits with code 1 and prints an `Error:` line (the API raises `ValueError` with the same message) saying the checkpoint holds no messages yet and suggesting the next (step 0) checkpoint, and the source store is unchanged.
 
-### 3.7 Code-Review Fixes
+### 3.7 Replay and Forensics Hardening
 
 AC-161: Given a thread ID, database path, checkpoint ID, exception message, or table element containing Rich markup-like syntax (such as `run[/x]` or missing `--db` `[red]missing.rl`), When `relate-dag tree`, `relate-dag forensics loops`, or `relate-dag replay` (without `--graph`) is run, Then all interpolated text is escaped and rendered literally without `MarkupError` or unintended formatting artifacts.
 AC-162: Given a Python runtime environment where `StateGraph` cannot be subscripted or parametrized at runtime, When `langgraph_checkpoint_relate` or any of its submodules is imported, Then the import succeeds without raising `TypeError`.
@@ -454,6 +454,11 @@ AC-164: Given a workflow step produced by multiple concurrent fan-out nodes whos
 AC-165: Given a file-path graph spec without an attribute delimiter and attribute name (such as `C:\work\graph.py` or `path/to/graph.py`), When `load_graph_factory(spec)` is called, Then `GraphSpecError` is raised with a message stating the spec must look like `module:attribute` or `path/to/file.py:attribute`.
 AC-166: Given a replayed graph execution where `InvalidUpdateError` is raised by a node during graph execution, When `relate-dag replay --graph ...` is run, Then the CLI exits with code 1 and prints `Error: replay failed: InvalidUpdateError: <message>` without appending the `--as-node` hint; Given `update_state` itself rejects the update prior to execution, When `relate-dag replay --graph ...` is run, Then the CLI exits with code 1 and prints the `--as-node` hint.
 AC-167: Given a Rich Console instance with an initial width state, When `_print_wide(console, ...)` is called and completes, Then `console._width` is preserved and restored to its exact pre-call value so subsequent table prints do not stay clamped or pinned.
+AC-168: Given a recorded and a replayed run whose non-message channel holds values equal under Python == but of different scalar types (0 and False, 1 and True, 1 and 1.0), at top level or nested in lists or dicts, When diff_runs compares them, Then the channel is reported as changed.
+AC-169: Given a recorded and a replayed run whose non-message channel holds float('nan') at the same position, When diff_runs compares them, Then no change is reported for that channel.
+AC-170: Given langgraph_checkpoint_relate is imported, When a caller uses GraphFactory at runtime (GraphFactory | None, or typing.get_type_hints on a function annotated with it), Then it is a type, not a str, and no error is raised; AC-162 still holds.
+AC-171: Given a checkpoint linked to a successful tool call by (:Checkpoint)-[:INVOKED]-> and to a failing tool call through (:Write)-[:INVOKED]->, When trace_root_cause runs, Then root_tool_call_id and root_tool_name both name the failing call.
+AC-172: Given a fan-out step where only some nodes wrote the failing tool argument, When failure_summary() or trace_argument_origin() runs, Then origin nodes list only the nodes whose writes contain the argument; and Given update_state rejects a replay update, When the InvalidUpdateError propagates, Then it carries no added exception note and is_update_state_error still returns True.
 
 ### 3.8 Regression Criteria
 
@@ -504,7 +509,7 @@ Code-review fixes non-goals:
 23. **`[:FORKED_TO]` failure-anchor diagnostic note:** modifying the failure-anchor diagnostic logic for forked threads is out of scope.
 24. **LangGraph async message-id note:** documenting or altering LangGraph async message ID handling is out of scope.
 25. **Store rebuild or README updates:** rebuilding `examples/data/demo.rl` or updating benchmark figures and README copy is out of scope.
-26. **Dependency or `pyproject.toml` changes:** adding or modifying runtime or package dependencies is out of scope.**
+26. **Dependency or `pyproject.toml` changes:** adding or modifying runtime or package dependencies is out of scope.
 
 ---
 

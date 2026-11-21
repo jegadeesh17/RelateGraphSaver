@@ -525,7 +525,10 @@ class AppliedToolCalls:
 Re-runs a user's graph from a stored checkpoint inside an in-memory fork and compares the result with the recorded run (AC-94..AC-108, [ADR-0017](DECISIONS.md#adr-0017-replay-runs-user-graph-code-only-against-an-in-memory-sandbox)). It reuses `fork_in_memory` unchanged (RC-03) and `extract_tool_events` from `tool_calls.py`. `TimeTravelEngine.replay` is a static method with exactly the parameters of `replay_from_checkpoint`; it imports `replay` inside the method (avoiding an import cycle) and returns its result (AC-108). All names below are exported from `langgraph_checkpoint_relate`.
 
 ```python
-GraphFactory: TypeAlias = "Callable[..., Any] | StateGraph[Any, Any, Any, Any]"  # string annotation avoids import-time parametrization failures (AC-162)
+if TYPE_CHECKING:
+    GraphFactory: TypeAlias = Callable[..., Any] | StateGraph[Any, Any, Any, Any]
+else:
+    GraphFactory = Callable[..., Any] | StateGraph  # runtime alias never subscripts StateGraph (AC-162, AC-170)
 class GraphSpecError(ValueError): ...            # errors.py; the message always contains the spec
 class ReplayInputError(RelateCheckpointError, ValueError): ...  # errors.py; invalid replay inputs
 def load_graph_factory(spec: str) -> GraphFactory: ...
@@ -586,7 +589,7 @@ class RelateForensics:
 **`trace_argument_origin` rules:**
 - Candidates are top-level argument values that are `str` with at least 3 characters; anything else returns `None` (AC-120).
 - One read, anchored like `trace_root_cause`: `MATCH path = (err:Checkpoint {checkpoint_id: $id})<-[:NEXT*0..]-(a:Checkpoint {thread_id: $thread_id})-[:HAS_WRITE]->(w:Write)` returning `a.checkpoint_id`, `a.step`, `length(path) - 1` (the `[:NEXT]` hops; the path also contains the closing `[:HAS_WRITE]` edge), `w.channel`, `w.idx`, `w.write_blob`. Python deserializes writes in `step`, then `idx`, order, skips channels `__*` and `branch:*` and undeserializable blobs, and searches strings: plain strings, `BaseMessage.content` (string or text parts), `AIMessage.tool_calls[*]["args"]` values, and nested dicts, lists and tuples to depth 6. A match is case-sensitive substring containment; the first matching write wins (AC-119; open question 15).
-- Node: a write sits on the checkpoint its task ran from, so the node is the one whose `versions_seen` entry differs between that checkpoint and its `[:NEXT]` child (both `checkpoint_blob`s, one extra read); several are joined with `, ` in sorted order.
+- Node: a write sits on the checkpoint its task ran from; origin nodes are derived from the `task_path` node of each matching write in the earliest matching checkpoint, intersected with nodes whose `versions_seen` entry differs between that checkpoint and its `[:NEXT]` child, falling back to `versions_seen` (ADR-0025); several are joined with `, ` in sorted order.
 
 **`trace_root_cause`** fills `origin_*` only when the root is a failing `:ToolCall` with a traceable argument (AC-121). When the error comes from a failing tool call, `error_checkpoint_id` is the *failure checkpoint*: the first checkpoint at or after the call's `[:INVOKED]` checkpoint on the `[:NEXT]` path whose writes hold the `ToolMessage` for `root_tool_call_id`, or the `[:INVOKED]` checkpoint if none. The origin trace deserializes that call's `args_blob` and starts at `error_checkpoint_id`, which `trace_root_cause` passes in already resolved, so it is resolved once; hops count from where the tool failed (AC-129) and `origin_hops` equals `trace_argument_origin(thread_id, error_checkpoint_id, args).hops` whichever step the `[:INVOKED]` edge sits on (AC-119, [ADR-0021](DECISIONS.md#adr-0021-tool-call-root-cause-anchors-on-the-failure-checkpoint)). Errors found through an `__error__` write or checkpoint metadata keep the checkpoint they were found on.
 
