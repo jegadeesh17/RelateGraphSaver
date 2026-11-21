@@ -482,3 +482,45 @@ def test_ac106_nested_dict_and_tuple_channels_differing_in_key_order_gives_empty
     diff = diff_runs(recorded, replayed)
 
     assert diff.is_empty
+
+
+def test_ac168_typed_scalar_channels_with_equal_values_report_changed() -> None:
+    # AC-168, ADR-0025: values equal under == but differing in scalar type report changed.
+    for val1, val2, repr1, repr2 in [
+        (0, False, "0", "False"),
+        (1, True, "1", "True"),
+        (1, 1.0, "1", "1.0"),
+    ]:
+        recorded = _snapshot(channels={"val": val1})
+        replayed = _snapshot(channels={"val": val2})
+        diff = diff_runs(recorded, replayed)
+        assert [(c.channel, c.kind, c.before, c.after) for c in diff.channels] == [
+            ("val", "changed", repr1, repr2)
+        ]
+
+    # Nested in dicts and lists
+    recorded_nested = _snapshot(channels={"data": {"a": [0]}})
+    replayed_nested = _snapshot(channels={"data": {"a": [False]}})
+    diff_nested = diff_runs(recorded_nested, replayed_nested)
+    assert [(c.channel, c.kind, c.before, c.after) for c in diff_nested.channels] == [
+        ("data", "changed", "{'a': [0]}", "{'a': [False]}")
+    ]
+
+
+def test_ac169_float_nan_channels_produce_empty_diff_and_differs_from_other_scalars() -> None:
+    # AC-169, ADR-0025: float('nan') compared with float('nan') produces no change.
+    recorded_nan = _snapshot(channels={"metric": float("nan")})
+    replayed_nan = _snapshot(channels={"metric": float("nan")})
+    assert diff_runs(recorded_nan, replayed_nan).is_empty
+
+    recorded_nested_nan = _snapshot(channels={"stats": {"s": [float("nan")]}})
+    replayed_nested_nan = _snapshot(channels={"stats": {"s": [float("nan")]}})
+    assert diff_runs(recorded_nested_nan, replayed_nested_nan).is_empty
+
+    # float('nan') vs 1.0 reports changed
+    recorded_diff = _snapshot(channels={"metric": float("nan")})
+    replayed_diff = _snapshot(channels={"metric": 1.0})
+    diff = diff_runs(recorded_diff, replayed_diff)
+    assert [(c.channel, c.kind, c.before, c.after) for c in diff.channels] == [
+        ("metric", "changed", "nan", "1.0")
+    ]

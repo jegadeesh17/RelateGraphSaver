@@ -16,6 +16,7 @@ import importlib
 import importlib.util
 import inspect
 import logging
+import math
 import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -294,13 +295,15 @@ def _message_preview(message: Any) -> tuple[_MessageKey, str]:
     return _message_key(message), shown
 
 
-def _channel_key(value: Any) -> Any:
-    """Return a comparison key for a channel value (ADR-0024).
+def _channel_key(value: object) -> object:
+    """Return a comparison key for a channel value (AC-106, AC-168, AC-169, ADR-0024, ADR-0025).
 
     Messages are normalized with :func:`_message_key` so random ids do not trigger diffs;
     lists and tuples are mapped elementwise; dicts are mapped key-by-key preserving dict
-    ``id`` keys; scalars (str, int, float, bool, None) are returned directly; and any
-    other object falls back to its ``repr``.
+    ``id`` keys; float NaN is normalized to ``("float", "nan")``; scalar values
+    (str, int, float, bool, None) map to typed ``(type(value).__name__, value)`` tuples so
+    equal-under-== values of different scalar types produce distinct keys; and any other
+    object falls back to its ``repr``.
     """
     if isinstance(value, BaseMessage):
         return _message_key(value)
@@ -308,8 +311,10 @@ def _channel_key(value: Any) -> Any:
         return [_channel_key(item) for item in value]
     if isinstance(value, dict):
         return {k: _channel_key(v) for k, v in value.items()}
+    if isinstance(value, float) and math.isnan(value):
+        return ("float", "nan")
     if value is None or isinstance(value, (str, int, float, bool)):
-        return value
+        return (type(value).__name__, value)
     return repr(value)
 
 
@@ -380,7 +385,7 @@ def diff_runs(recorded: RunSnapshot, replayed: RunSnapshot) -> RunDiff:
 
     Tool calls are matched by ``(tool_name, ordinal)``, never by call id; messages by index, by
     type, full content and the names and arguments of an AI message's tool calls (AC-106,
-    AC-159, ADR-0023); other channels by value (ADR-0024). A changed message is shown as
+    AC-159, ADR-0023); other channels by value (ADR-0024, ADR-0025). A changed message is shown as
     ``"<type>: <first 120 characters of content>"``, with ``...`` appended when the content is
     longer, for display only. Checkpoint ids, timestamps, message ids, tool-call ids and
     ``__*`` / ``branch:*`` channels are never compared, so a replay that behaves like the
