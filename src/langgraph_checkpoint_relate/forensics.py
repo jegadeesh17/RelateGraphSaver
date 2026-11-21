@@ -142,6 +142,64 @@ def _holds_tool_message(value: Any, tool_call_id: str) -> bool:
     return False
 
 
+def _expand_causal_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Expand rows with direct and/or write-linked tool calls into separate causal rows.
+
+    Prevents coalescing direct and linked tool calls from distinct invocations into a single
+    inconsistent row (AC-171).
+    """
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        base = {
+            k: v
+            for k, v in row.items()
+            if not k.startswith("direct_") and not k.startswith("linked_")
+        }
+        has_direct = row.get("direct_call_id") is not None
+        has_linked = row.get("linked_call_id") is not None
+
+        if has_direct:
+            d_row = dict(base)
+            d_row["tool_call_id"] = row["direct_call_id"]
+            d_row["tool_error"] = row.get("direct_error")
+            d_row["tool_name"] = row.get("direct_tool_name")
+            out.append(d_row)
+
+        if has_linked:
+            l_row = dict(base)
+            l_row["tool_call_id"] = row["linked_call_id"]
+            l_row["tool_error"] = row.get("linked_error")
+            l_row["tool_name"] = row.get("linked_tool_name")
+            out.append(l_row)
+
+        if not has_direct and not has_linked:
+            n_row = dict(base)
+            n_row["tool_call_id"] = None
+            n_row["tool_error"] = None
+            n_row["tool_name"] = None
+            out.append(n_row)
+
+    return out
+
+
+def _node_from_task_path(task_path: object) -> str | None:
+    """Extract node name from a LangGraph task path (ADR-0025).
+
+    Strip a leading '~', split on ',', and strip each part.
+    When there are exactly 2 parts, the first is '__pregel_pull' and the second is non-empty,
+    return the second part; otherwise return None.
+    """
+    if not isinstance(task_path, str):
+        return None
+    raw = task_path.strip()
+    if raw.startswith("~"):
+        raw = raw[1:]
+    parts = [p.strip() for p in raw.split(",")]
+    if len(parts) == 2 and parts[0] == "__pregel_pull" and parts[1]:
+        return parts[1]
+    return None
+
+
 class RelateForensics:
     """Forensic diagnostic engine for analyzing LangGraph execution graphs in Relate."""
 
@@ -395,7 +453,7 @@ class RelateForensics:
     def _argument_origin(
         self, thread_id: str, error_checkpoint_id: str, args: Mapping[str, Any]
     ) -> tuple[ArgumentOrigin, tuple[str, ...]] | None:
-        """Find the earliest write holding a tool call's argument, returning origin and origin nodes."""
+        """Find the earliest write holding a tool call's argument, returning origin and origin nodes (ADR-0018, ADR-0025)."""
         if not isinstance(thread_id, str) or not thread_id.strip():
             raise CheckpointNotFoundError("thread_id must be a non-empty string.")
         if not isinstance(error_checkpoint_id, str) or not error_checkpoint_id.strip():
@@ -414,38 +472,66 @@ class RelateForensics:
             "MATCH path = (err:Checkpoint {checkpoint_id: $id})<-[:NEXT*0..]-"
             "(a:Checkpoint {thread_id: $thread_id})-[:HAS_WRITE]->(w:Write) "
             "RETURN a.checkpoint_id AS checkpoint_id, a.step AS step, length(path) AS hops, "
-            "       w.channel AS channel, w.idx AS idx, w.write_blob AS write_blob",
+            "       w.channel AS channel, w.idx AS idx, w.write_blob AS write_blob, "
+            "       w.task_path AS task_path",
             {"id": error_checkpoint_id, "thread_id": thread_id},
         )
         rows = sorted(rows, key=lambda r: (int(r.get("step") or 0), int(r.get("idx") or 0)))
+        first_match: tuple[dict[str, Any], str, str] | None = None
+        matched_checkpoint_id: str | None = None
+        matches: list[dict[str, Any]] = []
+
         for row in rows:
             channel = str(row.get("channel") or "")
             if channel.startswith(("__", "branch:")) or not row.get("write_blob"):
                 continue
+            checkpoint_id = str(row.get("checkpoint_id") or "")
+            if matched_checkpoint_id is not None:
+                if checkpoint_id != matched_checkpoint_id:
+                    if first_match is not None and int(row.get("step") or 0) > int(
+                        first_match[0].get("step") or 0
+                    ):
+                        break
+                    continue
             value = self._loads_blob(row["write_blob"], f"write on channel '{channel}'")
             if value is None:
                 continue
             for name, needle in candidates:
                 if _value_contains(value, needle):
-                    checkpoint_id = str(row["checkpoint_id"])
-                    nodes = self._writing_nodes(checkpoint_id, thread_id)
-                    node = ", ".join(nodes) or _UNKNOWN_NODE
-                    origin = ArgumentOrigin(
-                        argument=name,
-                        value=needle,
-                        node=node,
-                        step=int(row.get("step") or 0),
-                        # length(path) also counts the closing [:HAS_WRITE] edge.
-                        hops=max(int(row.get("hops") or 1) - 1, 0),
-                        checkpoint_id=checkpoint_id,
-                    )
-                    return origin, nodes
-        return None
+                    if first_match is None:
+                        first_match = (row, name, needle)
+                        matched_checkpoint_id = checkpoint_id
+                    matches.append(row)
+                    break
+
+        if first_match is None or matched_checkpoint_id is None:
+            return None
+
+        first_row, first_name, first_needle = first_match
+        fallback = self._writing_nodes(matched_checkpoint_id, thread_id)
+        parsed = {_node_from_task_path(r.get("task_path")) for r in matches}
+        nodes: tuple[str, ...]
+        if None not in parsed and (parsed & set(fallback)):
+            nodes = tuple(sorted(str(n) for n in (parsed & set(fallback))))
+        else:
+            nodes = fallback
+
+        node = ", ".join(nodes) or _UNKNOWN_NODE
+        origin = ArgumentOrigin(
+            argument=first_name,
+            value=first_needle,
+            node=node,
+            step=int(first_row.get("step") or 0),
+            # length(path) also counts the closing [:HAS_WRITE] edge.
+            hops=max(int(first_row.get("hops") or 1) - 1, 0),
+            checkpoint_id=matched_checkpoint_id,
+        )
+        return origin, nodes
 
     def trace_argument_origin(
         self, thread_id: str, error_checkpoint_id: str, args: Mapping[str, Any]
     ) -> ArgumentOrigin | None:
-        """Find the earliest write that held a string argument of a failing tool call.
+        """Find the earliest write that held a string argument of a failing tool call (ADR-0018, ADR-0025).
 
         Only top-level string arguments of at least 3 characters are traced, by
         case-sensitive containment; the earliest matching write on the ``[:NEXT]`` path
@@ -782,9 +868,12 @@ class RelateForensics:
             "       w.channel AS channel, "
             "       w.task_id AS task_id, "
             "       w.write_blob AS write_blob, "
-            "       coalesce(tc1.call_id, tc2.call_id) AS tool_call_id, "
-            "       coalesce(tc1.error, tc2.error) AS tool_error, "
-            "       coalesce(tc1.tool_name, tc2.tool_name) AS tool_name "
+            "       tc1.call_id AS direct_call_id, "
+            "       tc1.error AS direct_error, "
+            "       tc1.tool_name AS direct_tool_name, "
+            "       tc2.call_id AS linked_call_id, "
+            "       tc2.error AS linked_error, "
+            "       tc2.tool_name AS linked_tool_name "
             "ORDER BY distance_to_error ASC"
         )
         causal_rows = self._saver.proxy.execute_read(
@@ -794,6 +883,7 @@ class RelateForensics:
                 "error_checkpoint_id": error_checkpoint_id,
             },
         )
+        causal_rows = _expand_causal_rows(causal_rows)
 
         root_tool_call_id: str | None = None
         root_tool_name: str | None = None
