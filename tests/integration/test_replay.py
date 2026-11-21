@@ -1027,3 +1027,85 @@ def test_ac166_is_update_state_error_false_for_untagged_exception() -> None:
     exc = InvalidUpdateError("regular invalid update")
     assert not is_update_state_error(exc)
     assert not is_update_state_error(ValueError("other"))
+
+
+def test_ac172_invalid_update_error_carries_no_added_exception_note(
+    research_source: RelateSaver,
+) -> None:
+    """AC-172: When update_state rejects a replay update, the InvalidUpdateError propagates
+    with no added exception note, and is_update_state_error still returns True.
+    """
+    fork = _checkpoint_before_human_review(research_source)
+    with pytest.raises(InvalidUpdateError) as exc_info:
+        replay_from_checkpoint(
+            research_source,
+            RESEARCH_THREAD_ID,
+            fork,
+            create_research_graph,
+            update={"plan": ["rejected plan"]},
+            as_node="non_existent_node",
+        )
+    exc = exc_info.value
+    assert is_update_state_error(exc) is True
+    # Verify no notes were added to the exception (AC-172)
+    notes = getattr(exc, "__notes__", None)
+    assert notes is None or len(notes) == 0
+
+
+class _TypedScalarReplayState(TypedDict):
+    flag: Any
+    count: Any
+    metric: float
+
+
+def _typed_scalar_replay_graph(checkpointer: Any = None) -> Any:
+    def step(state: _TypedScalarReplayState) -> dict[str, Any]:
+        return {
+            "flag": state.get("flag", False),
+            "count": state.get("count", 0),
+            "metric": state.get("metric", float("nan")),
+        }
+
+    builder = StateGraph(_TypedScalarReplayState)
+    builder.add_node("step", step)
+    builder.add_edge(START, "step")
+    builder.add_edge("step", END)
+    return builder.compile(checkpointer=checkpointer)
+
+
+def test_ac168_ac169_replay_typed_scalar_and_nan_channels() -> None:
+    """AC-168, AC-169: replay_from_checkpoint detects scalar type shifts (0 vs False, 1 vs 1.0)
+    and reports no spurious diff for matching float('nan') values.
+    """
+    with RelateSaver(":memory:") as source:
+        graph = _typed_scalar_replay_graph(checkpointer=source)
+        graph.invoke(
+            {"flag": False, "count": 1, "metric": float("nan")},
+            {"configurable": {"thread_id": "t-scalar"}},
+        )
+
+        fork = next(
+            str(snap.config["configurable"]["checkpoint_id"])
+            for snap in graph.get_state_history({"configurable": {"thread_id": "t-scalar"}})
+            if snap.metadata.get("step") == 1
+        )
+
+        # Update flag to 0 (equal under == to False, but int != bool)
+        # and count to 1.0 (equal under == to 1, but float != int)
+        result = replay_from_checkpoint(
+            source,
+            "t-scalar",
+            fork,
+            _typed_scalar_replay_graph,
+            update={"flag": 0, "count": 1.0},
+            as_node="step",
+        )
+
+        changed_channels = {c.channel: (c.kind, c.before, c.after) for c in result.diff.channels}
+        # AC-168: flag and count must be reported as changed due to type differences
+        assert "flag" in changed_channels
+        assert changed_channels["flag"] == ("changed", "False", "0")
+        assert "count" in changed_channels
+        assert changed_channels["count"] == ("changed", "1", "1.0")
+        # AC-169: metric holding float('nan') on both runs must not be reported as changed
+        assert "metric" not in changed_channels
