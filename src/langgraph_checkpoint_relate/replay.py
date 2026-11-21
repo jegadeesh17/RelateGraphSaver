@@ -57,12 +57,12 @@ else:
 
 _DETAIL_LIMIT = 120
 _MESSAGE_LIMIT = 120
-_UPDATE_STATE_NOTE = "relate:update_state_error"
+_UPDATE_STATE_ATTR = "_relate_update_state_error"
 
 
 def is_update_state_error(exc: BaseException) -> bool:
-    """Return whether the exception originated directly from graph.update_state (ADR-0024)."""
-    return _UPDATE_STATE_NOTE in getattr(exc, "__notes__", [])
+    """Return whether the exception originated directly from graph.update_state (ADR-0025)."""
+    return getattr(exc, _UPDATE_STATE_ATTR, False) is True
 
 
 # ---------------------------------------------------------------------------
@@ -609,7 +609,7 @@ def replay_from_checkpoint(
             try:
                 new_cfg = graph.update_state(fork_cfg, values, as_node=node)
             except InvalidUpdateError as exc:
-                exc.add_note(_UPDATE_STATE_NOTE)
+                setattr(exc, _UPDATE_STATE_ATTR, True)
                 raise
             updated_checkpoint_id = str(new_cfg["configurable"]["checkpoint_id"])
 

@@ -1019,6 +1019,7 @@ def test_ac166_invalid_update_error_during_update_state_is_tagged(
             as_node="non_existent_node",
         )
     assert is_update_state_error(exc_info.value)
+    assert not any("relate" in note for note in getattr(exc_info.value, "__notes__", []))
 
 
 def test_ac166_is_update_state_error_false_for_untagged_exception() -> None:
