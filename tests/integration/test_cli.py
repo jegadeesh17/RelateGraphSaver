@@ -1743,7 +1743,8 @@ def test_ac164_cli_forensics_failures_displays_fanout_origin_nodes(
     result = runner.invoke(app, ["forensics", "failures", "--db", db_file])
     assert result.exit_code == 0, result.output
     assert "_failing_fanout_tool" in result.output
-    assert "fetcher, parser" in result.output
+    assert "fetcher" in result.output
+    assert "fetcher, parser" not in result.output
 
 
 @pytest.mark.parametrize("initial_width", [None, 80, 120])
