@@ -49,6 +49,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.4
 - Tool-call capture sends only new statements per saver (ADR-0011) and commits without its own flush; the store is flushed on close (ADR-0014).
 
 ### Fixed
+- The replay diff compares non-message channel scalars by type and value (`0 != False`, `1 != 1.0`), preventing false matches across types, and normalizes `float('nan')` so identical NaN values produce an empty diff (AC-168, AC-169, ADR-0025).
+- `GraphFactory` is exported as a runtime type union (`Callable[..., Any] | StateGraph`) without subscripting `StateGraph` at runtime, enabling `GraphFactory | None` and `typing.get_type_hints()` without runtime errors while preserving strict type checker verification (AC-170, ADR-0025).
+- `update_state` exceptions are tagged with an internal attribute (`_relate_update_state_error`) instead of an exception note, eliminating framework clutter from user tracebacks while preserving accurate `--as-node` hint scoping (AC-172, ADR-0025).
+- `trace_root_cause()` disentangles direct and write-linked tool calls into separate candidate rows, preventing a successful direct call and a failing write-linked call on the same checkpoint from coalescing into a single contradictory row (AC-171, ADR-0025).
+- `failure_summary()` and `trace_argument_origin()` parse write task paths to isolate only the fan-out nodes that actually authored the failing tool argument, falling back to writing nodes if unparsable (AC-172, ADR-0025).
 - `GraphFactory` uses a string type annotation so `langgraph_checkpoint_relate` imports successfully even in environments where `StateGraph` cannot be parametrized at runtime (AC-162).
 - The replay diff compares non-message channel values recursively by key rather than by string representation (`repr`), ignoring dictionary key order and normalizing message lists (AC-106, ADR-0024).
 - `trace_root_cause()` detects failing tool calls linked to checkpoints through intermediate `:Write` nodes, achieving parity with `failure_summary()` (AC-163).
