@@ -6,10 +6,12 @@ import re
 import sys
 from typing import Any
 
+import pytest
 from langchain_core.runnables import RunnableConfig
 from rich.console import Console
 from rich.tree import Tree
 
+from langgraph_checkpoint_relate.errors import RelateCheckpointError
 from langgraph_checkpoint_relate.saver import RelateSaver
 from langgraph_checkpoint_relate.visualizer import DAGVisualizer
 
@@ -113,3 +115,32 @@ def test_nested_forks_render_iteratively_ac_185() -> None:
     assert _indent_of(output, "cp-n-fork-a") > _indent_of(output, "cp-n-01")
     assert _indent_of(output, "cp-n-fork-b") > _indent_of(output, "cp-n-fork-a")
     assert _indent_of(output, "cp-n-fork-a2") == _indent_of(output, "cp-n-fork-a")
+
+
+@pytest.mark.parametrize(
+    "failing_fragment",
+    ["-[:FORKED_TO]->(c:Checkpoint) WHERE c.thread_id <>", "type(r) AS rel_type", "HAS_WRITE"],
+    ids=["external-forks", "edges", "writes"],
+)
+def test_database_error_in_supporting_query_propagates(
+    monkeypatch: pytest.MonkeyPatch, failing_fragment: str
+) -> None:
+    """A failing fork, edge or write query raises instead of rendering a partial tree."""
+    thread = "thread-db-error"
+    with RelateSaver(db_path=":memory:") as saver:
+        _put(saver, thread, "cp-e-01", 1)
+        _put(saver, thread, "cp-e-02", 2, "cp-e-01")
+        proxy = saver.proxy
+        real_execute_read = proxy.execute_read
+
+        def failing_execute_read(
+            cypher: str, params: dict[str, Any] | None = None, timeout: float | None = None
+        ) -> list[dict[str, Any]]:
+            if failing_fragment in cypher:
+                raise RelateCheckpointError("simulated database failure")
+            return real_execute_read(cypher, params, timeout)
+
+        monkeypatch.setattr(proxy, "execute_read", failing_execute_read)
+        visualizer = DAGVisualizer(saver)
+        with pytest.raises(RelateCheckpointError, match="simulated database failure"):
+            visualizer.render_tree(thread)

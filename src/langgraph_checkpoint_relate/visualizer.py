@@ -134,12 +134,9 @@ class DAGVisualizer:
             "       c.state_hash AS state_hash, "
             "       c.created_at AS created_at"
         )
-        try:
-            external_forks = self._saver.proxy.execute_read(
-                external_forks_query, {"thread_id": thread_id}
-            )
-        except Exception:
-            external_forks = []
+        external_forks = self._saver.proxy.execute_read(
+            external_forks_query, {"thread_id": thread_id}
+        )
 
         all_checkpoint_records = list(records) + list(external_forks)
 
@@ -159,10 +156,7 @@ class DAGVisualizer:
             "       p.thread_id AS parent_thread_id, "
             "       c.thread_id AS child_thread_id"
         )
-        try:
-            edge_records = self._saver.proxy.execute_read(edges_query, {"thread_id": thread_id})
-        except Exception:
-            edge_records = []
+        edge_records = self._saver.proxy.execute_read(edges_query, {"thread_id": thread_id})
 
         # 5. Query pending writes linked via [:HAS_WRITE]
         writes_query = (
@@ -176,10 +170,7 @@ class DAGVisualizer:
             "       w.created_at AS created_at "
             "ORDER BY w.idx ASC"
         )
-        try:
-            write_records = self._saver.proxy.execute_read(writes_query, {"thread_id": thread_id})
-        except Exception:
-            write_records = []
+        write_records = self._saver.proxy.execute_read(writes_query, {"thread_id": thread_id})
 
         writes_by_cid: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
         for w in write_records:
