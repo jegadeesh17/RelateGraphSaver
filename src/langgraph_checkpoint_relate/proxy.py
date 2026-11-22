@@ -6,6 +6,7 @@ import concurrent.futures
 import logging
 import os
 import queue
+import re
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -67,25 +68,31 @@ def _format_records(records: Any) -> list[dict[str, Any]]:
     return [_format_record(r) for r in records]
 
 
+_CONCURRENCY_RE = re.compile(
+    r"\b(lock(ed)?|busy|contention|deadlock|collision|timeout|timed out)\b",
+    re.IGNORECASE,
+)
+_CONNECTION_RE = re.compile(r"\b(closed|connection)\b", re.IGNORECASE)
+
+
 def _wrap_exception(exc: Exception) -> RelateCheckpointError:
     """Map database, driver, or runtime exceptions to appropriate RelateCheckpointError."""
     if isinstance(exc, RelateCheckpointError):
         return exc
 
     msg = str(exc)
-    lower_msg = msg.lower()
 
     err: RelateCheckpointError
-    if isinstance(exc, (TimeoutError, concurrent.futures.TimeoutError)) or any(
-        k in lower_msg for k in ("lock", "busy", "contention", "deadlock", "collision", "timeout")
+    if (
+        isinstance(exc, (TimeoutError, concurrent.futures.TimeoutError))
+        or _CONCURRENCY_RE.search(msg)
     ):
         err = RelateConcurrencyError(f"Concurrency or lock failure: {msg}")
         err.__cause__ = exc
         return err
 
     if (
-        "closed" in lower_msg
-        or "connection" in lower_msg
+        _CONNECTION_RE.search(msg)
         or exc.__class__.__name__ in ("InterfaceError", "RelateConnectionError")
     ):
         err = RelateConnectionError(f"Database connection error: {msg}")

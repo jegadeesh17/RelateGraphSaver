@@ -20,7 +20,11 @@ _PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from langgraph_checkpoint_relate.errors import RelateConcurrencyError, RelateConnectionError
+from langgraph_checkpoint_relate.errors import (
+    RelateCheckpointError,
+    RelateConcurrencyError,
+    RelateConnectionError,
+)
 from langgraph_checkpoint_relate.proxy import BatchCommand, DbCommand, RelateThreadProxy
 
 
@@ -331,3 +335,77 @@ class TestProxyLifecycleAndWorkerTimeout:
         assert len(errors) == 0, f"Unexpected exceptions during concurrent close: {errors}"
         assert proxy.is_alive() is False
         assert proxy._is_closed is True
+
+
+class TestProxyExceptionClassification:
+    """Verifies proxy exception mapping classifies concurrency and connection errors accurately."""
+
+    def test_proxy_avoids_false_positive_concurrency_on_substrings(self) -> None:
+        """Verify queries failing with 'unlocked', 'clock', 'block', or 'timeout_ms' do not raise RelateConcurrencyError."""
+        class MockFailingConn:
+            def __init__(self) -> None:
+                self.error: Exception | None = None
+
+            def execute(self, _cypher: str, _params: Any = None) -> Any:
+                if self.error:
+                    raise self.error
+                return []
+
+            def close(self) -> None:
+                pass
+
+        mock_conn = MockFailingConn()
+        with RelateThreadProxy(
+            db_path=":memory:",
+            connection_factory=lambda _p: mock_conn,
+            auto_init_schema=False,
+        ) as proxy:
+            for false_match in [
+                "node state is unlocked",
+                "system clock drift detected",
+                "syntax error in code block",
+                "invalid configuration parameter timeout_ms",
+            ]:
+                mock_conn.error = RuntimeError(false_match)
+                with pytest.raises(RelateCheckpointError) as exc_info:
+                    proxy.execute_read("RETURN 1")
+                assert not isinstance(exc_info.value, RelateConcurrencyError)
+                assert false_match in str(exc_info.value)
+
+    def test_proxy_classifies_concurrency_and_connection_errors(self) -> None:
+        """Verify queries failing with lock, timeout, or closed connection are classified accurately."""
+        class MockFailingConn:
+            def __init__(self) -> None:
+                self.error: Exception | None = None
+
+            def execute(self, _cypher: str, _params: Any = None) -> Any:
+                if self.error:
+                    raise self.error
+                return []
+
+            def close(self) -> None:
+                pass
+
+        mock_conn = MockFailingConn()
+        with RelateThreadProxy(
+            db_path=":memory:",
+            connection_factory=lambda _p: mock_conn,
+            auto_init_schema=False,
+        ) as proxy:
+            # Concurrency errors
+            for conc_msg in [
+                "database is locked",
+                "write lock contention",
+                "query timed out",
+            ]:
+                mock_conn.error = RuntimeError(conc_msg)
+                with pytest.raises(RelateConcurrencyError) as exc_info:
+                    proxy.execute_write("CREATE (n:Test)")
+                assert conc_msg in str(exc_info.value)
+
+            # Connection errors
+            mock_conn.error = RuntimeError("connection closed")
+            with pytest.raises(RelateConnectionError) as conn_info:
+                proxy.execute_read("RETURN 1")
+            assert "connection closed" in str(conn_info.value)
+
