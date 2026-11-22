@@ -401,77 +401,71 @@ class DAGVisualizer:
         current_thread_id: str,
         visited: set[str],
     ) -> None:
-        """Recursively append checkpoint nodes, pending writes, and branch subtrees."""
-        if cid in visited:
-            tree_node.add(f"[dim red](cycle detected: {escape(cid)})[/dim red]")
-            return
-        visited.add(cid)
+        """Append checkpoint nodes, writes and branch sub-trees without recursion (AC-185).
 
-        info = parsed_checkpoints[cid]
-        writes = writes_by_cid.get(cid, [])
-        children = list(children_map.get(cid, []))
-        has_successor = any(rel == "NEXT" for _, rel in children)
-        _, status_markup = self._determine_status(info, writes, has_successor)
-        label = self._format_checkpoint_label(info, status_markup)
-
-        current_node = tree_node.add(label)
-
-        # Annotate writes: on a leaf they are still pending, under a completed step they are not
-        write_label = "write:" if has_successor else "pending write:"
-        for w in writes:
-            channel = escape(str(w.get("channel", "")))
-            task_id = escape(str(w.get("task_id", "")))
-            if channel == "__error__":
-                current_node.add(
-                    f"[bold red]{write_label}[/bold red] channel='{channel}', task_id='{task_id}'"
-                )
-            elif channel == "__interrupt__":
-                current_node.add(
-                    f"[bold magenta]{write_label}[/bold magenta] channel='{channel}', task_id='{task_id}'"
-                )
-            else:
-                current_node.add(
-                    f"[yellow]{write_label}[/yellow] channel='{channel}', task_id='{task_id}'"
-                )
-
-        # Recurse for children
-        children.sort(
-            key=lambda item: (
-                1 if item[1] == "FORKED_TO" else 0,
-                parsed_checkpoints.get(item[0], {}).get("step", 0),
-                parsed_checkpoints.get(item[0], {}).get("created_at", ""),
-            )
-        )
-
-        for child_id, rel_type in children:
-            if child_id not in parsed_checkpoints:
+        [:NEXT] children are appended as siblings of the checkpoint that precedes
+        them, at the same depth. Only [:FORKED_TO] children open an indented
+        "Branch" sub-tree. An explicit work stack replaces call-stack recursion
+        so a long linear run cannot raise RecursionError (ADR-0027).
+        """
+        stack: list[tuple[Tree, str]] = [(tree_node, cid)]
+        while stack:
+            parent_node, current_cid = stack.pop()
+            if current_cid in visited:
+                parent_node.add(f"[dim red](cycle detected: {escape(current_cid)})[/dim red]")
                 continue
+            visited.add(current_cid)
 
-            if rel_type == "FORKED_TO":
-                child_info = parsed_checkpoints[child_id]
-                fork_header = "[bold cyan]Branch: [BRANCH][/bold cyan]"
-                if child_info["thread_id"] != current_thread_id:
-                    fork_header = f"[bold cyan]Branch: [BRANCH] (thread: {escape(child_info['thread_id'])})[/bold cyan]"
-                branch_node = current_node.add(fork_header)
-                self._add_checkpoint_subtree(
-                    tree_node=branch_node,
-                    cid=child_id,
-                    parsed_checkpoints=parsed_checkpoints,
-                    writes_by_cid=writes_by_cid,
-                    children_map=children_map,
-                    current_thread_id=current_thread_id,
-                    visited=visited,
+            info = parsed_checkpoints[current_cid]
+            writes = writes_by_cid.get(current_cid, [])
+            children = [
+                (child_id, rel_type)
+                for child_id, rel_type in children_map.get(current_cid, [])
+                if child_id in parsed_checkpoints
+            ]
+            has_successor = any(rel == "NEXT" for _, rel in children)
+            _, status_markup = self._determine_status(info, writes, has_successor)
+            current_node = parent_node.add(self._format_checkpoint_label(info, status_markup))
+
+            # Annotate writes: on a leaf they are still pending, under a completed step they are not
+            write_label = "write:" if has_successor else "pending write:"
+            for w in writes:
+                channel = escape(str(w.get("channel", "")))
+                task_id = escape(str(w.get("task_id", "")))
+                if channel == "__error__":
+                    current_node.add(
+                        f"[bold red]{write_label}[/bold red] channel='{channel}', task_id='{task_id}'"
+                    )
+                elif channel == "__interrupt__":
+                    current_node.add(
+                        f"[bold magenta]{write_label}[/bold magenta] channel='{channel}', task_id='{task_id}'"
+                    )
+                else:
+                    current_node.add(
+                        f"[yellow]{write_label}[/yellow] channel='{channel}', task_id='{task_id}'"
+                    )
+
+            children.sort(
+                key=lambda item: (
+                    1 if item[1] == "FORKED_TO" else 0,
+                    parsed_checkpoints[item[0]]["step"],
+                    parsed_checkpoints[item[0]]["created_at"],
                 )
-            else:
-                self._add_checkpoint_subtree(
-                    tree_node=current_node,
-                    cid=child_id,
-                    parsed_checkpoints=parsed_checkpoints,
-                    writes_by_cid=writes_by_cid,
-                    children_map=children_map,
-                    current_thread_id=current_thread_id,
-                    visited=visited,
-                )
+            )
+
+            # Branch headers are attached now so they keep sorted order under this
+            # checkpoint; work items are pushed reversed so the first child pops first.
+            pending: list[tuple[Tree, str]] = []
+            for child_id, rel_type in children:
+                if rel_type == "FORKED_TO":
+                    child_info = parsed_checkpoints[child_id]
+                    fork_header = "[bold cyan]Branch: [BRANCH][/bold cyan]"
+                    if child_info["thread_id"] != current_thread_id:
+                        fork_header = f"[bold cyan]Branch: [BRANCH] (thread: {escape(child_info['thread_id'])})[/bold cyan]"
+                    pending.append((current_node.add(fork_header), child_id))
+                else:
+                    pending.append((parent_node, child_id))
+            stack.extend(reversed(pending))
 
 
 __all__ = ["DAGVisualizer"]

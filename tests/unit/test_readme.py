@@ -295,3 +295,25 @@ def test_where_the_data_lives_names_all_four_threads_ac_150() -> None:
     section = _section("Where the data lives")
     for thread_id in ("demo-tool-fail", "demo-tool-ok", "demo-research", "demo-real-api"):
         assert thread_id in section, f"thread {thread_id} missing"
+
+
+def test_readme_tree_sample_uses_flat_layout_ac_185() -> None:
+    """AC-185: the README tree excerpt matches the real flat output, steps at one depth."""
+    text = _readme_text()
+    block = text[text.index("Thread: demo-real-api") :]
+    excerpt = block[: block.index("```")].splitlines()
+    # The excerpt ends with an ellipsis line; everything before it is real output.
+    assert excerpt[-1] == "..."
+    sample = [line.rstrip() for line in excerpt[:-1]]
+
+    result = CliRunner().invoke(app, ["tree", "demo-real-api", "--db", str(DEMO_STORE)])
+    assert result.exit_code == 0, result.output
+    # The README shows the ASCII glyphs; the runner may print the Unicode ones.
+    ascii_glyphs = str.maketrans({"├": "+", "└": "`", "─": "-", "│": "|"})
+    actual = [line.translate(ascii_glyphs).rstrip() for line in result.output.splitlines()]
+    assert actual[: len(sample)] == sample
+
+    step_lines = [line for line in sample if "] Step " in line]
+    assert len(step_lines) >= 3
+    assert {line.index("[") for line in step_lines} == {4}
+    assert not any(line.startswith("    ") for line in sample)

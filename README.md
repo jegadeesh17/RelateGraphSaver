@@ -77,19 +77,24 @@ relate-dag forensics failures --db examples/data/demo.rl
 relate-dag replay demo-tool-fail 1f1e3dcc-9e79-6ab8-8000-7d30cc461d0e --graph examples/tool_agent.py:create_tool_agent_graph --set-message 0=https://example.org/report --db examples/data/demo.rl
 ```
 
-`tree` prints one thread as a tree (excerpt; each checkpoint line carries its id and step, and the tree continues to the last step):
+`tree` prints one thread as a tree (excerpt; each checkpoint line carries its id and step, successive steps sit at the same depth, only forked branches are indented, and the tree continues to the last step):
 
 ```text
 Thread: demo-real-api
-`-- [OK] Step -1: source: input (id: 1f1e3dcc-a6d6-6162-bfff-4124dcf80f96) - 
-    2026-11-19T05:48:05.367692+00:00
-    +-- write: channel='messages', 
-    |   task_id='ea4ddc7a-fa40-7938-a4e1-0bb9d5c4f9c6'
-    +-- write: channel='branch:to:intake', 
-    |   task_id='ea4ddc7a-fa40-7938-a4e1-0bb9d5c4f9c6'
-    `-- [OK] Step 0: source: loop (id: 1f1e3dcc-a6d9-674a-8000-f4e0be68ceae) - 
-        2026-11-19T05:48:05.401817+00:00
-        ...
++-- [OK] Step -1: source: input (id: 1f1e3dcc-a6d6-6162-bfff-4124dcf80f96) - 
+|   2026-11-19T05:48:05.367692+00:00
+|   +-- write: channel='messages', 
+|   |   task_id='ea4ddc7a-fa40-7938-a4e1-0bb9d5c4f9c6'
+|   `-- write: channel='branch:to:intake', 
+|       task_id='ea4ddc7a-fa40-7938-a4e1-0bb9d5c4f9c6'
++-- [OK] Step 0: source: loop (id: 1f1e3dcc-a6d9-674a-8000-f4e0be68ceae) - 
+|   2026-11-19T05:48:05.401817+00:00
+|   +-- write: channel='project', 
+|   |   task_id='f6e38094-3af4-4df9-46a4-a8906e3c9c74'
+|   `-- write: channel='branch:to:planner', 
+|       task_id='f6e38094-3af4-4df9-46a4-a8906e3c9c74'
++-- [OK] Step 1: source: loop (id: 1f1e3dcc-a6dd-62fa-8001-77bdfaae9575) - 
+...
 ```
 
 `trace-error` on `demo-real-api` names the tool call that failed and the node that wrote its bad argument (excerpt):
