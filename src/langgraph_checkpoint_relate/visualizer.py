@@ -168,7 +168,7 @@ class DAGVisualizer:
             "       w.channel AS channel, "
             "       w.idx AS idx, "
             "       w.created_at AS created_at "
-            "ORDER BY w.idx ASC"
+            "ORDER BY w.task_id ASC, w.idx ASC"
         )
         write_records = self._saver.proxy.execute_read(writes_query, {"thread_id": thread_id})
 

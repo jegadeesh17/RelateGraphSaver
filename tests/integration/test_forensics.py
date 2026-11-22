@@ -1711,3 +1711,93 @@ class TestPoisonDetection:
             assert report.error_checkpoint_id == cid3
             assert report.root_tool_call_id is None
             assert report.root_tool_name is None
+
+
+class TestDeterministicTieBreakOrdering:
+    """AC-180, AC-184: ties in causal and write queries resolve in a stable, sorted order."""
+
+    @staticmethod
+    def _put_cp(
+        saver: RelateSaver, thread_id: str, cid: str, parent: str | None, step: int
+    ) -> RunnableConfig:
+        cfg: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_id": cid}}
+        cp: Any = dict(empty_checkpoint())
+        cp["id"] = cid
+        if parent:
+            cp["parent_checkpoint_id"] = parent
+        saver.put(cfg, cp, {"step": step, "node": "n"}, {})  # type: ignore[typeddict-unknown-key]
+        return cfg
+
+    def test_ac184_equal_distance_failed_tool_calls_resolve_to_lowest_call_id(
+        self, temp_disk_db: str
+    ) -> None:
+        """AC-184: two failed calls on one checkpoint pick the lowest call id regardless of write order."""
+        thread_id = "thread-ac184-tie"
+        with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
+            self._put_cp(saver, thread_id, "cp-tie-1", None, 1)
+            cfg2 = self._put_cp(saver, thread_id, "cp-tie-2", "cp-tie-1", 2)
+            # Written in descending id order so insertion order disagrees with sorted order.
+            for call_id in ("call-tie-c", "call-tie-b", "call-tie-a"):
+                ai = AIMessage(
+                    content="",
+                    tool_calls=[{"id": call_id, "name": "search", "args": {"q": call_id}}],
+                )
+                saver.put_writes(cfg2, [("messages", [ai])], task_id=f"task-ai-{call_id}")
+                msg = ToolMessage(content="boom", tool_call_id=call_id, status="error")
+                saver.put_writes(cfg2, [("messages", [msg])], task_id=f"task-tool-{call_id}")
+            cfg3 = self._put_cp(saver, thread_id, "cp-tie-3", "cp-tie-2", 3)
+            saver.put_writes(cfg3, [("__error__", "downstream failure")], task_id="task-err")
+
+            with RelateForensics(saver) as forensics:
+                report = forensics.trace_root_cause(thread_id)
+
+        assert report.root_tool_call_id == "call-tie-a"
+        assert report.causal_path_length == 1
+
+    def test_ac184_causal_query_orders_by_distance_checkpoint_and_tool_call(
+        self, temp_disk_db: str
+    ) -> None:
+        """AC-184: the causal query carries explicit tie-breakers after distance_to_error."""
+        thread_id = "thread-ac184-order"
+        with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
+            self._put_cp(saver, thread_id, "cp-ord-1", None, 1)
+            cfg2 = self._put_cp(saver, thread_id, "cp-ord-2", "cp-ord-1", 2)
+            saver.put_writes(cfg2, [("__error__", "boom")], task_id="task-err")
+
+            seen: list[str] = []
+            real = saver.proxy.execute_read
+
+            def spy(query: str, params: dict[str, Any] | None = None) -> Any:
+                seen.append(query)
+                return real(query, params)
+
+            with (
+                patch.object(saver.proxy, "execute_read", side_effect=spy),
+                RelateForensics(saver) as forensics,
+            ):
+                forensics.trace_root_cause(thread_id)
+
+        causal = [q for q in seen if "length(path) AS distance_to_error" in q]
+        assert len(causal) == 1
+        order_by = causal[0].split("ORDER BY", 1)[1]
+        assert order_by.index("distance_to_error") < order_by.index("checkpoint_id")
+        assert order_by.index("checkpoint_id") < order_by.index("direct_call_id")
+        assert order_by.index("direct_call_id") < order_by.index("linked_call_id")
+
+    def test_ac180_tree_writes_ordered_by_task_id_then_idx(self, temp_disk_db: str) -> None:
+        """AC-180: tree write annotations are listed by task id, not by insertion order."""
+        from rich.console import Console
+
+        from langgraph_checkpoint_relate.visualizer import DAGVisualizer
+
+        thread_id = "thread-ac180-order"
+        with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
+            cfg = self._put_cp(saver, thread_id, "cp-wr-1", None, 1)
+            for task_id in ("task-c", "task-b", "task-a"):
+                saver.put_writes(cfg, [("chan", task_id)], task_id=task_id)
+            output = DAGVisualizer(saver).render_to_string(
+                thread_id, Console(width=200, record=True)
+            )
+
+        positions = [output.index(f"task_id='{t}'") for t in ("task-a", "task-b", "task-c")]
+        assert positions == sorted(positions)

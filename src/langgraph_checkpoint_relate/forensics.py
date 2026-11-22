@@ -1006,7 +1006,8 @@ class RelateForensics:
             "       tc2.call_id AS linked_call_id, "
             "       tc2.error AS linked_error, "
             "       tc2.tool_name AS linked_tool_name "
-            "ORDER BY distance_to_error ASC"
+            "ORDER BY distance_to_error ASC, checkpoint_id ASC, "
+            "         direct_call_id ASC, linked_call_id ASC"
         )
         causal_rows = self._saver.proxy.execute_read(
             causal_query,
