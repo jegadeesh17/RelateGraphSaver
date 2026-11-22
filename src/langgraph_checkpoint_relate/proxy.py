@@ -123,6 +123,7 @@ class RelateThreadProxy:
 
         self._queue: queue.Queue[Any] = queue.Queue()
         self._writer_lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
         self._is_closed = False
         self._conn: Any = None
         self._worker_thread: threading.Thread | None = None
@@ -136,6 +137,11 @@ class RelateThreadProxy:
         """Exclusive writer lock protecting mutating database operations."""
         return self._writer_lock
 
+    @property
+    def lifecycle_lock(self) -> threading.Lock:
+        """Lifecycle lock protecting state transitions, active checks, and enqueuing."""
+        return self._lifecycle_lock
+
     def _start_worker(self) -> None:
         """Spawn the dedicated background worker thread and wait for initialization."""
         self._worker_thread = threading.Thread(
@@ -148,6 +154,9 @@ class RelateThreadProxy:
         ready = self._ready_event.wait(timeout=self.default_timeout)
         if not ready:
             self._is_closed = True
+            self._queue.put(_ShutdownSentinel())
+            if self._worker_thread is not None and self._worker_thread.is_alive():
+                self._worker_thread.join(timeout=2.0)
             raise RelateConnectionError(
                 f"RelateThreadProxy worker failed to initialize within {self.default_timeout} seconds"
             )
@@ -177,12 +186,16 @@ class RelateThreadProxy:
         """Worker thread loop executing commands strictly on this thread."""
         try:
             self._conn = self._open_connection()
+            if self._is_closed:
+                self._cleanup_connection()
+                return
             if self.auto_init_schema and not self.read_only:
                 initialize_schema(self._conn)
             self._ready_event.set()
         except Exception as exc:
             self._startup_error = exc
             self._ready_event.set()
+            self._cleanup_connection()
             return
 
         while True:
@@ -454,10 +467,11 @@ class RelateThreadProxy:
 
     def ping(self, timeout: float | None = 5.0) -> bool:
         """Ping the worker thread through the actor queue to verify responsiveness."""
-        if not self.is_alive():
-            return False
         fut: concurrent.futures.Future[bool] = concurrent.futures.Future()
-        self._queue.put({"type": "is_alive", "future": fut})
+        with self._lifecycle_lock:
+            if not self.is_alive():
+                return False
+            self._queue.put({"type": "is_alive", "future": fut})
         try:
             return fut.result(timeout=timeout or self.default_timeout)
         except Exception:
@@ -500,8 +514,6 @@ class RelateThreadProxy:
         timeout: float | None,
     ) -> list[dict[str, Any]]:
         """Validate input, build command, and await completion."""
-        self._check_active()
-
         if not isinstance(cypher, str) or not cypher.strip():
             raise RelateCheckpointError("Cypher statement must be a non-empty string")
 
@@ -511,7 +523,10 @@ class RelateThreadProxy:
         bound_params = dict(params) if params is not None else {}
         fut: concurrent.futures.Future[list[dict[str, Any]]] = concurrent.futures.Future()
         cmd = DbCommand(cypher=cypher, params=bound_params, is_write=is_write, future=fut)
-        self._queue.put(cmd)
+
+        with self._lifecycle_lock:
+            self._check_active()
+            self._queue.put(cmd)
 
         effective_timeout = timeout if timeout is not None else self.default_timeout
         try:
@@ -538,13 +553,9 @@ class RelateThreadProxy:
         or by ``close()``.
         """
         self._check_writable()
-        self._check_active()
 
         if isinstance(statements, (str, bytes)) or not isinstance(statements, Sequence):
             raise RelateCheckpointError("Statements must be a sequence of (query, params) tuples")
-
-        if not statements:
-            return []
 
         validated_statements: list[tuple[str, dict[str, Any]]] = []
         for idx, item in enumerate(statements):
@@ -565,7 +576,12 @@ class RelateThreadProxy:
 
         fut: concurrent.futures.Future[list[list[dict[str, Any]]]] = concurrent.futures.Future()
         cmd = BatchCommand(statements=validated_statements, future=fut, flush=flush)
-        self._queue.put(cmd)
+
+        with self._lifecycle_lock:
+            self._check_active()
+            if not statements:
+                return []
+            self._queue.put(cmd)
 
         effective_timeout = timeout if timeout is not None else self.default_timeout
         try:
@@ -598,9 +614,6 @@ class RelateThreadProxy:
 
     def flush(self, timeout: float | None = None) -> None:
         """Explicitly flush pending changes to disk WAL (a no-op when read-only)."""
-        self._check_active()
-        if self.read_only:
-            return
         fut: concurrent.futures.Future[None] = concurrent.futures.Future()
 
         def do_flush() -> None:
@@ -616,7 +629,12 @@ class RelateThreadProxy:
                 if not fut.cancelled():
                     fut.set_exception(_wrap_exception(exc))
 
-        self._queue.put(do_flush)
+        with self._lifecycle_lock:
+            self._check_active()
+            if self.read_only:
+                return
+            self._queue.put(do_flush)
+
         effective_timeout = timeout if timeout is not None else self.default_timeout
         try:
             fut.result(timeout=effective_timeout)
@@ -626,9 +644,10 @@ class RelateThreadProxy:
 
     def abort(self, timeout: float | None = 2.0) -> None:
         """Abruptly terminate the proxy and connection without graceful flush."""
-        if self._is_closed:
-            return
-        self._is_closed = True
+        with self._lifecycle_lock:
+            if self._is_closed:
+                return
+            self._is_closed = True
 
         def do_abort() -> None:
             if self._conn is not None:
@@ -654,12 +673,13 @@ class RelateThreadProxy:
 
     def close(self, timeout: float | None = 5.0) -> None:
         """Cleanly shut down worker actor thread and close Relate connection."""
-        if self._is_closed:
-            return
-        self._is_closed = True
+        with self._lifecycle_lock:
+            if self._is_closed:
+                return
+            self._is_closed = True
+            self._queue.put(_ShutdownSentinel())
 
         if self._worker_thread is not None and self._worker_thread.is_alive():
-            self._queue.put(_ShutdownSentinel())
             effective_timeout = timeout if timeout is not None else 5.0
             self._worker_thread.join(timeout=effective_timeout)
 

@@ -9,6 +9,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 from collections.abc import Generator
 from pathlib import Path
 from typing import Any
@@ -19,7 +20,7 @@ _PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from langgraph_checkpoint_relate.errors import RelateConcurrencyError
+from langgraph_checkpoint_relate.errors import RelateConcurrencyError, RelateConnectionError
 from langgraph_checkpoint_relate.proxy import BatchCommand, DbCommand, RelateThreadProxy
 
 
@@ -179,3 +180,154 @@ class TestProxyCancellationOnTimeout:
                 "MATCH (n:PreCancelledBatch {id: 'pre-b-1'}) RETURN count(n) AS cnt"
             )
             assert res == [{"cnt": 0}]
+
+
+class TestProxyLifecycleAndWorkerTimeout:
+    """Verifies proxy worker initialization timeouts and atomic lifecycle coordination."""
+
+    def test_startup_timeout_signals_worker_exit_and_closes_connection(self) -> None:
+        """On worker startup timeout, proxy signals worker thread to stop and closes connection handle."""
+        class MockRelateConn:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        mock_conn = MockRelateConn()
+        worker_threads: list[threading.Thread] = []
+
+        def slow_factory(_path: str) -> Any:
+            worker_threads.append(threading.current_thread())
+            time.sleep(0.1)
+            return mock_conn
+
+        with pytest.raises(RelateConnectionError, match="failed to initialize within"):
+            RelateThreadProxy(
+                db_path=":memory:",
+                connection_factory=slow_factory,
+                default_timeout=0.03,
+                auto_init_schema=False,
+            )
+
+        assert len(worker_threads) == 1
+        worker_thread = worker_threads[0]
+        # Worker thread must have joined and exited cleanly
+        assert not worker_thread.is_alive()
+        # Connection handle must have been closed
+        assert mock_conn.closed is True
+
+    def test_lifecycle_lock_prevents_race_conditions_with_close(self, temp_db_path: str) -> None:
+        """Unified lifecycle lock coordinates active check, command enqueue, and close atomically."""
+        proxy = RelateThreadProxy(db_path=temp_db_path)
+        assert proxy.is_alive() is True
+
+        # Pre-seed a test record
+        proxy.execute_write("CREATE (n:RaceTest {id: 'init'})")
+
+        # Hold lifecycle lock from an external thread, simulating an active command enqueue
+        lock_held = threading.Event()
+        release_lock = threading.Event()
+
+        def hold_lock() -> None:
+            with proxy.lifecycle_lock:
+                lock_held.set()
+                release_lock.wait(timeout=2.0)
+
+        t = threading.Thread(target=hold_lock)
+        t.start()
+        assert lock_held.wait(timeout=1.0) is True
+
+        # While lifecycle lock is held, proxy.close() must block
+        close_finished = threading.Event()
+
+        def do_close() -> None:
+            proxy.close()
+            close_finished.set()
+
+        close_thread = threading.Thread(target=do_close)
+        close_thread.start()
+
+        # Verify close has not completed while lock is held
+        assert close_finished.wait(timeout=0.05) is False
+
+        # Release lock; close() should proceed cleanly
+        release_lock.set()
+        t.join(timeout=1.0)
+        close_thread.join(timeout=1.0)
+        assert close_finished.is_set() is True
+
+        # Post-close, active checks immediately reject all operations atomically
+        with pytest.raises(RelateConnectionError, match="is closed"):
+            proxy.execute_read("RETURN 1")
+
+        with pytest.raises(RelateConnectionError, match="is closed"):
+            proxy.execute_write("CREATE (n:RaceTest {id: 'post'})")
+
+        with pytest.raises(RelateConnectionError, match="is closed"):
+            proxy.execute_batch([("CREATE (n:RaceTest {id: 'batch'})", {})])
+
+        with pytest.raises(RelateConnectionError, match="is closed"):
+            proxy.execute_batch([])
+
+        with pytest.raises(RelateConnectionError, match="is closed"):
+            proxy.flush()
+
+        assert proxy.ping() is False
+        assert proxy.is_alive() is False
+        assert proxy._queue.empty() is True
+
+    def test_concurrent_execution_and_close_no_races_or_deadlocks(self, temp_db_path: str) -> None:
+        """High-concurrency query execution racing with close() completes cleanly without hangs."""
+        proxy = RelateThreadProxy(db_path=temp_db_path)
+        proxy.execute_write("CREATE (n:ConcurrentItem {count: 0})")
+
+        stop_signal = threading.Event()
+        errors: list[Exception] = []
+        operations_count = 0
+        ops_lock = threading.Lock()
+
+        def worker(worker_id: int) -> None:
+            nonlocal operations_count
+            while not stop_signal.is_set():
+                try:
+                    op_type = worker_id % 4
+                    if op_type == 0:
+                        proxy.execute_read("MATCH (n:ConcurrentItem) RETURN count(n) AS cnt")
+                    elif op_type == 1:
+                        proxy.execute_write(
+                            "CREATE (n:ConcurrentItem {id: $id})",
+                            {"id": f"item-{worker_id}-{time.perf_counter()}"},
+                        )
+                    elif op_type == 2:
+                        proxy.execute_batch([
+                            ("CREATE (n:ConcurrentBatch {worker: $w})", {"w": worker_id}),
+                        ])
+                    else:
+                        proxy.flush()
+                    with ops_lock:
+                        operations_count += 1
+                except RelateConnectionError as conn_err:
+                    # Expected once proxy is closed
+                    assert "is closed" in str(conn_err) or "not running" in str(conn_err)
+                    break
+                except Exception as exc:
+                    errors.append(exc)
+                    break
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+        for th in threads:
+            th.start()
+
+        # Let workers run for a brief moment, then close the proxy concurrently
+        time.sleep(0.05)
+        proxy.close(timeout=3.0)
+        stop_signal.set()
+
+        for th in threads:
+            th.join(timeout=3.0)
+            assert not th.is_alive(), "Worker thread hung during concurrent execution and close"
+
+        assert len(errors) == 0, f"Unexpected exceptions during concurrent close: {errors}"
+        assert proxy.is_alive() is False
+        assert proxy._is_closed is True
