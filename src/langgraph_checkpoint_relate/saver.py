@@ -483,7 +483,7 @@ class RelateSaver(BaseCheckpointSaver[str]):
                 "       c.metadata_blob AS metadata_blob, "
                 "       c.state_hash AS state_hash, "
                 "       c.created_at AS created_at "
-                "ORDER BY c.step DESC, c.created_at DESC "
+                "ORDER BY c.checkpoint_id DESC "
                 "LIMIT 1"
             )
             params = {
@@ -601,11 +601,19 @@ class RelateSaver(BaseCheckpointSaver[str]):
 
         checkpoint_id = get_checkpoint_id(config) if config else None
 
+        # Extract target before checkpoint id if specified (AC-175, ADR-0026)
+        before_id: str | None = None
+        if isinstance(before, dict):
+            before_id = get_checkpoint_id(before)
+        elif isinstance(before, str) and before.strip():
+            before_id = before.strip()
+
         query = (
             "MATCH (c:Checkpoint) "
             "WHERE ($thread_id IS NULL OR c.thread_id = $thread_id) "
             "  AND ($checkpoint_ns IS NULL OR c.checkpoint_ns = $checkpoint_ns) "
             "  AND ($checkpoint_id IS NULL OR c.checkpoint_id = $checkpoint_id) "
+            "  AND ($before IS NULL OR c.checkpoint_id < $before) "
             "RETURN c.checkpoint_id AS checkpoint_id, "
             "       c.thread_id AS thread_id, "
             "       c.checkpoint_ns AS checkpoint_ns, "
@@ -615,12 +623,13 @@ class RelateSaver(BaseCheckpointSaver[str]):
             "       c.metadata_blob AS metadata_blob, "
             "       c.state_hash AS state_hash, "
             "       c.created_at AS created_at "
-            "ORDER BY c.step DESC, c.created_at DESC"
+            "ORDER BY c.checkpoint_id DESC"
         )
         params: dict[str, Any] = {
             "thread_id": thread_id,
             "checkpoint_ns": checkpoint_ns,
             "checkpoint_id": checkpoint_id,
+            "before": before_id,
         }
 
         try:
@@ -628,57 +637,13 @@ class RelateSaver(BaseCheckpointSaver[str]):
         except RelateCheckpointError:
             return
 
-        # Extract target before checkpoint id if specified
-        before_id: str | None = None
-        if isinstance(before, dict):
-            before_id = get_checkpoint_id(before)
-        elif isinstance(before, str) and before.strip():
-            before_id = before.strip()
-
-        before_step: int | None = None
-        before_created_at: str | None = None
-        if before_id:
-            for r in rows:
-                if r["checkpoint_id"] == before_id:
-                    before_step = int(r["step"])
-                    before_created_at = str(r["created_at"])
-                    break
-            if before_step is None:
-                try:
-                    b_query = (
-                        "MATCH (c:Checkpoint {checkpoint_id: $cid}) "
-                        "RETURN c.step AS step, c.created_at AS created_at "
-                        "LIMIT 1"
-                    )
-                    b_rows = self.proxy.execute_read(b_query, {"cid": before_id})
-                    if b_rows:
-                        before_step = int(b_rows[0]["step"])
-                        before_created_at = str(b_rows[0]["created_at"])
-                except RelateCheckpointError:
-                    pass
-
         yielded_count = 0
         for r in rows:
             cid = str(r["checkpoint_id"])
-            step = int(r["step"])
-            created_at = str(r["created_at"])
 
-            # Filter by before checkpoint boundary
-            if before_id:
-                if cid == before_id:
-                    continue
-                if before_step is not None:
-                    if step > before_step:
-                        continue
-                    if (
-                        step == before_step
-                        and before_created_at is not None
-                        and created_at >= before_created_at
-                    ):
-                        continue
-                else:
-                    if cid >= before_id:
-                        continue
+            # Filter by before checkpoint boundary (AC-175, ADR-0026)
+            if before_id and cid >= before_id:
+                continue
 
             metadata_bytes = _extract_bytes(r["metadata_blob"])
             metadata = self.serde.loads(metadata_bytes)

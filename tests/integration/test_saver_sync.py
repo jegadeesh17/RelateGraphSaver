@@ -50,7 +50,9 @@ def test_get_tuple_omitted_checkpoint_ns_defaults_to_root_ac_173() -> None:
                 "checkpoint_ns": "subgraph_node",
             }
         }
-        saver.put(cfg_subgraph, _make_checkpoint("cp-subgraph-01", "subgraph_step_2"), {"step": 2}, {})
+        saver.put(
+            cfg_subgraph, _make_checkpoint("cp-subgraph-01", "subgraph_step_2"), {"step": 2}, {}
+        )
 
         # 3. Call get_tuple with omitted checkpoint_ns
         cfg_omitted: RunnableConfig = {
@@ -112,9 +114,7 @@ def test_list_omitted_checkpoint_ns_returns_all_namespaces_ac_173() -> None:
     with RelateSaver(db_path=":memory:") as saver:
         thread_id = "test-thread-list-ac173"
 
-        cfg_root: RunnableConfig = {
-            "configurable": {"thread_id": thread_id, "checkpoint_ns": ""}
-        }
+        cfg_root: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
         cfg_sub: RunnableConfig = {
             "configurable": {"thread_id": thread_id, "checkpoint_ns": "sub_agent"}
         }
@@ -144,3 +144,95 @@ def test_get_tuple_invalid_input_boundaries_ac_173() -> None:
         assert saver.get_tuple({"configurable": {"thread_id": None}}) is None
         assert saver.get_tuple({"configurable": {"thread_id": 12345}}) is None
         assert saver.get_tuple({"configurable": {"thread_id": "nonexistent_thread"}}) is None
+
+
+def test_get_tuple_latest_ordered_by_checkpoint_id_descending_ac_175() -> None:
+    """AC-175, ADR-0026: get_tuple() resolves latest checkpoint by checkpoint_id descending.
+
+    Proves that even when an earlier checkpoint has a higher step number due to a workflow
+    fork or update_state call, the checkpoint with the highest checkpoint_id (UUIDv6)
+    is returned as the latest checkpoint.
+    """
+    with RelateSaver(db_path=":memory:") as saver:
+        thread_id = "test-thread-ac175-latest"
+        cfg: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+
+        # Main branch executes up to step 5
+        cid_main = "1ef82a3c-b034-6c2e-8000-000000000001"
+        saver.put(cfg, _make_checkpoint(cid_main, "main_step_5"), {"step": 5}, {})
+
+        # update_state forks from an earlier state, created later with lower step (step 2)
+        cid_fork = "1ef82a3c-b034-6c2e-8000-000000000002"
+        saver.put(cfg, _make_checkpoint(cid_fork, "fork_step_2"), {"step": 2}, {})
+
+        # get_tuple without checkpoint_id resolves the latest write by checkpoint_id descending
+        latest = saver.get_tuple(cfg)
+        assert latest is not None
+        assert latest.config["configurable"]["checkpoint_id"] == cid_fork
+        assert latest.checkpoint["channel_values"]["data"] == "fork_step_2"
+        assert latest.metadata.get("step") == 2
+
+
+def test_list_ordered_by_checkpoint_id_descending_ac_175() -> None:
+    """AC-175, ADR-0026: list() yields checkpoints ordered reverse-chronologically by checkpoint_id."""
+    with RelateSaver(db_path=":memory:") as saver:
+        thread_id = "test-thread-ac175-list"
+        cfg: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+
+        # Checkpoints with divergent step numbers
+        cids = [
+            ("1ef82a3c-b034-6c2e-8000-000000000001", 10, "val_1"),
+            ("1ef82a3c-b034-6c2e-8000-000000000002", 3, "val_2"),
+            ("1ef82a3c-b034-6c2e-8000-000000000003", 8, "val_3"),
+        ]
+        for cid, step, val in cids:
+            saver.put(cfg, _make_checkpoint(cid, val), {"step": step}, {})
+
+        records = list(saver.list(cfg))
+        assert len(records) == 3
+        yielded_ids = [r.checkpoint["id"] for r in records]
+        assert yielded_ids == [
+            "1ef82a3c-b034-6c2e-8000-000000000003",
+            "1ef82a3c-b034-6c2e-8000-000000000002",
+            "1ef82a3c-b034-6c2e-8000-000000000001",
+        ]
+        # Steps are yielded in checkpoint_id descending order, not step order
+        assert [r.metadata["step"] for r in records] == [8, 3, 10]
+
+
+def test_list_before_pagination_by_checkpoint_id_ac_175() -> None:
+    """AC-175, ADR-0026: list(before=...) filters checkpoints where checkpoint_id < before."""
+    with RelateSaver(db_path=":memory:") as saver:
+        thread_id = "test-thread-ac175-before"
+        cfg: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+
+        cids = [
+            "1ef82a3c-b034-6c2e-8000-000000000001",
+            "1ef82a3c-b034-6c2e-8000-000000000002",
+            "1ef82a3c-b034-6c2e-8000-000000000003",
+            "1ef82a3c-b034-6c2e-8000-000000000004",
+        ]
+        for i, cid in enumerate(cids, start=1):
+            saver.put(cfg, _make_checkpoint(cid, f"v_{i}"), {"step": i}, {})
+
+        # (a) Filter before cid 0003 with config dict: returns 0002, 0001
+        before_cfg: RunnableConfig = {
+            "configurable": {"thread_id": thread_id, "checkpoint_id": cids[2]}
+        }
+        res_cfg = list(saver.list(cfg, before=before_cfg))
+        assert [r.checkpoint["id"] for r in res_cfg] == [cids[1], cids[0]]
+
+        # (b) Filter before cid 0003 with string and limit=1: returns 0002
+        res_str = list(saver.list(cfg, before=cids[2], limit=1))
+        assert [r.checkpoint["id"] for r in res_str] == [cids[1]]
+
+        # (c) Filter before earliest checkpoint: returns empty list
+        before_earliest: RunnableConfig = {
+            "configurable": {"thread_id": thread_id, "checkpoint_id": cids[0]}
+        }
+        res_empty = list(saver.list(cfg, before=before_earliest))
+        assert res_empty == []
+
+        # (d) Invalid input boundary: empty string before returns all checkpoints
+        res_invalid_str = list(saver.list(cfg, before="   "))
+        assert len(res_invalid_str) == 4

@@ -195,11 +195,14 @@ class TestRelateSaverEndToEnd:
             assert latest_tuple.parent_config is not None
             assert "checkpoint_id" in latest_tuple.parent_config["configurable"]
 
-            # AC-06: list yields CheckpointTuple records ordered reverse-chronologically by step
+            # AC-06, AC-175, ADR-0026: list yields CheckpointTuple records ordered reverse-chronologically by checkpoint_id
             history = list(saver.list(run_config))
             assert (
                 len(history) >= 4
             )  # __start__, enrich (step 1), process (step 2), format (step 3)
+
+            history_cids = [h.checkpoint["id"] for h in history]
+            assert history_cids == sorted(history_cids, reverse=True)
 
             steps: list[Any] = [h.metadata.get("step") for h in history if "step" in h.metadata]
             assert steps == sorted(steps, reverse=True)
