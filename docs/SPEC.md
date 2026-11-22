@@ -17,7 +17,7 @@ RelateGraphSaver is an open-source, embedded, graph-native checkpoint and time-t
 
 ### 1.2 Posture
 - Posture: Production
-- Standard: High reliability, crash safety, strict thread safety, and zero data corruption on abnormal process termination.
+- Standard: High reliability, crash safety, strict thread safety, zero data corruption on abnormal process termination, and deterministic time-ordered UUIDv6 checkpoint lineage.
 
 ### 1.3 Target Persona
 AI Agent Engineers building, debugging, and observing autonomous workflows in LangGraph who require durable, crash-safe execution persistence and rapid time-travel debugging without database server infrastructure.
@@ -33,6 +33,7 @@ The product capabilities were delivered in these stages:
 - **Milestone 4:** Judge Readiness (clean-install CLI fix, lint and type-check baseline, README Relate rationale and limits, `:ToolCall` capture from real runs, async checkpointer methods, SQLite comparison benchmark).
 - **Judge Impact:** tree status fix, graph re-execution replay with a run diff, argument provenance, cross-thread tool failures, a key-free real-API demo thread, README and metadata corrections (updated 2026-11-18).
 - **Replay and forensics hardening (AC-161..AC-172):** CLI markup escaping, import type-annotation robustness, indirect tool-call root-cause parity, fan-out origin nodes, path spec validation, update-state hint scoping, console width restoration, and typed replay channel comparison (updated 2026-11-21).
+- **Write-path and read-side correctness (AC-173..AC-188):** write-path namespace normalization, parent-id extraction, UUIDv6 checkpoint ordering, proxy cancellation, custom serializer wrapping, first-write-wins channel semantics, root-to-leaf loop detection, non-recursive tree rendering, and read-only diagnostics defaults (updated 2026-11-22).
 
 ### 2.1 Milestone 1: MVP Vertical Slice
 
@@ -217,6 +218,28 @@ Starts from Journeys 8, 9, 19, and 22.
 5. The developer replays a graph that triggers `InvalidUpdateError` during graph execution; the CLI prints the failure error without the misleading `--as-node` update hint.
 6. The CLI displays wide tables via `_print_wide`; after printing, the terminal width setting is restored, preserving standard rendering for subsequent outputs.
 
+### 2.7 Write-Path and Read-Side Correctness
+
+These journeys define behavioral correctness on write operations, thread proxy execution, DAG traversal lineage, loop detection sequencing, and diagnostics defaults.
+
+#### Journey 27: Strict Write-Path Correctness and Concurrency Handling
+Starts from Journeys 1, 2, and 5.
+1. The developer compiles and executes a workflow with or without explicit subgraphs. When `get_tuple()` is invoked without a `checkpoint_ns`, it defaults to `""` matching SqliteSaver semantics, while `list()` returns checkpoints across all namespaces when no namespace filter is provided.
+2. During state checkpointing, `put()` resolves parent checkpoint linkage strictly from `config["configurable"]["checkpoint_id"]`, ignoring any caller-supplied `metadata["parents"]`.
+3. Checkpoint ordering for latest tuple retrieval and pagination (`before`) orders strictly by time-ordered UUIDv6 `checkpoint_id` descending, independent of step numbering.
+4. If connection loss or concurrency conflicts occur during reads, `get_tuple()` and `list()` re-raise `RelateConnectionError` and `RelateConcurrencyError` rather than returning empty results or swallowing failures.
+5. The developer configures the saver with custom serialization or environment variables; any plain `SerializerProtocol` is automatically wrapped into `RelateStateSerializer`, and configuration values resolve through explicit argument -> `RELATE_*` environment variable -> default (`:memory:`), raising descriptive `ValueError` naming any invalid variable.
+6. When client timeouts occur on thread proxy requests, pending futures are cancelled, and the worker thread drops cancelled commands without executing or committing them. For pending channel writes, regular channels apply first-write-wins (`ON CREATE SET`), while index map channels overwrite, maintaining deterministic ordering by `task_id` and `idx`.
+
+#### Journey 28: Forensic Lineage, Loop Detection, and Tree Diagnostics
+Starts from Journeys 8, 9, and 21.
+1. The developer inspects execution lineage across thread branches; traversals follow `[:NEXT|FORKED_TO*0..]` strictly restricted to the specified `thread_id`.
+2. The developer runs loop detection via `detect_loops()`; sequences are constructed by walking `NEXT` relationships from root to leaf per namespace rather than sorting across steps, and thresholds below 2 are rejected with `ValueError`.
+3. The developer runs `trace_root_cause()`; poison analysis inspects channel names without false-positive matching against serialized string values, and antecedent tool-call errors on the `__error__` path are attributed as root cause only when within `distance_to_error <= 1`.
+4. The developer inspects execution history via `relate-dag tree` or `DAGVisualizer`; linear `NEXT` sequences render as siblings at equal indentation iteratively without recursion, while branches (`FORKED_TO`) nest hierarchically.
+5. Replay boundaries determine recorded leaf nodes by halting prior to subsequent input steps where metadata `source == "input"`.
+6. `RelateForensics` and `DAGVisualizer` instances default to `read_only=True` on open, preserving file immutability during analysis.
+
 ---
 
 ## 3. Acceptance Criteria
@@ -227,7 +250,7 @@ AC-02: Given an initialized RelateSaver, When put() is invoked with a valid conf
 AC-03: Given an existing thread execution with multiple checkpoints, When get_tuple() is called with a thread_id, Then it returns the latest CheckpointTuple with matching checkpoint, metadata, and parent_config.
 AC-04: Given an existing thread execution with multiple checkpoints, When get_tuple() is called with a specific checkpoint_id in config, Then it returns the exact CheckpointTuple matching that checkpoint_id.
 AC-05: Given a non-existent thread_id or checkpoint_id, When get_tuple() is invoked, Then it returns None without raising an exception.
-AC-06: Given an execution with multiple checkpoints, When list() is called with a thread_id, Then it yields CheckpointTuple records ordered reverse-chronologically by checkpoint step.
+AC-06: Given an execution with multiple checkpoints, When list() or latest get_tuple() is called with a thread_id, Then checkpoints are ordered reverse-chronologically by checkpoint_id (uuid6), superseding step order.
 AC-07: Given an execution with multiple checkpoints, When list() is called with before and limit parameters, Then it yields at most limit CheckpointTuple records created before the specified checkpoint_id.
 AC-08: Given multiple OS threads concurrently invoking put() on the same RelateSaver instance, When transactions execute, Then RelateThreadProxy serializes all write operations without raising database thread-affinity or lock contention exceptions.
 AC-09: Given concurrent reads and writes across worker threads, When get_tuple() executes while writes are queued, Then reads return consistent committed checkpoint states without dirty reads or partial writes.
@@ -460,7 +483,26 @@ AC-170: Given langgraph_checkpoint_relate is imported, When a caller uses GraphF
 AC-171: Given a checkpoint linked to a successful tool call by (:Checkpoint)-[:INVOKED]-> and to a failing tool call through (:Write)-[:INVOKED]->, When trace_root_cause runs, Then root_tool_call_id and root_tool_name both name the failing call.
 AC-172: Given a fan-out step where only some nodes wrote the failing tool argument, When failure_summary() or trace_argument_origin() runs, Then origin nodes list only the nodes whose writes contain the argument; and Given update_state rejects a replay update, When the InvalidUpdateError propagates, Then it carries no added exception note and is_update_state_error still returns True.
 
-### 3.8 Regression Criteria
+### 3.8 Write-Path and Read-Side Correctness
+
+AC-173: Given a config without checkpoint_ns, When get_tuple() is called, Then checkpoint_ns defaults to "" (matching SqliteSaver behavior); and When list() is called without checkpoint_ns, Then results remain unfiltered by namespace.
+AC-174: Given a checkpoint configuration and metadata containing parents, When put() is called, Then the parent checkpoint ID is resolved strictly from config["configurable"]["checkpoint_id"] and any metadata["parents"] field is ignored.
+AC-175: Given checkpoints stored in a thread, When get_tuple() resolves the latest checkpoint or list() queries with a before filter, Then ordering and filtering use checkpoint_id (ORDER BY c.checkpoint_id DESC and c.checkpoint_id < $before).
+AC-176: Given an underlying RelateConnectionError or RelateConcurrencyError during execution, When get_tuple() or list() is invoked, Then the error is re-raised rather than returning None or an empty collection.
+AC-177: Given a custom serializer implementing SerializerProtocol passed to RelateSaver, When initialized, Then it is automatically wrapped in RelateStateSerializer(inner_serializer=serde).
+AC-178: Given RelateSaver initialization, When configuration parameters are resolved, Then resolution priority is explicit constructor argument, then RELATE_* environment variable (RELATE_DB_PATH, RELATE_WAL_ENABLED, RELATE_PROXY_TIMEOUT_SEC, RELATE_LOG_LEVEL), then defaults (db_path=":memory:", wal enabled=True, timeout=30.0, log_level=INFO); and When an environment variable contains an invalid value, Then ValueError is raised naming the offending variable.
+AC-179: Given a RelateThreadProxy command awaiting execution, When a caller timeout expires, Then the future is cancelled and the worker thread skips the cancelled command without executing or committing it.
+AC-180: Given concurrent or multiple writes to channel state, When put_writes() executes, Then non-special channels use first-write-wins semantics via ON CREATE SET, WRITES_IDX_MAP channels overwrite, and write records are retrieved ordered by w.task_id, w.idx.
+AC-181: Given an execution DAG containing branches and checkpoint relationships, When lineage walks traverse the graph in forensics, Then queries traverse [:NEXT|FORKED_TO*0..] restricted strictly to checkpoints within the same thread_id.
+AC-182: Given an execution history with multiple checkpoints and namespaces, When detect_loops() is invoked, Then sequences are constructed by walking NEXT relationships from root to leaf per namespace rather than sorting across steps.
+AC-183: Given channel state inspected for poison pills during forensics, When root-cause analysis runs, Then poison checks match exclusively against the channel name, and substring matches for 'poison' and 'fault' within serialized value text are not performed.
+AC-184: Given an execution terminating in an error along an __error__ path, When trace_root_cause() analyzes antecedent tool calls, Then a tool-call error is accepted as root cause only when distance_to_error <= 1.
+AC-185: Given an execution DAG with linear checkpoints and branches, When relate-dag tree or DAGVisualizer renders the graph, Then NEXT children render as siblings at the same depth built iteratively without recursion, and only FORKED_TO relationships nest child branches.
+AC-186: Given recorded execution checkpoints spanning multiple invoke runs, When replay determines the recorded leaf via _recorded_leaf, Then traversal halts before the next checkpoint whose metadata source is "input".
+AC-187: Given a store path opened for diagnostics, When RelateForensics or DAGVisualizer is instantiated without an explicit read_only argument, Then read_only defaults to True.
+AC-188: Given loop detection configuration, When detect_loops() is invoked with threshold < 2, Then ValueError is raised.
+
+### 3.9 Regression Criteria
 
 RC-01: Given a thread with branches, When `relate-dag tree` is run, Then branch points still show `Branch: [BRANCH]` and an unknown thread still exits non-zero with a not-found error (AC-23, AC-24).
 RC-02: Given `relate-dag replay` without `--graph`, When the checkpoint id is empty or unknown, Then it still exits with code 1 and prints `checkpoint_id must be a non-empty string` or `Available checkpoints:` respectively.
@@ -473,6 +515,10 @@ RC-08: Given `examples/tool_agent.py` and `examples/research_agent.py`, When run
 RC-09: Given the package, When every previously public name in `langgraph_checkpoint_relate` is imported, Then each import succeeds.
 RC-10: Given `README.md` and `pyproject.toml`, When the strings asserted before this change are checked (for example "How we use Relate, and why", `Mode: single file`, "Use case", `RelateSaver`, `fork_in_memory`, `pip install`, the three `relate-dag` commands, and the URL keys `Homepage`, `Repository`, `Issues`), Then all are still present.
 RC-11: Given no network access, When `pytest -m "not slow"` is run, Then it passes.
+RC-12: Given an existing execution with subgraphs, When get_tuple() is called with an explicit checkpoint_ns, Then it returns checkpoints matching that specific namespace (AC-18).
+RC-13: Given an existing execution history, When put() is called with standard config, Then new checkpoints are created and linked to parent checkpoints as before (AC-02).
+RC-14: Given relate-dag tree on normal DAG structures, When executed, Then it renders valid step numbers, checkpoint IDs, and node names (AC-22).
+RC-15: Given standard serialization without a custom serializer, When put() and get_tuple() run, Then LangGraph state channels are saved and restored with type fidelity (AC-13).
 
 ---
 
@@ -510,6 +556,11 @@ Code-review fixes non-goals:
 24. **LangGraph async message-id note:** documenting or altering LangGraph async message ID handling is out of scope.
 25. **Store rebuild or README updates:** rebuilding `examples/data/demo.rl` or updating benchmark figures and README copy is out of scope.
 26. **Dependency or `pyproject.toml` changes:** adding or modifying runtime or package dependencies is out of scope.
+
+Write-path and read-side correctness non-goals:
+
+27. **Substring error-text matching for poison channels:** matching arbitrary serialized value text for substrings "poison" or "fault" is removed in favor of explicit channel name matching.
+28. **Multi-process proxy synchronization:** RelateThreadProxy continues to manage single-process concurrency.
 
 ---
 
@@ -598,3 +649,11 @@ Code-review fixes non-goals:
 20. **Code-review fixes: Graph spec error hierarchy:**
     - *Question:* Does `GraphSpecError` inherit from `ValueError` to preserve existing exception handling?
     - *Assumption:* Yes, `GraphSpecError` remains a `ValueError` subclass per ADR-0022 and AC-97/AC-155.
+
+21. **Write-path and read-side correctness: detect_loops minimum threshold:**
+    - *Question:* Should threshold values below 2 be clamped or rejected?
+    - *Assumption:* Rejected with `ValueError` (AC-188), as cycle detection requires at least 2 occurrences to define a repetitive sequence.
+
+22. **Write-path and read-side correctness: Checkpoint ordering in non-UUIDv6 tests:**
+    - *Question:* Do legacy or synthetic tests using manual string checkpoint IDs work with UUIDv6 ordering?
+    - *Assumption:* Synthetic test IDs must sort chronologically in ASCII string comparison to conform to `c.checkpoint_id DESC` ordering (AC-175).

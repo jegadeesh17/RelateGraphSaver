@@ -37,6 +37,10 @@ Reference documents:
 | [ADR-0023](#adr-0023-replay-diff-compares-full-message-content) | Replay Diff Compares Full Message Content | Accepted | 2026-11-20 |
 | [ADR-0024](#adr-0024-replay-diff-compares-channel-values-not-repr) | Replay Diff Compares Channel Values, Not Repr | Accepted | 2026-11-20 |
 | [ADR-0025](#adr-0025-typed-channel-keys-write-level-origin-nodes-and-an-attribute-tag-for-update_state-errors) | Typed Channel Keys, Write-Level Origin Nodes and an Attribute Tag for update_state Errors | Accepted | 2026-11-21 |
+| [ADR-0026](#adr-0026-latest-and-before-follow-checkpoint_id-order) | Latest and `before` Follow `checkpoint_id` Order | Accepted | 2026-11-22 |
+| [ADR-0027](#adr-0027-flat-tree-layout-with-fork-indentation) | Flat Tree Layout with Fork Indentation | Accepted | 2026-11-22 |
+| [ADR-0028](#adr-0028-relate_-environment-variable-configuration) | `RELATE_*` Environment Variable Configuration | Accepted | 2026-11-22 |
+| [ADR-0029](#adr-0029-forensics-lineage-namespace-loop-detection-and-root-cause-priority) | Forensics Lineage, Namespace Loop Detection, and Root-Cause Priority | Accepted | 2026-11-22 |
 
 ---
 
@@ -238,7 +242,8 @@ Each async method runs its synchronous counterpart with `asyncio.to_thread`, so 
 ## ADR-0007: Static Quality Gates Pass Through Configuration and Behavior-Neutral Fixes
 
 Date: 2026-11-17  
-Status: Accepted
+Status: Accepted  
+Amended by: [ADR-0026](#adr-0026-latest-and-before-follow-checkpoint_id-order)
 
 ### Context
 
@@ -882,3 +887,142 @@ This amends ADR-0018 and ADR-0024:
 - **Positive:** Argument provenance narrows down to the specific node that wrote the argument in concurrent fan-out steps (AC-172).
 - **Positive:** `InvalidUpdateError` carries no added note in tracebacks while preserving CLI hint detection (AC-172).
 - **Negative:** `_channel_key` produces slightly larger tuples in memory during replay diffing.
+
+---
+
+## ADR-0026: Latest and `before` Follow `checkpoint_id` Order
+
+Date: 2026-11-22  
+Status: Accepted  
+Supersedes: Step-based ordering in [ADR-0007](#adr-0007-static-quality-gates-pass-through-configuration-and-behavior-neutral-fixes) and AC-06
+
+### Context
+
+`RelateSaver.get_tuple` (when retrieving the latest checkpoint for a thread without an explicit `checkpoint_id`) and `RelateSaver.list` (and pagination with `before`) originally sorted checkpoints by integer step number descending (`ORDER BY c.step DESC`).
+
+LangGraph's reference checkpointer implementation (`SqliteSaver`) and the LangGraph runtime assume that checkpoint sorting and reverse-chronological listing use time-ordered UUIDv6 `checkpoint_id` strings (`ORDER BY c.checkpoint_id DESC`, `c.checkpoint_id < $before`). When workflows branch or when `update_state` is invoked on an earlier historical checkpoint, the forked state writes a new checkpoint that may share or have a lower `step` number than existing checkpoints on the main branch. Ordering by `step` causes `get_tuple()` to return a stale checkpoint from a different branch rather than the latest write, and causes `before` pagination to skip or mishandle forked checkpoints.
+
+### Decision
+
+We update checkpoint sorting and filtering across `saver.py` (`get_tuple`, `list`, and `before` filter) to order strictly by `c.checkpoint_id DESC` and filter with `c.checkpoint_id < $before`.
+
+Checkpoint IDs emitted by LangGraph use UUIDv6 (`id.uuid6()`), which embeds a 60-bit timestamp in big-endian byte order, guaranteeing that lexicographical string comparison sorts in chronological creation order. This supersedes the previous step-based ordering in AC-06. Synthetic or hand-crafted checkpoint IDs in test suites that do not use UUIDv6 must sort chronologically in ASCII string order.
+
+### Alternatives considered
+
+1. **Composite ordering by `(step DESC, created_at DESC)`:** Rejected; `step` numbers diverge or collide across branches and forks, and ISO-8601 string timestamps can collide during high-frequency execution in tight loops.
+2. **Retain step-based ordering with branch tracking:** Rejected; diverges from standard LangGraph `SqliteSaver` semantics and adds unnecessary query complexity when UUIDv6 already provides native chronological ordering.
+3. **Cypher graph traversal following `NEXT` backwards:** Rejected; cannot resolve unlinked forks or disjoint branch heads without traversing multiple paths.
+
+### Consequences
+
+- **Positive:** Full parity with LangGraph runtime expectations and `SqliteSaver` semantics (AC-06, AC-175).
+- **Positive:** Correctly resolves latest checkpoints and pagination for `update_state` forks and branching workflows.
+- **Negative:** Hand-crafted synthetic test IDs in legacy unit tests must sort chronologically in ASCII order.
+
+---
+
+## ADR-0027: Flat Tree Layout with Fork Indentation
+
+Date: 2026-11-22  
+Status: Accepted
+
+### Context
+
+`DAGVisualizer.render_tree` and `relate-dag tree` originally traversed execution DAGs using recursive depth-first tree traversal, rendering each subsequent `[:NEXT]` child checkpoint at an increased indentation level.
+
+In long-running agent workflows or benchmarking runs exceeding 1,000 to 1,500 checkpoints, recursive rendering encounters Python's default call stack recursion limit (`sys.getrecursionlimit()`), raising `RecursionError` and preventing trace visualization. Furthermore, linear execution steps connected by `[:NEXT]` do not represent hierarchical parent-child relationships; indenting each step produces severe rightward terminal drift and broken line wraps. Only branch points—specifically `[:FORKED_TO]` edges created during time travel or branching—represent true conceptual sub-trees.
+
+### Decision
+
+We re-architect `DAGVisualizer` to use an iterative sibling rendering layout:
+1. Linear `[:NEXT]` children are rendered sequentially as siblings at the same depth and indentation level, constructed iteratively with explicit loops and no call-stack recursion.
+2. Only `[:FORKED_TO]` relationships nest child branches into indented sub-trees.
+3. README sample outputs and visualizer expectations (`tests/unit/test_readme.py`) are updated to reflect the flat, non-drifting tree layout.
+
+### Alternatives considered
+
+1. **Increase recursion limit via `sys.setrecursionlimit(10000)`:** Rejected; fragile workaround that risks hard segmentation faults / stack overflows in the C runtime and fails to resolve terminal line-wrapping from rightward drift.
+2. **Paginate or truncate tree output at N steps:** Rejected; developers inspecting agent traces require full lineage visibility without arbitrary truncation.
+3. **Graphviz or Mermaid export only:** Rejected; the terminal-native tree CLI (`relate-dag tree`) is a core feature for instant local developer inspection.
+
+### Consequences
+
+- **Positive:** Eliminates recursion limits, allowing `relate-dag tree` to render 1,500+ checkpoint runs without `RecursionError` (AC-185).
+- **Positive:** Terminal output remains readable and clean without rightward drift for linear step sequences.
+- **Negative:** Visualizer tests and README example outputs must match the updated sibling layout format.
+
+---
+
+## ADR-0028: `RELATE_*` Environment Variable Configuration
+
+Date: 2026-11-22  
+Status: Accepted
+
+### Context
+
+Configuration values for `RelateSaver` (such as the database path, WAL flush behavior, proxy timeout, and log level) were previously documented inconsistently (e.g., `"checkpoints.rl"` was mentioned as the default path in some documentation while code used `":memory:"`). In 12-factor application architectures, serverless workflows, and CLI environments, configuring checkpointer settings via standardized environment variables is essential.
+
+Additionally, configuration priority must be explicit: constructor arguments must always take precedence over environment variables, and environment variables must take precedence over defaults. When an invalid environment variable value is supplied, silently falling back to a default can mask critical configuration defects.
+
+### Decision
+
+We define a strict three-tier configuration resolution order:
+1. **Explicit constructor argument:** Used whenever provided (not `None` or sentinel).
+2. **`RELATE_*` environment variable:**
+   - `RELATE_DB_PATH` (str): target database file path or `":memory:"`.
+   - `RELATE_WAL_ENABLED` (bool): parsed from `"1"`, `"true"`, `"yes"`, `"on"` / `"0"`, `"false"`, `"no"`, `"off"` (case-insensitive).
+   - `RELATE_PROXY_TIMEOUT_SEC` (float): positive float numeric string.
+   - `RELATE_LOG_LEVEL` (str): `"DEBUG"`, `"INFO"`, `"WARNING"`, `"ERROR"`, `"CRITICAL"`.
+3. **Default value:** `db_path=":memory:"`, `wal_enabled=True`, `default_timeout=30.0`, `log_level="INFO"`.
+
+If an environment variable contains an unparseable or invalid value, initialization raises `ValueError` explicitly naming the offending variable (e.g. `ValueError("Invalid value for RELATE_PROXY_TIMEOUT_SEC: ...")`). All documentation and signatures are corrected to declare `":memory:"` as the default `db_path`.
+
+### Alternatives considered
+
+1. **Default `db_path` to `"checkpoints.rl"`:** Rejected; writing files to disk by default causes unexpected disk side-effects during testing and ephemeral runs; `":memory:"` is safe and zero-side-effect by default.
+2. **Silent fallback on invalid environment variables:** Rejected; masking configuration errors leads to silent misbehavior in production (e.g., disabling WAL or misconfiguring timeouts).
+3. **Adopting `pydantic-settings`:** Rejected; adds an unnecessary heavyweight external runtime dependency for four environment variables.
+
+### Consequences
+
+- **Positive:** Deterministic configuration resolution with transparent priority (AC-178).
+- **Positive:** Fast, clear failure when environment variables contain typos or invalid values.
+- **Positive:** Code and documentation agree that `":memory:"` is the default database path.
+
+---
+
+## ADR-0029: Forensics Lineage, Namespace Loop Detection, and Root-Cause Priority
+
+Date: 2026-11-22  
+Status: Accepted
+
+### Context
+
+Forensic analysis in `RelateForensics` (`trace_root_cause`, `detect_loops`, and argument provenance) presented subtle edge cases in complex multi-agent graphs:
+1. Lineage traversals across checkpoints could bleed into sibling threads or cross-thread forks when relationship patterns were unconstrained by thread identity.
+2. `detect_loops` constructed checkpoint sequences by sorting all thread checkpoints by `step` across all namespaces, interleaving subgraph steps and obscuring the actual chronological path.
+3. Poison pill detection in `trace_root_cause` inspected serialized state payloads for substring matches of `"poison"` and `"fault"`. Legitimate user messages or prompts containing these words were falsely flagged as poisoned state failures.
+4. On the `__error__` path (when a graph step writes an error to the `__error__` channel), antecedent tool calls far back in history could be blamed as root cause even when the failure was completely unrelated to the tool.
+
+### Decision
+
+We establish five forensic traversal and attribution rules:
+1. **Thread-constrained lineage traversal:** Lineage walks follow `[:NEXT|FORKED_TO*0..]` strictly restricted to checkpoints within the specified `thread_id` (AC-181).
+2. **Namespace-isolated root-to-leaf loop detection:** `detect_loops` constructs execution sequences by walking `[:NEXT]` edges from root to leaf separately per `checkpoint_ns`, sorting candidate node names and preserving true path order. A `threshold < 2` raises `ValueError` (AC-182, AC-188).
+3. **Channel-name only poison detection:** Poison analysis matches exclusively against the channel name (e.g., channel named `poison`); substring matching for `"poison"` or `"fault"` within serialized value text is removed (AC-183).
+4. **Root-cause priority on `__error__` path:** When execution terminates along an `__error__` path, an antecedent tool-call error is accepted as root cause only when `distance_to_error <= 1`. Causal queries break ties with `ORDER BY distance_to_error, c.checkpoint_id, tool_call_id`, and tree writes order by `w.task_id, w.idx`.
+5. **Read-only by default:** `RelateForensics` and `DAGVisualizer` open database stores with `read_only=True` by default (AC-187).
+
+### Alternatives considered
+
+1. **Global step sorting for cycle detection:** Rejected; subgraph and concurrent fan-out executions interleave step indices, producing spurious cycle warnings or missing repeating loops.
+2. **Retain regex heuristics on serialized state text:** Rejected; parsing serialized binary blobs for English words causes false-positive failure diagnoses on benign user payloads.
+3. **Unbounded tool error attribution:** Rejected; attributing a crash to a tool that failed 10 steps earlier obscures the immediate error cause on the `__error__` path.
+
+### Consequences
+
+- **Positive:** Accurate loop and cycle detection across nested subgraphs and branched threads.
+- **Positive:** Eliminates false-positive poison reports on legitimate conversational content.
+- **Positive:** Deterministic, localized root-cause attribution prioritizing proximate tool failures (`distance_to_error <= 1`).
+- **Positive:** Diagnostic tools preserve database file immutability by defaulting to `read_only=True`.
