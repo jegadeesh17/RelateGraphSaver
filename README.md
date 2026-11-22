@@ -267,7 +267,7 @@ python examples/build_demo_store.py
 
 A rebuild writes new checkpoint ids, so the replay checkpoint id and the sample output shown in [Explore the demo store](#explore-the-demo-store) will change. After a rebuild, take the step 0 id of `demo-tool-fail` from the output of the `tree` command.
 
-The demo agents write to `checkpoints.rl` (`examples/research_agent.py`) or `tool_agent.rl` (`examples/tool_agent.py`) unless you pass `--db`; those files are not committed. Only `examples/data/demo.rl` is.
+The demo agents write to `checkpoints.rl` (`examples/research_agent.py`) or `tool_agent.rl` (`examples/tool_agent.py`) unless you pass `--db`; those files are not committed. Only `examples/data/demo.rl` and `examples/data/demo-llm.rl` are committed.
 
 ## Benchmark
 
@@ -333,6 +333,7 @@ RelateGraphSaver/
 │       ├── forensics.py        # RelateForensics (loop detection & root cause)
 │       ├── models.py           # DTO dataclasses (WriteNode, Forensic reports)
 │       ├── proxy.py            # RelateThreadProxy actor queue
+│       ├── replay.py           # Replay of a stored run through your graph in a sandbox
 │       ├── saver.py            # RelateSaver implementing BaseCheckpointSaver
 │       ├── schema.py           # Cypher DDL schema constraints and indexes
 │       ├── serde.py            # Typed state serialization and hashing
@@ -348,9 +349,11 @@ RelateGraphSaver/
 │   └── bench_checkpointers.py  # RelateSaver vs SqliteSaver benchmark
 ├── examples/
 │   ├── data/
+│   │   ├── demo-llm.rl         # Separate recorded run of a real LLM agent
 │   │   └── demo.rl             # Committed demo Relate store with four threads
-│   ├── build_demo_store.py     # Rebuilds the committed demo store offline
+│   ├── build_demo_store.py     # Rebuilds the committed demo store (needs network access)
 │   ├── dependency_agent.py     # Key-free dependency audit that calls the real PyPI API
+│   ├── openrouter_agent.py     # Optional real LLM agent run through OpenRouter
 │   ├── research_agent.py       # Multi-agent research pipeline demo
 │   └── tool_agent.py           # Key-free tool-calling demo with a failing tool
 ├── docs/                       # Living architectural documentation
