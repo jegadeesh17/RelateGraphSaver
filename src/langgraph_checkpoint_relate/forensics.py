@@ -6,6 +6,7 @@ path traversals from failure nodes to offending antecedent writes or tool calls.
 
 from __future__ import annotations
 
+import gc
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -142,6 +143,16 @@ def _holds_tool_message(value: Any, tool_call_id: str) -> bool:
     return False
 
 
+_TOOL_KEYS = {
+    "direct_call_id",
+    "direct_error",
+    "direct_tool_name",
+    "linked_call_id",
+    "linked_error",
+    "linked_tool_name",
+}
+
+
 def _expand_causal_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Expand rows with direct and/or write-linked tool calls into separate causal rows.
 
@@ -150,13 +161,18 @@ def _expand_causal_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     out: list[dict[str, Any]] = []
     for row in rows:
-        base = {
-            k: v
-            for k, v in row.items()
-            if not k.startswith("direct_") and not k.startswith("linked_")
-        }
         has_direct = row.get("direct_call_id") is not None
         has_linked = row.get("linked_call_id") is not None
+
+        if not has_direct and not has_linked:
+            n_row = {k: v for k, v in row.items() if k not in _TOOL_KEYS}
+            n_row["tool_call_id"] = None
+            n_row["tool_error"] = None
+            n_row["tool_name"] = None
+            out.append(n_row)
+            continue
+
+        base = {k: v for k, v in row.items() if k not in _TOOL_KEYS}
 
         if has_direct:
             d_row = dict(base)
@@ -171,13 +187,6 @@ def _expand_causal_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             l_row["tool_error"] = row.get("linked_error")
             l_row["tool_name"] = row.get("linked_tool_name")
             out.append(l_row)
-
-        if not has_direct and not has_linked:
-            n_row = dict(base)
-            n_row["tool_call_id"] = None
-            n_row["tool_error"] = None
-            n_row["tool_name"] = None
-            out.append(n_row)
 
     return out
 
@@ -469,8 +478,9 @@ class RelateForensics:
             return None
 
         rows = self._saver.proxy.execute_read(
-            "MATCH path = (err:Checkpoint {checkpoint_id: $id})<-[:NEXT*0..]-"
+            "MATCH path = (err:Checkpoint {checkpoint_id: $id})<-[:NEXT|FORKED_TO*0..]-"
             "(a:Checkpoint {thread_id: $thread_id})-[:HAS_WRITE]->(w:Write) "
+            "WHERE ALL(n IN nodes(path) WHERE n.thread_id = $thread_id) "
             "RETURN a.checkpoint_id AS checkpoint_id, a.step AS step, length(path) AS hops, "
             "       w.channel AS channel, w.idx AS idx, w.write_blob AS write_blob, "
             "       w.task_path AS task_path",
@@ -557,8 +567,9 @@ class RelateForensics:
     ) -> str:
         """Return the first checkpoint at or after the error whose writes hold the tool's result."""
         rows = self._saver.proxy.execute_read(
-            "MATCH path = (err:Checkpoint {checkpoint_id: $id})-[:NEXT*0..]->"
+            "MATCH path = (err:Checkpoint {checkpoint_id: $id})-[:NEXT|FORKED_TO*0..]->"
             "(c:Checkpoint {thread_id: $thread_id})-[:HAS_WRITE]->(w:Write) "
+            "WHERE ALL(n IN nodes(path) WHERE n.thread_id = $thread_id) "
             "RETURN c.checkpoint_id AS checkpoint_id, length(path) AS distance, "
             "       w.channel AS channel, w.write_blob AS write_blob",
             {"id": error_checkpoint_id, "thread_id": thread_id},
@@ -709,6 +720,19 @@ class RelateForensics:
         if not isinstance(thread_id, str) or not thread_id.strip():
             raise CheckpointNotFoundError("thread_id must be a non-empty string.")
 
+        gc_was_enabled = gc.isenabled()
+        if gc_was_enabled:
+            gc.disable()
+        try:
+            return self._trace_root_cause_impl(thread_id)
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+
+    def _trace_root_cause_impl(
+        self,
+        thread_id: str,
+    ) -> RootCauseReport:
         # Verify thread exists
         check_query = (
             "MATCH (c:Checkpoint {thread_id: $thread_id}) "
@@ -852,12 +876,13 @@ class RelateForensics:
         if not error_message:
             error_message = f"Execution error at checkpoint {error_checkpoint_id}"
 
-        # 4. Backward causal path traversal across [:NEXT], [:HAS_WRITE], [:INVOKED].
+        # 4. Backward causal path traversal across [:NEXT|FORKED_TO], [:HAS_WRITE], [:INVOKED].
         # The variable-length pattern starts from the uniquely identified error checkpoint
-        # and walks NEXT edges backwards; the reverse direction (antecedent first) makes
-        # the engine expand from every checkpoint in the database.
+        # and walks NEXT and FORKED_TO edges backwards within the same thread; the reverse direction
+        # (antecedent first) makes the engine expand from every checkpoint in the database.
         causal_query = (
-            "MATCH path = (err:Checkpoint {checkpoint_id: $error_checkpoint_id})<-[:NEXT*0..]-(antecedent:Checkpoint {thread_id: $thread_id}) "
+            "MATCH path = (err:Checkpoint {checkpoint_id: $error_checkpoint_id})<-[:NEXT|FORKED_TO*0..]-(antecedent:Checkpoint {thread_id: $thread_id}) "
+            "WHERE ALL(n IN nodes(path) WHERE n.thread_id = $thread_id) "
             "OPTIONAL MATCH (antecedent)-[:HAS_WRITE]->(w:Write) "
             "OPTIONAL MATCH (antecedent)-[:INVOKED]->(tc1:ToolCall) "
             "OPTIONAL MATCH (w)-[:INVOKED]->(tc2:ToolCall) "

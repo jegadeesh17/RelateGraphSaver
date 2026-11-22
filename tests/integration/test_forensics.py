@@ -1011,3 +1011,203 @@ class TestFailureSummary:
 
         assert len(summary) == 1
         assert summary[0].origin_nodes == ("<unknown>",)
+
+    def test_ac181_in_thread_fork_traverses_forked_to_for_root_cause_and_argument_origin(
+        self, temp_disk_db: str
+    ) -> None:
+        """AC-181: Lineage walk traverses across in-thread FORKED_TO edges."""
+        thread_id = "thread-ac181-fork"
+        with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
+            # Step 0: Root checkpoint with tool call and argument write
+            cid_root = "cp-ac181-root"
+            cfg_root: RunnableConfig = {
+                "configurable": {"thread_id": thread_id, "checkpoint_id": cid_root}
+            }
+            cp_root: Any = dict(empty_checkpoint())
+            cp_root["id"] = cid_root
+            saver.put(cfg_root, cp_root, {"step": 0}, {})
+            saver.put_writes(cfg_root, [("target", "val-forked-secret")], task_id="task-root")
+
+            saver.proxy.execute_write(
+                "CREATE (tc:ToolCall {call_id: $call_id, tool_name: $name, args_blob: $args, "
+                "error: $err, created_at: $created_at}) "
+                "WITH tc "
+                "MATCH (c:Checkpoint {checkpoint_id: $cid}) "
+                "MERGE (c)-[:INVOKED]->(tc)",
+                {
+                    "call_id": "call-root-fail-181",
+                    "name": "root_api",
+                    "args": b'{"target": "val-forked-secret"}',
+                    "err": "Connection reset by peer",
+                    "created_at": "2026-11-22T00:00:00Z",
+                    "cid": cid_root,
+                },
+            )
+
+            # Step 1: Linear child cp_main (via NEXT)
+            cid_main = "cp-ac181-main"
+            cfg_main: RunnableConfig = {
+                "configurable": {"thread_id": thread_id, "checkpoint_id": cid_main}
+            }
+            cp_main: Any = dict(empty_checkpoint())
+            cp_main["id"] = cid_main
+            cp_main["parent_checkpoint_id"] = cid_root
+            saver.put(cfg_main, cp_main, {"step": 1}, {})
+
+            # Step 1: Fork child cp_fork from root (via FORKED_TO in same thread)
+            cid_fork = "cp-ac181-fork"
+            cfg_fork: RunnableConfig = {
+                "configurable": {"thread_id": thread_id, "checkpoint_id": cid_fork}
+            }
+            cp_fork: Any = dict(empty_checkpoint())
+            cp_fork["id"] = cid_fork
+            cp_fork["parent_checkpoint_id"] = cid_root
+            saver.put(cfg_fork, cp_fork, {"step": 1}, {})
+
+            # Write tool response holding ToolMessage at cp_fork
+            tool_msg = ToolMessage(
+                content="failed result", tool_call_id="call-root-fail-181", status="error"
+            )
+            saver.put_writes(cfg_fork, [("messages", [tool_msg])], task_id="task-tool-res")
+
+            # Step 2: Child cp_sub in the fork branch (via NEXT from cp_fork)
+            cid_sub = "cp-ac181-sub"
+            cfg_sub: RunnableConfig = {
+                "configurable": {"thread_id": thread_id, "checkpoint_id": cid_sub}
+            }
+            cp_sub: Any = dict(empty_checkpoint())
+            cp_sub["id"] = cid_sub
+            cp_sub["parent_checkpoint_id"] = cid_fork
+            saver.put(cfg_sub, cp_sub, {"step": 2}, {})
+            saver.put_writes(
+                cfg_sub, [("__error__", "Error downstream in branch")], task_id="task-err"
+            )
+
+            # Verify FORKED_TO exists between root and fork checkpoint
+            fork_rels = saver.proxy.execute_read(
+                "MATCH (p:Checkpoint {checkpoint_id: $p_id})-[r:FORKED_TO]->(c:Checkpoint {checkpoint_id: $c_id}) "
+                "RETURN count(r) AS count",
+                {"p_id": cid_root, "c_id": cid_fork},
+            )
+            assert fork_rels[0]["count"] == 1
+
+            with RelateForensics(saver) as forensics:
+                # trace_argument_origin walks back across NEXT then FORKED_TO to root
+                origin = forensics.trace_argument_origin(
+                    thread_id, cid_sub, {"target": "val-forked-secret"}
+                )
+                assert origin is not None
+                assert origin.argument == "target"
+                assert origin.value == "val-forked-secret"
+                assert origin.checkpoint_id == cid_root
+                assert origin.hops == 2
+
+                # _failure_checkpoint_id traverses forward across FORKED_TO to cp_fork
+                fail_cp = forensics._failure_checkpoint_id(
+                    thread_id, cid_root, "call-root-fail-181"
+                )
+                assert fail_cp == cid_fork
+
+                # trace_root_cause on cp_sub finds the root tool call across NEXT + FORKED_TO
+                report = forensics.trace_root_cause(thread_id)
+                assert report.error_checkpoint_id == cid_sub
+                assert report.root_tool_call_id == "call-root-fail-181"
+                assert report.root_tool_name == "root_api"
+                assert report.causal_path_length == 2
+
+    def test_ac181_cross_thread_branch_isolated_from_lineage_walk(self, temp_disk_db: str) -> None:
+        """AC-181: Lineage walk strictly excludes checkpoints belonging to other thread_ids."""
+        thread_t1 = "thread-ac181-t1"
+        thread_t2 = "thread-ac181-t2"
+        with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
+            # Thread 1: root checkpoint
+            cid_t1_root = "cp-ac181-t1-root"
+            cfg_t1_root: RunnableConfig = {
+                "configurable": {"thread_id": thread_t1, "checkpoint_id": cid_t1_root}
+            }
+            cp_t1_root: Any = dict(empty_checkpoint())
+            cp_t1_root["id"] = cid_t1_root
+            saver.put(cfg_t1_root, cp_t1_root, {"step": 0}, {})
+            saver.put_writes(cfg_t1_root, [("payload", "t1-secret-data")], task_id="task-t1-root")
+
+            # Thread 1: step 1 checkpoint with error
+            cid_t1_err = "cp-ac181-t1-err"
+            cfg_t1_err: RunnableConfig = {
+                "configurable": {"thread_id": thread_t1, "checkpoint_id": cid_t1_err}
+            }
+            cp_t1_err: Any = dict(empty_checkpoint())
+            cp_t1_err["id"] = cid_t1_err
+            cp_t1_err["parent_checkpoint_id"] = cid_t1_root
+            saver.put(cfg_t1_err, cp_t1_err, {"step": 1}, {})
+            saver.put_writes(cfg_t1_err, [("__error__", "t1 failure")], task_id="task-t1-err")
+
+            # Thread 2: branches from Thread 1's root (cross-thread FORKED_TO)
+            cid_t2_root = "cp-ac181-t2-root"
+            cfg_t2_root: RunnableConfig = {
+                "configurable": {"thread_id": thread_t2, "checkpoint_id": cid_t2_root}
+            }
+            cp_t2_root: Any = dict(empty_checkpoint())
+            cp_t2_root["id"] = cid_t2_root
+            cp_t2_root["parent_checkpoint_id"] = cid_t1_root
+            saver.put(cfg_t2_root, cp_t2_root, {"step": 1}, {})
+            tool_msg = ToolMessage(
+                content="t2 result", tool_call_id="call-root-fail-181", status="error"
+            )
+            saver.put_writes(
+                cfg_t2_root,
+                [
+                    ("payload", "t2-secret-data"),
+                    ("__error__", "t2 failure"),
+                    ("messages", [tool_msg]),
+                ],
+                task_id="task-t2",
+            )
+
+            # Verify cross-thread FORKED_TO edge was created
+            cross_rels = saver.proxy.execute_read(
+                "MATCH (p:Checkpoint {thread_id: $t1})-[r:FORKED_TO]->(c:Checkpoint {thread_id: $t2}) "
+                "RETURN count(r) AS count",
+                {"t1": thread_t1, "t2": thread_t2},
+            )
+            assert cross_rels[0]["count"] == 1
+
+            with RelateForensics(saver) as forensics:
+                # Thread 1's lineage walk does NOT find t2's payload
+                t1_origin = forensics.trace_argument_origin(
+                    thread_t1, cid_t1_err, {"payload": "t2-secret-data"}
+                )
+                assert t1_origin is None
+
+                # Thread 1 finds its own payload
+                t1_own_origin = forensics.trace_argument_origin(
+                    thread_t1, cid_t1_err, {"payload": "t1-secret-data"}
+                )
+                assert t1_own_origin is not None
+                assert t1_own_origin.checkpoint_id == cid_t1_root
+
+                # Thread 1's _failure_checkpoint_id does NOT traverse into Thread 2
+                fail_cp_t1 = forensics._failure_checkpoint_id(
+                    thread_t1, cid_t1_root, "call-root-fail-181"
+                )
+                assert fail_cp_t1 == cid_t1_root
+
+                # Thread 2's lineage walk does NOT walk backwards across FORKED_TO into Thread 1
+                t2_leak_origin = forensics.trace_argument_origin(
+                    thread_t2, cid_t2_root, {"payload": "t1-secret-data"}
+                )
+                assert t2_leak_origin is None
+
+                # Thread 2 finds its own payload
+                t2_own_origin = forensics.trace_argument_origin(
+                    thread_t2, cid_t2_root, {"payload": "t2-secret-data"}
+                )
+                assert t2_own_origin is not None
+                assert t2_own_origin.checkpoint_id == cid_t2_root
+
+                # Invalid input: empty thread_id raises CheckpointNotFoundError
+                with pytest.raises(CheckpointNotFoundError):
+                    forensics.trace_argument_origin("", cid_t1_root, {"payload": "any"})
+
+                # Unknown thread raises CheckpointNotFoundError for trace_root_cause
+                with pytest.raises(CheckpointNotFoundError):
+                    forensics.trace_root_cause("nonexistent-thread-id")
