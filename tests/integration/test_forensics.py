@@ -625,6 +625,12 @@ class TestRelateForensics:
                     "cid": first_id,
                 },
             )
+            first_cfg: RunnableConfig = {
+                "configurable": {"thread_id": thread_id, "checkpoint_id": first_id}
+            }
+            saver.put_writes(
+                first_cfg, [("poison", "upstream unavailable")], task_id="task-first-poison"
+            )
             saver.put_writes(config, [("__error__", "Chain aborted")], task_id="task-long")
 
             started = time.perf_counter()
@@ -632,8 +638,10 @@ class TestRelateForensics:
             elapsed = time.perf_counter() - started
 
         assert report.error_checkpoint_id == config["configurable"]["checkpoint_id"]
-        assert report.root_tool_call_id == "call-long-chain-1"
-        assert report.root_tool_name == "slow_api"
+        assert (
+            report.root_channel_write is not None
+            and "task-first-poison" in report.root_channel_write
+        )
         assert report.causal_path_length == chain_length - 1
         assert elapsed < 1.0
 
@@ -1255,12 +1263,16 @@ class TestFailureSummary:
                 )
                 assert fail_cp == cid_fork
 
-                # trace_root_cause on cp_sub finds the root tool call across NEXT + FORKED_TO
+                # Under AC-184, distant tool call at distance 2 is not blamed on the __error__ path;
+                # the nearest antecedent write at distance 1 is identified instead.
                 report = forensics.trace_root_cause(thread_id)
                 assert report.error_checkpoint_id == cid_sub
-                assert report.root_tool_call_id == "call-root-fail-181"
-                assert report.root_tool_name == "root_api"
-                assert report.causal_path_length == 2
+                assert (
+                    report.root_channel_write is not None
+                    and "task-tool-res" in report.root_channel_write
+                )
+                assert report.root_tool_call_id is None
+                assert report.causal_path_length == 1
 
     def test_ac181_cross_thread_branch_isolated_from_lineage_walk(self, temp_disk_db: str) -> None:
         """AC-181: Lineage walk strictly excludes checkpoints belonging to other thread_ids."""
@@ -1379,9 +1391,7 @@ class TestPoisonDetection:
         with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
             # Step 1: Antecedent write on a benign channel containing "default value" or "fault diagnosis"
             cid1 = "cp-ac183-clean-1"
-            cfg1: RunnableConfig = {
-                "configurable": {"thread_id": thread_id, "checkpoint_id": cid1}
-            }
+            cfg1: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_id": cid1}}
             cp1: Any = dict(empty_checkpoint())
             cp1["id"] = cid1
             saver.put(cfg1, cp1, {"step": 1, "node": "config_loader"}, {})  # type: ignore[typeddict-unknown-key]
@@ -1393,9 +1403,7 @@ class TestPoisonDetection:
 
             # Step 2: Intermediate step with an upstream tool invocation (no explicit error)
             cid2 = "cp-ac183-clean-2"
-            cfg2: RunnableConfig = {
-                "configurable": {"thread_id": thread_id, "checkpoint_id": cid2}
-            }
+            cfg2: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_id": cid2}}
             cp2: Any = dict(empty_checkpoint())
             cp2["id"] = cid2
             cp2["parent_checkpoint_id"] = cid1
@@ -1417,9 +1425,7 @@ class TestPoisonDetection:
 
             # Step 3: Failure checkpoint where error is recorded
             cid3 = "cp-ac183-clean-3"
-            cfg3: RunnableConfig = {
-                "configurable": {"thread_id": thread_id, "checkpoint_id": cid3}
-            }
+            cfg3: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_id": cid3}}
             cp3: Any = dict(empty_checkpoint())
             cp3["id"] = cid3
             cp3["parent_checkpoint_id"] = cid2
@@ -1455,9 +1461,7 @@ class TestPoisonDetection:
         with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
             # Step 1: Write on a channel whose name contains "poison"
             cid1 = "cp-ac183-p-1"
-            cfg1: RunnableConfig = {
-                "configurable": {"thread_id": thread_id, "checkpoint_id": cid1}
-            }
+            cfg1: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_id": cid1}}
             cp1: Any = dict(empty_checkpoint())
             cp1["id"] = cid1
             saver.put(cfg1, cp1, {"step": 1, "node": "injector"}, {})  # type: ignore[typeddict-unknown-key]
@@ -1469,9 +1473,7 @@ class TestPoisonDetection:
 
             # Step 2: Intermediate step with an upstream tool invocation (no explicit error)
             cid2 = "cp-ac183-p-2"
-            cfg2: RunnableConfig = {
-                "configurable": {"thread_id": thread_id, "checkpoint_id": cid2}
-            }
+            cfg2: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_id": cid2}}
             cp2: Any = dict(empty_checkpoint())
             cp2["id"] = cid2
             cp2["parent_checkpoint_id"] = cid1
@@ -1493,9 +1495,7 @@ class TestPoisonDetection:
 
             # Step 3: Failure checkpoint
             cid3 = "cp-ac183-p-3"
-            cfg3: RunnableConfig = {
-                "configurable": {"thread_id": thread_id, "checkpoint_id": cid3}
-            }
+            cfg3: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_id": cid3}}
             cp3: Any = dict(empty_checkpoint())
             cp3["id"] = cid3
             cp3["parent_checkpoint_id"] = cid2
@@ -1515,16 +1515,12 @@ class TestPoisonDetection:
             assert report.root_tool_call_id is None
             assert report.causal_path_length == 2
 
-    def test_ac183_empty_or_whitespace_channel_not_flagged(
-        self, temp_disk_db: str
-    ) -> None:
+    def test_ac183_empty_or_whitespace_channel_not_flagged(self, temp_disk_db: str) -> None:
         """AC-183: Empty or whitespace channel names are safely handled and not flagged as poison."""
         thread_id = "thread-ac183-empty-chan"
         with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
             cid1 = "cp-ac183-empty-1"
-            cfg1: RunnableConfig = {
-                "configurable": {"thread_id": thread_id, "checkpoint_id": cid1}
-            }
+            cfg1: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_id": cid1}}
             cp1: Any = dict(empty_checkpoint())
             cp1["id"] = cid1
             saver.put(cfg1, cp1, {"step": 1, "node": "step1"}, {})  # type: ignore[typeddict-unknown-key]
@@ -1535,9 +1531,7 @@ class TestPoisonDetection:
             )
 
             cid2 = "cp-ac183-empty-2"
-            cfg2: RunnableConfig = {
-                "configurable": {"thread_id": thread_id, "checkpoint_id": cid2}
-            }
+            cfg2: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_id": cid2}}
             cp2: Any = dict(empty_checkpoint())
             cp2["id"] = cid2
             cp2["parent_checkpoint_id"] = cid1
@@ -1553,3 +1547,167 @@ class TestPoisonDetection:
 
             assert report.thread_id == thread_id
             assert report.error_checkpoint_id == cid2
+
+    def test_ac184_tool_call_error_at_distance_1_attributed_on_error_write_path(
+        self, temp_disk_db: str
+    ) -> None:
+        """AC-184: Tool-call error at distance 1 is attributed as root cause on the __error__ path."""
+        thread_id = "thread-ac184-dist1"
+        call_id = "call-search-dist1"
+        with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
+            # Step 1: Initial checkpoint
+            cid1 = "cp-ac184-dist1-s1"
+            cfg1: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_id": cid1}}
+            cp1: Any = dict(empty_checkpoint())
+            cp1["id"] = cid1
+            saver.put(cfg1, cp1, {"step": 1, "node": "agent"}, {})  # type: ignore[typeddict-unknown-key]
+
+            # Step 2: Tool execution checkpoint with failed tool call (distance 1 to step 3)
+            cid2 = "cp-ac184-dist1-s2"
+            cfg2: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_id": cid2}}
+            cp2: Any = dict(empty_checkpoint())
+            cp2["id"] = cid2
+            cp2["parent_checkpoint_id"] = cid1
+            saver.put(cfg2, cp2, {"step": 2, "node": "tool_node"}, {})  # type: ignore[typeddict-unknown-key]
+            ai = AIMessage(
+                content="",
+                tool_calls=[{"id": call_id, "name": "vector_search", "args": {"q": "foo"}}],
+            )
+            saver.put_writes(cfg2, [("messages", [ai])], task_id="task-ai")
+            tool_msg = ToolMessage(
+                content="Connection refused", tool_call_id=call_id, status="error"
+            )
+            saver.put_writes(cfg2, [("messages", [tool_msg])], task_id="task-tool")
+
+            # Step 3: Failure checkpoint terminating with __error__ write
+            cid3 = "cp-ac184-dist1-s3"
+            cfg3: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_id": cid3}}
+            cp3: Any = dict(empty_checkpoint())
+            cp3["id"] = cid3
+            cp3["parent_checkpoint_id"] = cid2
+            saver.put(cfg3, cp3, {"step": 3, "node": "error_handler"}, {})  # type: ignore[typeddict-unknown-key]
+            saver.put_writes(
+                cfg3,
+                [("__error__", "Cascading failure following tool execution")],
+                task_id="task-err",
+            )
+
+            with RelateForensics(saver) as forensics:
+                report = forensics.trace_root_cause(thread_id)
+
+            assert report.thread_id == thread_id
+            assert report.error_checkpoint_id == cid3
+            assert report.root_tool_call_id == call_id
+            assert report.root_tool_name == "vector_search"
+            assert report.causal_path_length == 1
+            assert "vector_search" in report.diagnostic_summary
+
+    def test_ac184_tool_call_error_at_distance_2_not_attributed_on_error_write_path(
+        self, temp_disk_db: str
+    ) -> None:
+        """AC-184: Antecedent tool-call error at distance >= 2 is not blamed as root cause on the __error__ path."""
+        thread_id = "thread-ac184-dist2"
+        call_id = "call-old-distant-err"
+        with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
+            # Step 1: Checkpoint with failed tool call (distance 2 to step 3)
+            cid1 = "cp-ac184-dist2-s1"
+            cfg1: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_id": cid1}}
+            cp1: Any = dict(empty_checkpoint())
+            cp1["id"] = cid1
+            saver.put(cfg1, cp1, {"step": 1, "node": "old_tool"}, {})  # type: ignore[typeddict-unknown-key]
+            ai = AIMessage(
+                content="",
+                tool_calls=[{"id": call_id, "name": "legacy_lookup", "args": {"k": "v"}}],
+            )
+            saver.put_writes(cfg1, [("messages", [ai])], task_id="task-ai-1")
+            tool_msg = ToolMessage(content="Service timeout", tool_call_id=call_id, status="error")
+            saver.put_writes(cfg1, [("messages", [tool_msg])], task_id="task-tool-1")
+
+            # Step 2: Normal recovery checkpoint with regular channel write
+            cid2 = "cp-ac184-dist2-s2"
+            cfg2: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_id": cid2}}
+            cp2: Any = dict(empty_checkpoint())
+            cp2["id"] = cid2
+            cp2["parent_checkpoint_id"] = cid1
+            saver.put(cfg2, cp2, {"step": 2, "node": "fallback_node"}, {})  # type: ignore[typeddict-unknown-key]
+            saver.put_writes(
+                cfg2,
+                [("messages", [HumanMessage(content="fallback completed successfully")])],
+                task_id="task-fallback",
+            )
+
+            # Step 3: Unrelated crash checkpoint terminating with __error__ write
+            cid3 = "cp-ac184-dist2-s3"
+            cfg3: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_id": cid3}}
+            cp3: Any = dict(empty_checkpoint())
+            cp3["id"] = cid3
+            cp3["parent_checkpoint_id"] = cid2
+            saver.put(cfg3, cp3, {"step": 3, "node": "unrelated_crasher"}, {})  # type: ignore[typeddict-unknown-key]
+            saver.put_writes(
+                cfg3,
+                [("__error__", "Out of memory in unrelated crasher")],
+                task_id="task-err-3",
+            )
+
+            with RelateForensics(saver) as forensics:
+                report = forensics.trace_root_cause(thread_id)
+
+            assert report.thread_id == thread_id
+            assert report.error_checkpoint_id == cid3
+            # The distant tool error at distance 2 must NOT be blamed as root tool call
+            assert report.root_tool_call_id != call_id
+            assert report.root_tool_call_id is None
+            assert report.root_tool_name is None
+            # The offending antecedent should be the nearest antecedent write preceding failure (step 2)
+            assert report.root_channel_write is not None
+            assert report.causal_path_length == 1
+
+    def test_ac184_distant_tool_error_without_intermediate_writes_not_attributed(
+        self, temp_disk_db: str
+    ) -> None:
+        """AC-184: Distant tool error at distance >= 2 without intermediate writes is not blamed on __error__ path."""
+        thread_id = "thread-ac184-nowrite"
+        call_id = "call-distant-no-write"
+        with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
+            # Step 1: Checkpoint with tool error (distance 2 to step 3)
+            cid1 = "cp-ac184-nw-s1"
+            cfg1: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_id": cid1}}
+            cp1: Any = dict(empty_checkpoint())
+            cp1["id"] = cid1
+            saver.put(cfg1, cp1, {"step": 1, "node": "tool_step"}, {})  # type: ignore[typeddict-unknown-key]
+            ai = AIMessage(
+                content="",
+                tool_calls=[{"id": call_id, "name": "distant_tool", "args": {}}],
+            )
+            saver.put_writes(cfg1, [("messages", [ai])], task_id="task-ai")
+            tool_msg = ToolMessage(content="Failed", tool_call_id=call_id, status="error")
+            saver.put_writes(cfg1, [("messages", [tool_msg])], task_id="task-tool")
+
+            # Step 2: Intermediate checkpoint with no channel writes
+            cid2 = "cp-ac184-nw-s2"
+            cfg2: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_id": cid2}}
+            cp2: Any = dict(empty_checkpoint())
+            cp2["id"] = cid2
+            cp2["parent_checkpoint_id"] = cid1
+            saver.put(cfg2, cp2, {"step": 2, "node": "noop_step"}, {})  # type: ignore[typeddict-unknown-key]
+
+            # Step 3: Error checkpoint terminating with __error__ write
+            cid3 = "cp-ac184-nw-s3"
+            cfg3: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_id": cid3}}
+            cp3: Any = dict(empty_checkpoint())
+            cp3["id"] = cid3
+            cp3["parent_checkpoint_id"] = cid2
+            saver.put(cfg3, cp3, {"step": 3, "node": "crash_step"}, {})  # type: ignore[typeddict-unknown-key]
+            saver.put_writes(
+                cfg3,
+                [("__error__", "Failure at step 3")],
+                task_id="task-err",
+            )
+
+            with RelateForensics(saver) as forensics:
+                report = forensics.trace_root_cause(thread_id)
+
+            assert report.thread_id == thread_id
+            assert report.error_checkpoint_id == cid3
+            assert report.root_tool_call_id is None
+            assert report.root_tool_name is None

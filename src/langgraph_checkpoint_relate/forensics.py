@@ -864,6 +864,7 @@ class RelateForensics:
             "LIMIT 1"
         )
         error_records = self._saver.proxy.execute_read(error_write_query, {"thread_id": thread_id})
+        is_error_write_path = bool(error_records)
 
         # 2. Look for error checkpoint via tool call error
         if not error_records:
@@ -1022,9 +1023,11 @@ class RelateForensics:
         causal_path_length: int = 0
 
         # Prioritized search for offending antecedent:
-        # Priority 1: ToolCall with explicit error
+        # Priority 1: ToolCall with explicit error (AC-184, ADR-0029)
         for r in causal_rows:
             if r.get("tool_call_id") and r.get("tool_error"):
+                if is_error_write_path and int(r.get("distance_to_error", 0)) > 1:
+                    continue
                 root_tool_call_id = str(r["tool_call_id"])
                 root_tool_name = str(r["tool_name"]) if r.get("tool_name") else None
                 root_channel_write = str(r["write_id"]) if r.get("write_id") else None
@@ -1046,10 +1049,12 @@ class RelateForensics:
                         causal_path_length = int(r.get("distance_to_error", 0))
                         break
 
-        # Priority 3: Upstream tool invocation preceding failure
+        # Priority 3: Upstream tool invocation preceding failure (AC-184, ADR-0029)
         if not root_channel_write and not root_tool_call_id:
             for r in causal_rows:
                 if r.get("tool_call_id") and int(r.get("distance_to_error", 0)) > 0:
+                    if is_error_write_path and int(r.get("distance_to_error", 0)) > 1:
+                        continue
                     root_tool_call_id = str(r["tool_call_id"])
                     root_tool_name = str(r["tool_name"]) if r.get("tool_name") else None
                     root_channel_write = str(r["write_id"]) if r.get("write_id") else None
@@ -1063,8 +1068,11 @@ class RelateForensics:
                 dist = int(r.get("distance_to_error", 0))
                 if channel and channel != "__error__" and dist > 0:
                     root_channel_write = str(r["write_id"])
-                    root_tool_call_id = str(r["tool_call_id"]) if r.get("tool_call_id") else None
-                    root_tool_name = str(r["tool_name"]) if r.get("tool_name") else None
+                    if not (is_error_write_path and dist > 1):
+                        root_tool_call_id = (
+                            str(r["tool_call_id"]) if r.get("tool_call_id") else None
+                        )
+                        root_tool_name = str(r["tool_name"]) if r.get("tool_name") else None
                     causal_path_length = dist
                     break
 
