@@ -43,8 +43,8 @@ class RelateStateSerializer(SerializerProtocol):
             inner_serializer: Optional custom SerializerProtocol instance.
             pickle_fallback: Whether to fall back to pickle for unsupported types.
         """
-        self._serializer: SerializerProtocol = (
-            inner_serializer or JsonPlusSerializer(pickle_fallback=pickle_fallback)
+        self._serializer: SerializerProtocol = inner_serializer or JsonPlusSerializer(
+            pickle_fallback=pickle_fallback
         )
 
     @property

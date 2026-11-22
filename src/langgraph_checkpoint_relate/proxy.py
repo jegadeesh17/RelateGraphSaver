@@ -83,17 +83,16 @@ def _wrap_exception(exc: Exception) -> RelateCheckpointError:
     msg = str(exc)
 
     err: RelateCheckpointError
-    if (
-        isinstance(exc, (TimeoutError, concurrent.futures.TimeoutError))
-        or _CONCURRENCY_RE.search(msg)
+    if isinstance(exc, (TimeoutError, concurrent.futures.TimeoutError)) or _CONCURRENCY_RE.search(
+        msg
     ):
         err = RelateConcurrencyError(f"Concurrency or lock failure: {msg}")
         err.__cause__ = exc
         return err
 
-    if (
-        _CONNECTION_RE.search(msg)
-        or exc.__class__.__name__ in ("InterfaceError", "RelateConnectionError")
+    if _CONNECTION_RE.search(msg) or exc.__class__.__name__ in (
+        "InterfaceError",
+        "RelateConnectionError",
     ):
         err = RelateConnectionError(f"Database connection error: {msg}")
         err.__cause__ = exc

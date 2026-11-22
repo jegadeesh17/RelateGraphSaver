@@ -571,4 +571,3 @@ def test_checkpoint_tuple_pending_writes_ordered_by_task_id_then_idx_ac_180() ->
             ("task-z", "ch_z", "val_z"),
         ]
         assert tup.pending_writes == expected
-

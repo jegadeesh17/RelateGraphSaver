@@ -116,9 +116,7 @@ class TestProxyCancellationOnTimeout:
             block_event.set()
 
             # Verify no nodes from the cancelled transaction were created or committed
-            res = proxy.execute_read(
-                "MATCH (n:BatchCancelled) RETURN count(n) AS cnt"
-            )
+            res = proxy.execute_read("MATCH (n:BatchCancelled) RETURN count(n) AS cnt")
             assert res == [{"cnt": 0}], (
                 "Batch mutation must NOT have executed or persisted to the database"
             )
@@ -159,14 +157,10 @@ class TestProxyCancellationOnTimeout:
             proxy._queue.put(cmd)
 
             # Sync by running another read query
-            res = proxy.execute_read(
-                "MATCH (n:PreCancelled {id: 'pre-1'}) RETURN count(n) AS cnt"
-            )
+            res = proxy.execute_read("MATCH (n:PreCancelled {id: 'pre-1'}) RETURN count(n) AS cnt")
             assert res == [{"cnt": 0}]
 
-    def test_pre_cancelled_batch_command_skipped_by_worker_ac_179(
-        self, temp_db_path: str
-    ) -> None:
+    def test_pre_cancelled_batch_command_skipped_by_worker_ac_179(self, temp_db_path: str) -> None:
         """AC-179: A BatchCommand cancelled prior to processing is skipped without execution."""
         with RelateThreadProxy(db_path=temp_db_path) as proxy:
             fut: concurrent.futures.Future[list[list[dict[str, Any]]]] = concurrent.futures.Future()
@@ -191,6 +185,7 @@ class TestProxyLifecycleAndWorkerTimeout:
 
     def test_startup_timeout_signals_worker_exit_and_closes_connection(self) -> None:
         """On worker startup timeout, proxy signals worker thread to stop and closes connection handle."""
+
         class MockRelateConn:
             def __init__(self) -> None:
                 self.closed = False
@@ -304,9 +299,11 @@ class TestProxyLifecycleAndWorkerTimeout:
                             {"id": f"item-{worker_id}-{time.perf_counter()}"},
                         )
                     elif op_type == 2:
-                        proxy.execute_batch([
-                            ("CREATE (n:ConcurrentBatch {worker: $w})", {"w": worker_id}),
-                        ])
+                        proxy.execute_batch(
+                            [
+                                ("CREATE (n:ConcurrentBatch {worker: $w})", {"w": worker_id}),
+                            ]
+                        )
                     else:
                         proxy.flush()
                     with ops_lock:
@@ -342,6 +339,7 @@ class TestProxyExceptionClassification:
 
     def test_proxy_avoids_false_positive_concurrency_on_substrings(self) -> None:
         """Verify queries failing with 'unlocked', 'clock', 'block', or 'timeout_ms' do not raise RelateConcurrencyError."""
+
         class MockFailingConn:
             def __init__(self) -> None:
                 self.error: Exception | None = None
@@ -374,6 +372,7 @@ class TestProxyExceptionClassification:
 
     def test_proxy_classifies_concurrency_and_connection_errors(self) -> None:
         """Verify queries failing with lock, timeout, or closed connection are classified accurately."""
+
         class MockFailingConn:
             def __init__(self) -> None:
                 self.error: Exception | None = None
@@ -408,4 +407,3 @@ class TestProxyExceptionClassification:
             with pytest.raises(RelateConnectionError) as conn_info:
                 proxy.execute_read("RETURN 1")
             assert "connection closed" in str(conn_info.value)
-

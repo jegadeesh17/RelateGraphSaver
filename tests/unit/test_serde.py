@@ -421,4 +421,3 @@ def test_relate_saver_keeps_relate_state_serializer_without_double_wrapping_ac_1
         assert saver.serde is existing
     finally:
         saver.close()
-

@@ -646,9 +646,7 @@ class TestRelateSaverEndToEnd:
             assert tuple_res is not None
             assert tuple_res.checkpoint["channel_values"]["seam"] == "passed"
 
-    def test_compiled_graph_with_subgraph_node_ac_173_ac_174(
-        self, temp_disk_path: str
-    ) -> None:
+    def test_compiled_graph_with_subgraph_node_ac_173_ac_174(self, temp_disk_path: str) -> None:
         """Verifies compiled StateGraph with embedded subgraph node, namespace resolution, and parent chains.
 
         Validates AC-173: get_state() without namespace resolves the root namespace state ("").
@@ -656,6 +654,7 @@ class TestRelateSaverEndToEnd:
         proper parent chains, with config["configurable"]["checkpoint_id"] strictly taking priority
         over metadata["parents"].
         """
+
         class ChildState(TypedDict):
             counter: int
             sub_step: str
@@ -789,18 +788,16 @@ class TestRelateSaverEndToEnd:
             assert tuple_explicit is not None
             assert tuple_explicit.parent_config is not None
             assert (
-                tuple_explicit.parent_config["configurable"]["checkpoint_id"]
-                == "explicit_parent"
+                tuple_explicit.parent_config["configurable"]["checkpoint_id"] == "explicit_parent"
             )
 
-    def test_update_state_fork_and_invoke_time_travel_ac_175(
-        self, temp_disk_path: str
-    ) -> None:
+    def test_update_state_fork_and_invoke_time_travel_ac_175(self, temp_disk_path: str) -> None:
         """Verifies time-travel branching via update_state followed by invoke resuming from edited step.
 
         Validates AC-175: Checkpoint ordering and filtering use checkpoint_id DESC so get_state resolves
         the new branch head (highest checkpoint_id) rather than the old branch's later step.
         """
+
         class ForkState(TypedDict):
             counter: int
             trace: list[str]
@@ -844,9 +841,7 @@ class TestRelateSaverEndToEnd:
             assert step1_ckpts[0].checkpoint["channel_values"]["counter"] == 1
 
             # 3. Call update_state on step 1 with edited counter: 99
-            edit_config: Any = {
-                "configurable": {"thread_id": thread_id, "checkpoint_id": step1_id}
-            }
+            edit_config: Any = {"configurable": {"thread_id": thread_id, "checkpoint_id": step1_id}}
             update_result: Any = graph.update_state(edit_config, {"counter": 99})
             updated_id = update_result["configurable"]["checkpoint_id"]
             assert updated_id != step1_id
@@ -871,9 +866,7 @@ class TestRelateSaverEndToEnd:
             ckpt_ids = [c.config["configurable"]["checkpoint_id"] for c in all_fork_ckpts]
             assert ckpt_ids == sorted(ckpt_ids, reverse=True)
 
-    def test_timed_out_write_does_not_commit_ac_179(
-        self, temp_disk_path: str
-    ) -> None:
+    def test_timed_out_write_does_not_commit_ac_179(self, temp_disk_path: str) -> None:
         """Verifies that a write expiring caller timeout is cancelled and never committed.
 
         Validates AC-179: When caller timeout expires, future is cancelled and worker thread
@@ -939,9 +932,7 @@ class TestRelateSaverEndToEnd:
             )
             assert tuple_check is None
 
-    def test_closed_proxy_read_raises_connection_error_ac_176(
-        self, temp_disk_path: str
-    ) -> None:
+    def test_closed_proxy_read_raises_connection_error_ac_176(self, temp_disk_path: str) -> None:
         """Verifies closed proxy propagates RelateConnectionError on get_tuple and list.
 
         Validates AC-176: Underlying RelateConnectionError is re-raised rather than returning
@@ -974,4 +965,3 @@ class TestRelateSaverEndToEnd:
         with pytest.raises(RelateConnectionError) as exc_list:
             list(saver.list(res_cfg))
         assert "closed" in str(exc_list.value).lower()
-

@@ -819,7 +819,9 @@ class TestForkToolCalls:
                 return orig_read(cypher, params, timeout)
 
             monkeypatch.setattr(source.proxy, "execute_read", failing_read)
-            with pytest.raises(RelateCheckpointError, match="Simulated candidates query read failure"):
+            with pytest.raises(
+                RelateCheckpointError, match="Simulated candidates query read failure"
+            ):
                 source.fork_in_memory(thread_id, "cp-1")
 
     def test_fork_in_memory_propagates_writes_read_error_ac_19(
@@ -876,7 +878,9 @@ class TestForkToolCalls:
 
             orig_execute_batch = RelateThreadProxy.execute_batch
 
-            def failing_execute_batch(self: RelateThreadProxy, statements: Any, **kwargs: Any) -> None:
+            def failing_execute_batch(
+                self: RelateThreadProxy, statements: Any, **kwargs: Any
+            ) -> None:
                 if getattr(self, "db_path", None) == ":memory:":
                     raise RuntimeError("Simulated batch population failure")
                 orig_execute_batch(self, statements, **kwargs)

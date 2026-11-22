@@ -184,4 +184,3 @@ def test_wrap_exception_accurate_connection_classification_ac_01() -> None:
         exc = RuntimeError(non_conn_msg)
         wrapped_non_conn = _wrap_exception(exc)
         assert not isinstance(wrapped_non_conn, RelateConnectionError)
-
