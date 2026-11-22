@@ -324,6 +324,153 @@ class TestRelateForensics:
             assert report.occurrence_count == 2
             assert report.checkpoint_id_range == ("cp-step-0", "cp-step-5")
 
+    def test_detect_loops_multi_namespace_no_false_positive_ac_182(self, temp_disk_db: str) -> None:
+        """AC-182: Verify multi-namespace thread with intervening subgraph does not produce false positive loops."""
+        thread_id = "thread-multi-ns-no-false-positive"
+        with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
+            # Root graph steps 0 and 1
+            cp0: Any = dict(empty_checkpoint())
+            cp0["id"] = "cp-root-0"
+            cp0["channel_values"] = {"counter": 0}
+            cfg0: RunnableConfig = {
+                "configurable": {
+                    "thread_id": thread_id,
+                    "checkpoint_ns": "",
+                    "checkpoint_id": "cp-root-0",
+                }
+            }
+            saver.put(cfg0, cp0, {"node": "step_a", "step": 0}, {})  # type: ignore[typeddict-unknown-key]
+
+            cp1: Any = dict(empty_checkpoint())
+            cp1["id"] = "cp-root-1"
+            cp1["parent_checkpoint_id"] = "cp-root-0"
+            cp1["channel_values"] = {"counter": 1}
+            cfg1: RunnableConfig = {
+                "configurable": {
+                    "thread_id": thread_id,
+                    "checkpoint_ns": "",
+                    "checkpoint_id": "cp-root-1",
+                }
+            }
+            saver.put(cfg1, cp1, {"node": "step_b", "step": 1}, {})  # type: ignore[typeddict-unknown-key]
+
+            # Intervening subgraph execution at steps 2 and 3 with matching node names (step_a, step_b)
+            # In global step sorting, this creates a bogus sequence [step_a, step_b, step_a, step_b].
+            cp_s0: Any = dict(empty_checkpoint())
+            cp_s0["id"] = "cp-sub-2"
+            cp_s0["parent_checkpoint_id"] = "cp-root-1"
+            cp_s0["channel_values"] = {"sub_val": 10}
+            cfg_s0: RunnableConfig = {
+                "configurable": {
+                    "thread_id": thread_id,
+                    "checkpoint_ns": "subgraph:worker",
+                    "checkpoint_id": "cp-sub-2",
+                }
+            }
+            saver.put(cfg_s0, cp_s0, {"node": "step_a", "step": 2}, {})  # type: ignore[typeddict-unknown-key]
+
+            cp_s1: Any = dict(empty_checkpoint())
+            cp_s1["id"] = "cp-sub-3"
+            cp_s1["parent_checkpoint_id"] = "cp-sub-2"
+            cp_s1["channel_values"] = {"sub_val": 11}
+            cfg_s1: RunnableConfig = {
+                "configurable": {
+                    "thread_id": thread_id,
+                    "checkpoint_ns": "subgraph:worker",
+                    "checkpoint_id": "cp-sub-3",
+                }
+            }
+            saver.put(cfg_s1, cp_s1, {"node": "step_b", "step": 3}, {})  # type: ignore[typeddict-unknown-key]
+
+            # Root graph resumes execution at steps 4 and 5
+            cp2: Any = dict(empty_checkpoint())
+            cp2["id"] = "cp-root-4"
+            cp2["parent_checkpoint_id"] = "cp-root-1"
+            cp2["channel_values"] = {"counter": 2}
+            cfg2: RunnableConfig = {
+                "configurable": {
+                    "thread_id": thread_id,
+                    "checkpoint_ns": "",
+                    "checkpoint_id": "cp-root-4",
+                }
+            }
+            saver.put(cfg2, cp2, {"node": "step_c", "step": 4}, {})  # type: ignore[typeddict-unknown-key]
+
+            cp3: Any = dict(empty_checkpoint())
+            cp3["id"] = "cp-root-5"
+            cp3["parent_checkpoint_id"] = "cp-root-4"
+            cp3["channel_values"] = {"counter": 3}
+            cfg3: RunnableConfig = {
+                "configurable": {
+                    "thread_id": thread_id,
+                    "checkpoint_ns": "",
+                    "checkpoint_id": "cp-root-5",
+                }
+            }
+            saver.put(cfg3, cp3, {"node": "step_d", "step": 5}, {})  # type: ignore[typeddict-unknown-key]
+
+            # Namespace-isolated traversal along NEXT edges avoids cross-namespace step interleaving
+            reports = saver.detect_loops(thread_id, threshold=2)
+            assert reports == []
+
+    def test_detect_loops_subgraph_genuine_cycle_detected_ac_182(self, temp_disk_db: str) -> None:
+        """AC-182: Verify loops genuinely present in a subgraph namespace are detected within that subgraph namespace."""
+        thread_id = "thread-subgraph-genuine-loop"
+        with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
+            # Root caller step
+            cp_root: Any = dict(empty_checkpoint())
+            cp_root["id"] = "cp-root-start"
+            cp_root["channel_values"] = {"status": "init"}
+            cfg_root: RunnableConfig = {
+                "configurable": {
+                    "thread_id": thread_id,
+                    "checkpoint_ns": "",
+                    "checkpoint_id": "cp-root-start",
+                }
+            }
+            saver.put(cfg_root, cp_root, {"node": "root_caller", "step": 0}, {})  # type: ignore[typeddict-unknown-key]
+
+            # Subgraph performs a repeating loop of [planner, worker] twice
+            sub_sequence = ["planner", "worker", "planner", "worker"]
+            prev_sub_cid: str | None = None
+            for idx, node_name in enumerate(sub_sequence, start=1):
+                cid = f"cp-sub-{idx}"
+                cp: Any = dict(empty_checkpoint())
+                cp["id"] = cid
+                cp["parent_checkpoint_id"] = prev_sub_cid if prev_sub_cid else "cp-root-start"
+                cp["channel_values"] = {"sub_step": idx}
+                cfg: RunnableConfig = {
+                    "configurable": {
+                        "thread_id": thread_id,
+                        "checkpoint_ns": "subgraph:task_executor",
+                        "checkpoint_id": cid,
+                    }
+                }
+                saver.put(cfg, cp, {"node": node_name, "step": idx}, {})  # type: ignore[typeddict-unknown-key]
+                prev_sub_cid = cid
+
+            # Root finishes after subgraph
+            cp_finish: Any = dict(empty_checkpoint())
+            cp_finish["id"] = "cp-root-end"
+            cp_finish["parent_checkpoint_id"] = "cp-root-start"
+            cp_finish["channel_values"] = {"status": "done"}
+            cfg_finish: RunnableConfig = {
+                "configurable": {
+                    "thread_id": thread_id,
+                    "checkpoint_ns": "",
+                    "checkpoint_id": "cp-root-end",
+                }
+            }
+            saver.put(cfg_finish, cp_finish, {"node": "root_finisher", "step": 5}, {})  # type: ignore[typeddict-unknown-key]
+
+            reports = saver.detect_loops(thread_id, threshold=2)
+            assert len(reports) == 1
+            report = reports[0]
+            assert report.thread_id == thread_id
+            assert report.cycle_nodes == ["planner", "worker"]
+            assert report.occurrence_count == 2
+            assert report.checkpoint_id_range == ("cp-sub-1", "cp-sub-4")
+
     def test_trace_root_cause_tool_call_antecedent(self, temp_disk_db: str) -> None:
         """Verify trace_root_cause pinpoints offending tool call linked via INVOKED edge."""
         thread_id = "thread-tool-fail-001"

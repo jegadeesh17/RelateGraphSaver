@@ -6,6 +6,7 @@ path traversals from failure nodes to offending antecedent writes or tool calls.
 
 from __future__ import annotations
 
+import collections
 import gc
 import logging
 from collections.abc import Callable, Mapping, Sequence
@@ -276,8 +277,9 @@ class RelateForensics:
     ) -> list[LoopReport]:
         """Identify state oscillation or repeating cycle paths in the Cypher DAG.
 
-        Implements AC-25 and AC-26 by evaluating state hashes and node execution transitions
-        along the ordered checkpoint sequence for thread_id.
+        Implements AC-25, AC-26, and AC-182 (ADR-0029) by traversing NEXT relationships
+        per namespace from root to leaf, evaluating node execution transitions and
+        state hashes along each path without cross-namespace step interleaving.
 
         Args:
             thread_id: Execution thread identifier.
@@ -296,18 +298,19 @@ class RelateForensics:
         if not isinstance(threshold, int) or threshold < 1:
             raise ValueError(f"threshold must be an integer >= 1, got {threshold!r}")
 
-        # Query ordered checkpoints for thread_id
+        # 1. Query all checkpoints for thread_id
         cypher = (
             "MATCH (c:Checkpoint {thread_id: $thread_id}) "
             "OPTIONAL MATCH (c)-[:HAS_WRITE]->(w:Write) "
             "RETURN c.checkpoint_id AS checkpoint_id, "
+            "       c.checkpoint_ns AS checkpoint_ns, "
             "       c.step AS step, "
             "       c.state_hash AS state_hash, "
             "       c.metadata_blob AS metadata_blob, "
             "       c.created_at AS created_at, "
             "       collect(w.task_path) AS task_paths, "
             "       collect(w.channel) AS channels "
-            "ORDER BY c.step ASC, c.created_at ASC"
+            "ORDER BY c.step ASC, c.created_at ASC, c.checkpoint_id ASC"
         )
         records = self._saver.proxy.execute_read(cypher, {"thread_id": thread_id})
         if not records:
@@ -315,10 +318,13 @@ class RelateForensics:
                 f"Thread '{thread_id}' not found or contains no checkpoints."
             )
 
-        # Parse records and extract node names and state hashes
-        items: list[dict[str, Any]] = []
+        # Parse records and organize by namespace
+        checkpoint_items: dict[str, dict[str, Any]] = {}
+        by_namespace: dict[str, list[str]] = collections.defaultdict(list)
+
         for r in records:
             cid = str(r["checkpoint_id"])
+            ns = str(r.get("checkpoint_ns") or "")
             step = int(r.get("step", 0))
             state_hash = str(r.get("state_hash", ""))
             created_at = str(r.get("created_at", ""))
@@ -341,22 +347,28 @@ class RelateForensics:
             # If node_name is not yet resolved, inspect task_paths from writes
             if not node_name:
                 task_paths = r.get("task_paths") or []
+                cand_task_nodes: list[str] = []
                 for tp in task_paths:
                     if tp:
                         parts = [p.strip() for p in str(tp).split(",") if p.strip()]
                         if parts:
                             cand = parts[-1]
                             if cand and cand != "loop":
-                                node_name = cand
-                                break
+                                cand_task_nodes.append(cand)
+                if cand_task_nodes:
+                    cand_task_nodes.sort()
+                    node_name = cand_task_nodes[0]
 
             # If still not resolved, inspect channels from writes
             if not node_name:
                 channels = r.get("channels") or []
+                cand_chan_nodes: list[str] = []
                 for ch in channels:
                     if ch and str(ch).startswith("branch:to:"):
-                        node_name = str(ch).split("branch:to:")[-1]
-                        break
+                        cand_chan_nodes.append(str(ch).split("branch:to:")[-1])
+                if cand_chan_nodes:
+                    cand_chan_nodes.sort()
+                    node_name = cand_chan_nodes[0]
 
             # Fallbacks: step -1 is input/start
             if not node_name:
@@ -365,62 +377,156 @@ class RelateForensics:
                 else:
                     node_name = f"step_{step}"
 
-            items.append(
-                {
-                    "checkpoint_id": cid,
-                    "step": step,
-                    "state_hash": state_hash,
-                    "node": node_name,
-                    "created_at": created_at,
-                }
+            checkpoint_items[cid] = {
+                "checkpoint_id": cid,
+                "checkpoint_ns": ns,
+                "step": step,
+                "state_hash": state_hash,
+                "node": node_name,
+                "created_at": created_at,
+            }
+            by_namespace[ns].append(cid)
+
+        # 2. Query NEXT edges within thread_id
+        edges_cypher = (
+            "MATCH (p:Checkpoint {thread_id: $thread_id})-[r:NEXT]->(c:Checkpoint {thread_id: $thread_id}) "
+            "RETURN p.checkpoint_id AS parent_id, c.checkpoint_id AS child_id"
+        )
+        edge_records = self._saver.proxy.execute_read(edges_cypher, {"thread_id": thread_id})
+
+        next_children: dict[str, list[str]] = collections.defaultdict(list)
+        has_incoming_next: set[str] = set()
+        for edge in edge_records:
+            pid = str(edge["parent_id"])
+            cid = str(edge["child_id"])
+            if pid in checkpoint_items and cid in checkpoint_items:
+                if checkpoint_items[pid]["checkpoint_ns"] == checkpoint_items[cid]["checkpoint_ns"]:
+                    next_children[pid].append(cid)
+                    has_incoming_next.add(cid)
+
+        for pid in next_children:
+            next_children[pid].sort(
+                key=lambda x: (
+                    checkpoint_items[x]["step"],
+                    checkpoint_items[x]["created_at"],
+                    x,
+                )
             )
 
-        # 1. Detect cycles in node execution sequence
-        node_cycles = _detect_sequence_cycles(
-            items,
-            key_fn=lambda it: it["node"],
-            threshold=threshold,
+        # 3. Order namespaces chronologically by earliest step/created_at
+        sorted_namespaces = sorted(
+            by_namespace.keys(),
+            key=lambda n: (
+                min(
+                    (checkpoint_items[c]["step"], checkpoint_items[c]["created_at"])
+                    for c in by_namespace[n]
+                ),
+                n,
+            ),
         )
 
-        covered_ranges: set[tuple[int, int]] = set()
+        seen_reports: set[tuple[tuple[str, ...], int, tuple[str, str]]] = set()
         reports: list[LoopReport] = []
 
-        for start_idx, end_idx, k, cycle_nodes in node_cycles:
-            covered_ranges.add((start_idx, end_idx))
-            reports.append(
-                LoopReport(
-                    thread_id=thread_id,
-                    cycle_nodes=cycle_nodes,
-                    occurrence_count=k,
-                    checkpoint_id_range=(
-                        items[start_idx]["checkpoint_id"],
-                        items[end_idx]["checkpoint_id"],
+        # 4. Walk NEXT relationships per namespace from roots to leaves
+        for ns in sorted_namespaces:
+            ns_cids = by_namespace[ns]
+            roots = [cid for cid in ns_cids if cid not in has_incoming_next]
+            if not roots:
+                # Cycle fallback
+                fallback_root = min(
+                    ns_cids,
+                    key=lambda x: (
+                        checkpoint_items[x]["step"],
+                        checkpoint_items[x]["created_at"],
+                        x,
                     ),
                 )
-            )
-
-        # 2. Detect cycles in state_hash sequence (for state oscillation where node names may be static)
-        hash_cycles = _detect_sequence_cycles(
-            items,
-            key_fn=lambda it: it["state_hash"],
-            threshold=threshold,
-        )
-
-        for start_idx, end_idx, k, cycle_nodes in hash_cycles:
-            # Avoid duplicate reporting if already covered by node cycles
-            if any(s <= start_idx and end_idx <= e for s, e in covered_ranges):
-                continue
-            reports.append(
-                LoopReport(
-                    thread_id=thread_id,
-                    cycle_nodes=cycle_nodes,
-                    occurrence_count=k,
-                    checkpoint_id_range=(
-                        items[start_idx]["checkpoint_id"],
-                        items[end_idx]["checkpoint_id"],
-                    ),
+                roots = [fallback_root]
+            else:
+                roots.sort(
+                    key=lambda x: (
+                        checkpoint_items[x]["step"],
+                        checkpoint_items[x]["created_at"],
+                        x,
+                    )
                 )
-            )
+
+            def get_paths(start_cid: str) -> list[list[str]]:
+                paths: list[list[str]] = []
+                stack: list[list[str]] = [[start_cid]]
+                while stack:
+                    path = stack.pop()
+                    curr = path[-1]
+                    children = [c for c in next_children.get(curr, []) if c not in path]
+                    if not children:
+                        paths.append(path)
+                    else:
+                        for child in reversed(children):
+                            stack.append(path + [child])
+                return paths
+
+            for root in roots:
+                for path in get_paths(root):
+                    items = [checkpoint_items[c] for c in path]
+
+                    # Detect cycles in node execution sequence
+                    node_cycles = _detect_sequence_cycles(
+                        items,
+                        key_fn=lambda it: it["node"],
+                        threshold=threshold,
+                    )
+
+                    path_covered_ranges: set[tuple[int, int]] = set()
+                    for start_idx, end_idx, k, cycle_nodes in node_cycles:
+                        path_covered_ranges.add((start_idx, end_idx))
+                        rep_key = (
+                            tuple(cycle_nodes),
+                            k,
+                            (items[start_idx]["checkpoint_id"], items[end_idx]["checkpoint_id"]),
+                        )
+                        if rep_key not in seen_reports:
+                            seen_reports.add(rep_key)
+                            reports.append(
+                                LoopReport(
+                                    thread_id=thread_id,
+                                    cycle_nodes=cycle_nodes,
+                                    occurrence_count=k,
+                                    checkpoint_id_range=(
+                                        items[start_idx]["checkpoint_id"],
+                                        items[end_idx]["checkpoint_id"],
+                                    ),
+                                )
+                            )
+
+                    # Detect cycles in state_hash sequence
+                    hash_cycles = _detect_sequence_cycles(
+                        items,
+                        key_fn=lambda it: it["state_hash"],
+                        threshold=threshold,
+                    )
+
+                    for start_idx, end_idx, k, cycle_nodes in hash_cycles:
+                        if any(s <= start_idx and end_idx <= e for s, e in path_covered_ranges):
+                            continue
+                        rep_key = (
+                            tuple(cycle_nodes),
+                            k,
+                            (items[start_idx]["checkpoint_id"], items[end_idx]["checkpoint_id"]),
+                        )
+                        if rep_key not in seen_reports:
+                            seen_reports.add(rep_key)
+                            reports.append(
+                                LoopReport(
+                                    thread_id=thread_id,
+                                    cycle_nodes=cycle_nodes,
+                                    occurrence_count=k,
+                                    checkpoint_id_range=(
+                                        items[start_idx]["checkpoint_id"],
+                                        items[end_idx]["checkpoint_id"],
+                                    ),
+                                )
+                            )
 
         return reports
 
