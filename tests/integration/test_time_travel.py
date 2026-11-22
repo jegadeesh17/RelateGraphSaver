@@ -796,3 +796,101 @@ class TestForkToolCalls:
 
             assert graph_counts(source) == before
             assert _tool_rows(source) == tool_rows_before
+
+    def test_fork_in_memory_propagates_candidate_read_error_ac_19(
+        self, temp_disk_db: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-19: Read error querying candidates propagates directly instead of raising CheckpointNotFoundError."""
+        thread_id = "tt-candidate-read-err"
+        config: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+        with RelateSaver(db_path=temp_disk_db) as source:
+            cp = _make_checkpoint("cp-1", {"count": 1})
+            source.put(config, cp, {"step": 1, "source": "input"}, {})
+
+            orig_read = source.proxy.execute_read
+
+            def failing_read(
+                cypher: str,
+                params: dict[str, Any] | None = None,
+                timeout: float | None = None,
+            ) -> list[dict[str, Any]]:
+                if "ORDER BY c.step ASC" in cypher:
+                    raise RelateCheckpointError("Simulated candidates query read failure")
+                return orig_read(cypher, params, timeout)
+
+            monkeypatch.setattr(source.proxy, "execute_read", failing_read)
+            with pytest.raises(RelateCheckpointError, match="Simulated candidates query read failure"):
+                source.fork_in_memory(thread_id, "cp-1")
+
+    def test_fork_in_memory_propagates_writes_read_error_ac_19(
+        self, temp_disk_db: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-19: Read error querying writes propagates directly instead of being swallowed."""
+        thread_id = "tt-writes-read-err"
+        config: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+        with RelateSaver(db_path=temp_disk_db) as source:
+            cp = _make_checkpoint("cp-1", {"count": 1})
+            cfg_out = source.put(config, cp, {"step": 1, "source": "input"}, {})
+            source.put_writes(cfg_out, [("channel1", "val1")], task_id="task-1")
+
+            orig_read = source.proxy.execute_read
+
+            def failing_read(
+                cypher: str,
+                params: dict[str, Any] | None = None,
+                timeout: float | None = None,
+            ) -> list[dict[str, Any]]:
+                if "[:HAS_WRITE]->(w:Write)" in cypher:
+                    raise RelateCheckpointError("Simulated writes query read failure")
+                return orig_read(cypher, params, timeout)
+
+            monkeypatch.setattr(source.proxy, "execute_read", failing_read)
+            with pytest.raises(RelateCheckpointError, match="Simulated writes query read failure"):
+                source.fork_in_memory(thread_id, "cp-1")
+
+    def test_fork_in_memory_closes_saver_on_population_failure_ac_19(
+        self, temp_disk_db: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-19: Batch execution failure during fork population closes the in-memory saver and propagates."""
+        from langgraph_checkpoint_relate.proxy import RelateThreadProxy
+
+        thread_id = "tt-pop-fail"
+        config: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+        with RelateSaver(db_path=temp_disk_db) as source:
+            cp = _make_checkpoint("cp-1", {"count": 1})
+            source.put(config, cp, {"step": 1, "source": "input"}, {})
+
+            created_memory_savers: list[RelateSaver] = []
+            closed_savers: list[RelateSaver] = []
+            orig_saver_init = RelateSaver.__init__
+            orig_close = RelateSaver.close
+
+            def tracking_init(self: RelateSaver, *args: Any, **kwargs: Any) -> None:
+                orig_saver_init(self, *args, **kwargs)
+                if self.db_path == ":memory:":
+                    created_memory_savers.append(self)
+
+            def tracking_close(self: RelateSaver) -> None:
+                closed_savers.append(self)
+                orig_close(self)
+
+            orig_execute_batch = RelateThreadProxy.execute_batch
+
+            def failing_execute_batch(self: RelateThreadProxy, statements: Any, **kwargs: Any) -> None:
+                if getattr(self, "db_path", None) == ":memory:":
+                    raise RuntimeError("Simulated batch population failure")
+                orig_execute_batch(self, statements, **kwargs)
+
+            monkeypatch.setattr(RelateSaver, "__init__", tracking_init)
+            monkeypatch.setattr(RelateSaver, "close", tracking_close)
+            monkeypatch.setattr(RelateThreadProxy, "execute_batch", failing_execute_batch)
+
+            with pytest.raises(RuntimeError, match="Simulated batch population failure"):
+                source.fork_in_memory(thread_id, "cp-1")
+
+            assert len(created_memory_savers) == 1
+            mem_saver = created_memory_savers[0]
+            assert mem_saver in closed_savers
+            assert mem_saver.proxy._is_closed is True
+            if mem_saver.proxy._worker_thread is not None:
+                assert not mem_saver.proxy._worker_thread.is_alive()
