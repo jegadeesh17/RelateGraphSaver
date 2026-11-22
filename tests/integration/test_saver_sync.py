@@ -442,3 +442,133 @@ def test_invalid_relate_log_level_raises_value_error_ac_178(
     monkeypatch.setenv("RELATE_LOG_LEVEL", "debug")
     with RelateSaver(db_path=":memory:") as saver:
         assert saver.log_level == "DEBUG"
+
+
+def test_put_writes_regular_channel_first_write_wins_ac_180() -> None:
+    """AC-180: For regular channels, duplicate writes with the same task_id and index do not overwrite (first write wins)."""
+    with RelateSaver(db_path=":memory:") as saver:
+        thread_id = "thread-ac180-regular"
+        checkpoint_id = "cp-ac180-regular"
+        config: RunnableConfig = {
+            "configurable": {
+                "thread_id": thread_id,
+                "checkpoint_id": checkpoint_id,
+            }
+        }
+        saver.put(config, _make_checkpoint(checkpoint_id), {"step": 1}, {})
+
+        # First write to regular channel
+        saver.put_writes(config, [("channel_a", "first_value")], task_id="task-1")
+
+        # Second write with same task_id and index to same channel
+        saver.put_writes(config, [("channel_a", "second_value")], task_id="task-1")
+
+        tup = saver.get_tuple(config)
+        assert tup is not None
+        assert tup.pending_writes is not None
+        assert len(tup.pending_writes) == 1
+        task_id, channel, val = tup.pending_writes[0]
+        assert task_id == "task-1"
+        assert channel == "channel_a"
+        assert val == "first_value"
+
+
+def test_put_writes_special_channel_overwrites_earlier_value_ac_180() -> None:
+    """AC-180: For special channels (WRITES_IDX_MAP), subsequent writes overwrite earlier values."""
+    with RelateSaver(db_path=":memory:") as saver:
+        thread_id = "thread-ac180-special"
+        checkpoint_id = "cp-ac180-special"
+        config: RunnableConfig = {
+            "configurable": {
+                "thread_id": thread_id,
+                "checkpoint_id": checkpoint_id,
+            }
+        }
+        saver.put(config, _make_checkpoint(checkpoint_id), {"step": 1}, {})
+
+        # Initial write to special channels
+        saver.put_writes(
+            config,
+            [
+                ("__error__", "initial_error"),
+                ("__interrupt__", {"status": "paused_1"}),
+            ],
+            task_id="task-special",
+        )
+
+        # Overwrite with subsequent writes on the same special channels
+        saver.put_writes(
+            config,
+            [
+                ("__error__", "updated_error"),
+                ("__interrupt__", {"status": "paused_2"}),
+            ],
+            task_id="task-special",
+        )
+
+        tup = saver.get_tuple(config)
+        assert tup is not None
+        assert tup.pending_writes is not None
+        assert len(tup.pending_writes) == 2
+        writes_dict = {ch: val for _, ch, val in tup.pending_writes}
+        assert writes_dict["__error__"] == "updated_error"
+        assert writes_dict["__interrupt__"] == {"status": "paused_2"}
+
+
+def test_checkpoint_tuple_pending_writes_ordered_by_task_id_then_idx_ac_180() -> None:
+    """AC-180: CheckpointTuple pending_writes are ordered deterministically by w.task_id, then w.idx."""
+    with RelateSaver(db_path=":memory:") as saver:
+        thread_id = "thread-ac180-order"
+        checkpoint_id = "cp-ac180-order"
+        config: RunnableConfig = {
+            "configurable": {
+                "thread_id": thread_id,
+                "checkpoint_id": checkpoint_id,
+            }
+        }
+        saver.put(config, _make_checkpoint(checkpoint_id), {"step": 1}, {})
+
+        # Insert writes out of task_id and idx order
+        # task_z: idx 0 (ch_z), idx -1 (__error__)
+        saver.put_writes(
+            config,
+            [("ch_z", "val_z"), ("__error__", "err_z")],
+            task_id="task-z",
+        )
+        # task_m: idx 0 (ch_m)
+        saver.put_writes(
+            config,
+            [("ch_m", "val_m")],
+            task_id="task-m",
+        )
+        # task_a: idx 0 (ch_a1), idx 1 (ch_a2), idx -3 (__interrupt__)
+        saver.put_writes(
+            config,
+            [("ch_a1", "val_a1"), ("ch_a2", "val_a2"), ("__interrupt__", "int_a")],
+            task_id="task-a",
+        )
+
+        tup = saver.get_tuple(config)
+        assert tup is not None
+        assert tup.pending_writes is not None
+
+        # Expected order:
+        # task-a:
+        #   idx -3: __interrupt__
+        #   idx 0:  ch_a1
+        #   idx 1:  ch_a2
+        # task-m:
+        #   idx 0:  ch_m
+        # task-z:
+        #   idx -1: __error__
+        #   idx 0:  ch_z
+        expected = [
+            ("task-a", "__interrupt__", "int_a"),
+            ("task-a", "ch_a1", "val_a1"),
+            ("task-a", "ch_a2", "val_a2"),
+            ("task-m", "ch_m", "val_m"),
+            ("task-z", "__error__", "err_z"),
+            ("task-z", "ch_z", "val_z"),
+        ]
+        assert tup.pending_writes == expected
+

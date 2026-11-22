@@ -495,9 +495,10 @@ class RelateSaver(BaseCheckpointSaver[str]):
             write_idx = WRITES_IDX_MAP.get(channel, idx)
             write_blob = self.serde.dumps(value)
             write_id = f"{thread_id}:{checkpoint_ns}:{checkpoint_id_str}:{task_id_str}:{write_idx}"
+            set_clause = "SET" if channel in WRITES_IDX_MAP else "ON CREATE SET"
             stmt = (
-                "MERGE (w:Write {write_id: $write_id}) "
-                "SET w.thread_id = $thread_id, "
+                f"MERGE (w:Write {{write_id: $write_id}}) "
+                f"{set_clause} w.thread_id = $thread_id, "
                 "    w.checkpoint_ns = $checkpoint_ns, "
                 "    w.checkpoint_id = $checkpoint_id, "
                 "    w.task_id = $task_id, "
@@ -670,7 +671,7 @@ class RelateSaver(BaseCheckpointSaver[str]):
             "       w.channel AS channel, "
             "       w.write_blob AS write_blob, "
             "       w.idx AS idx "
-            "ORDER BY w.idx ASC"
+            "ORDER BY w.task_id, w.idx"
         )
         writes_params = {
             "thread_id": thread_id,
