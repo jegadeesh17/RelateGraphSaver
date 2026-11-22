@@ -454,12 +454,12 @@ class RelateSaver(BaseCheckpointSaver[str]):
 
         checkpoint_id = get_checkpoint_id(config)
         checkpoint_ns_raw = configurable.get("checkpoint_ns")
-        checkpoint_ns = str(checkpoint_ns_raw) if checkpoint_ns_raw is not None else None
+        checkpoint_ns = str(checkpoint_ns_raw) if checkpoint_ns_raw is not None else ""
 
         if checkpoint_id:
             query = (
                 "MATCH (c:Checkpoint {thread_id: $thread_id, checkpoint_id: $checkpoint_id}) "
-                "WHERE ($checkpoint_ns IS NULL OR c.checkpoint_ns = $checkpoint_ns) "
+                "WHERE c.checkpoint_ns = $checkpoint_ns "
                 "RETURN c.checkpoint_id AS checkpoint_id, "
                 "       c.thread_id AS thread_id, "
                 "       c.checkpoint_ns AS checkpoint_ns, "
@@ -479,7 +479,7 @@ class RelateSaver(BaseCheckpointSaver[str]):
         else:
             query = (
                 "MATCH (c:Checkpoint {thread_id: $thread_id}) "
-                "WHERE ($checkpoint_ns IS NULL OR c.checkpoint_ns = $checkpoint_ns) "
+                "WHERE c.checkpoint_ns = $checkpoint_ns "
                 "RETURN c.checkpoint_id AS checkpoint_id, "
                 "       c.thread_id AS thread_id, "
                 "       c.checkpoint_ns AS checkpoint_ns, "
