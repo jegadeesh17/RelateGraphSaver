@@ -208,11 +208,15 @@ class RelateThreadProxy:
                 logger.debug("Callable work item raised exception: %s", call_exc)
             return
         if isinstance(item, DbCommand):
+            if item.future.cancelled():
+                return
             if item.is_write and self.read_only:
                 item.future.set_exception(self._read_only_error())
                 return
             self._handle_db_command(item)
         elif isinstance(item, BatchCommand):
+            if item.future.cancelled():
+                return
             if self.read_only:
                 item.future.set_exception(self._read_only_error())
                 return
@@ -245,6 +249,8 @@ class RelateThreadProxy:
 
     def _handle_db_command(self, cmd: DbCommand) -> None:
         """Execute a single Cypher command."""
+        if cmd.future.cancelled():
+            return
         try:
             if cmd.is_write:
                 with self._writer_lock:
@@ -268,18 +274,22 @@ class RelateThreadProxy:
                 )
                 records = cur.fetchall() if hasattr(cur, "fetchall") else []
 
-            formatted = _format_records(records)
-            cmd.future.set_result(formatted)
+            if not cmd.future.cancelled():
+                formatted = _format_records(records)
+                cmd.future.set_result(formatted)
         except Exception as exc:
             if hasattr(self._conn, "rollback"):
                 try:
                     self._conn.rollback()
                 except Exception:
                     pass
-            cmd.future.set_exception(_wrap_exception(exc))
+            if not cmd.future.cancelled():
+                cmd.future.set_exception(_wrap_exception(exc))
 
     def _handle_batch_command(self, cmd: BatchCommand) -> None:
         """Execute a batch of Cypher commands atomically."""
+        if cmd.future.cancelled():
+            return
         try:
             with self._writer_lock:
                 prev_autocommit = getattr(self._conn, "autocommit", True)
@@ -312,9 +322,11 @@ class RelateThreadProxy:
                     if hasattr(self._conn, "autocommit"):
                         self._conn.autocommit = prev_autocommit
 
-            cmd.future.set_result(results)
+            if not cmd.future.cancelled():
+                cmd.future.set_result(results)
         except Exception as exc:
-            cmd.future.set_exception(_wrap_exception(exc))
+            if not cmd.future.cancelled():
+                cmd.future.set_exception(_wrap_exception(exc))
 
     def _handle_tuple_command(self, item: tuple[Any, Any, Any, Any]) -> None:
         """Handle legacy/internal (query, params, event, result_holder) protocol."""
@@ -505,9 +517,12 @@ class RelateThreadProxy:
         try:
             return fut.result(timeout=effective_timeout)
         except (TimeoutError, concurrent.futures.TimeoutError) as to_exc:
+            fut.cancel()
             raise RelateConcurrencyError(
                 f"Query timed out after {effective_timeout}s: {cypher[:60]}"
             ) from to_exc
+
+    _execute_internal = _dispatch_execute
 
     def execute_batch(
         self,
@@ -556,6 +571,7 @@ class RelateThreadProxy:
         try:
             return fut.result(timeout=effective_timeout)
         except (TimeoutError, concurrent.futures.TimeoutError) as to_exc:
+            fut.cancel()
             raise RelateConcurrencyError(
                 f"Batch transaction timed out after {effective_timeout}s ({len(statements)} statements)"
             ) from to_exc
@@ -588,19 +604,24 @@ class RelateThreadProxy:
         fut: concurrent.futures.Future[None] = concurrent.futures.Future()
 
         def do_flush() -> None:
+            if fut.cancelled():
+                return
             try:
                 with self._writer_lock:
                     if self._conn is not None and hasattr(self._conn, "flush"):
                         self._conn.flush()
-                fut.set_result(None)
+                if not fut.cancelled():
+                    fut.set_result(None)
             except Exception as exc:
-                fut.set_exception(_wrap_exception(exc))
+                if not fut.cancelled():
+                    fut.set_exception(_wrap_exception(exc))
 
         self._queue.put(do_flush)
         effective_timeout = timeout if timeout is not None else self.default_timeout
         try:
             fut.result(timeout=effective_timeout)
         except (TimeoutError, concurrent.futures.TimeoutError) as to_exc:
+            fut.cancel()
             raise RelateConcurrencyError(f"Flush timed out after {effective_timeout}s") from to_exc
 
     def abort(self, timeout: float | None = 2.0) -> None:

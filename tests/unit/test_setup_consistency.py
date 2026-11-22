@@ -264,7 +264,7 @@ def test_readme_benchmark_supports_the_why_not_x_sqlite_claim_ac_146() -> None:
 
 def test_sqlite_row_tables_match_the_installed_checkpointer_ac_146() -> None:
     """AC-146: the SqliteSaver row names the two tables the installed langgraph-checkpoint-sqlite creates."""
-    from langgraph.checkpoint.sqlite import SqliteSaver
+    from langgraph.checkpoint.sqlite import SqliteSaver  # type: ignore[import-not-found]
 
     connection = sqlite3.connect(":memory:")
     try:
