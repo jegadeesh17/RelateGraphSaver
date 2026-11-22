@@ -1358,3 +1358,198 @@ class TestFailureSummary:
                 # Unknown thread raises CheckpointNotFoundError for trace_root_cause
                 with pytest.raises(CheckpointNotFoundError):
                     forensics.trace_root_cause("nonexistent-thread-id")
+
+
+class TestPoisonDetection:
+    """Poison pill detection matching channel names exclusively (AC-183, ADR-0029)."""
+
+    @pytest.mark.parametrize(
+        "value_text",
+        ["default value", "fault diagnosis", "a default fallback with fault logging"],
+    )
+    def test_ac183_non_poison_channel_with_fault_substring_not_flagged_as_poison(
+        self, temp_disk_db: str, value_text: str
+    ) -> None:
+        """AC-183: Substring matches for 'poison' and 'fault' in serialized write values are not performed.
+
+        A non-poison channel with 'default value' or 'fault diagnosis' is not flagged as
+        a poison root cause, allowing upstream tool calls to be properly identified as root cause.
+        """
+        thread_id = f"thread-ac183-clean-{abs(hash(value_text))}"
+        with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
+            # Step 1: Antecedent write on a benign channel containing "default value" or "fault diagnosis"
+            cid1 = "cp-ac183-clean-1"
+            cfg1: RunnableConfig = {
+                "configurable": {"thread_id": thread_id, "checkpoint_id": cid1}
+            }
+            cp1: Any = dict(empty_checkpoint())
+            cp1["id"] = cid1
+            saver.put(cfg1, cp1, {"step": 1, "node": "config_loader"}, {})  # type: ignore[typeddict-unknown-key]
+            saver.put_writes(
+                cfg1,
+                [("config", value_text)],
+                task_id="task-config",
+            )
+
+            # Step 2: Intermediate step with an upstream tool invocation (no explicit error)
+            cid2 = "cp-ac183-clean-2"
+            cfg2: RunnableConfig = {
+                "configurable": {"thread_id": thread_id, "checkpoint_id": cid2}
+            }
+            cp2: Any = dict(empty_checkpoint())
+            cp2["id"] = cid2
+            cp2["parent_checkpoint_id"] = cid1
+            saver.put(cfg2, cp2, {"step": 2, "node": "tool_runner"}, {})  # type: ignore[typeddict-unknown-key]
+
+            saver.proxy.execute_write(
+                "CREATE (tc:ToolCall {call_id: $call_id, tool_name: $name, args_blob: $args, created_at: $created_at}) "
+                "WITH tc "
+                "MATCH (c:Checkpoint {checkpoint_id: $cid}) "
+                "MERGE (c)-[:INVOKED]->(tc)",
+                {
+                    "call_id": "call-upstream-tool-ac183",
+                    "name": "upstream_tool",
+                    "args": b"{}",
+                    "created_at": "2026-11-22T00:00:00Z",
+                    "cid": cid2,
+                },
+            )
+
+            # Step 3: Failure checkpoint where error is recorded
+            cid3 = "cp-ac183-clean-3"
+            cfg3: RunnableConfig = {
+                "configurable": {"thread_id": thread_id, "checkpoint_id": cid3}
+            }
+            cp3: Any = dict(empty_checkpoint())
+            cp3["id"] = cid3
+            cp3["parent_checkpoint_id"] = cid2
+            saver.put(cfg3, cp3, {"step": 3, "node": "failing_step"}, {})  # type: ignore[typeddict-unknown-key]
+            saver.put_writes(
+                cfg3,
+                [("__error__", "Failure occurred downstream")],
+                task_id="task-err",
+            )
+
+            with RelateForensics(saver) as forensics:
+                report = forensics.trace_root_cause(thread_id)
+
+            # AC-183: The write with 'default value' or 'fault diagnosis' is NOT flagged as poison.
+            # Instead, Priority 3 upstream tool invocation is correctly identified.
+            assert report.root_tool_call_id == "call-upstream-tool-ac183"
+            assert report.root_tool_name == "upstream_tool"
+            assert report.root_channel_write is None
+
+    @pytest.mark.parametrize(
+        "channel_name",
+        ["poison", "poison_channel", "sys_poison_input", "POISON"],
+    )
+    def test_ac183_poison_channel_name_flagged_as_poison_root_cause(
+        self, temp_disk_db: str, channel_name: str
+    ) -> None:
+        """AC-183: Poison checks match exclusively against the channel name (case-insensitively).
+
+        A write on a channel named 'poison' (or containing 'poison') is flagged as
+        a poison root cause (Priority 2), taking precedence over upstream tool invocations.
+        """
+        thread_id = f"thread-ac183-poison-{abs(hash(channel_name))}"
+        with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
+            # Step 1: Write on a channel whose name contains "poison"
+            cid1 = "cp-ac183-p-1"
+            cfg1: RunnableConfig = {
+                "configurable": {"thread_id": thread_id, "checkpoint_id": cid1}
+            }
+            cp1: Any = dict(empty_checkpoint())
+            cp1["id"] = cid1
+            saver.put(cfg1, cp1, {"step": 1, "node": "injector"}, {})  # type: ignore[typeddict-unknown-key]
+            saver.put_writes(
+                cfg1,
+                [(channel_name, "arbitrary benign content")],
+                task_id="task-poison",
+            )
+
+            # Step 2: Intermediate step with an upstream tool invocation (no explicit error)
+            cid2 = "cp-ac183-p-2"
+            cfg2: RunnableConfig = {
+                "configurable": {"thread_id": thread_id, "checkpoint_id": cid2}
+            }
+            cp2: Any = dict(empty_checkpoint())
+            cp2["id"] = cid2
+            cp2["parent_checkpoint_id"] = cid1
+            saver.put(cfg2, cp2, {"step": 2, "node": "tool_runner"}, {})  # type: ignore[typeddict-unknown-key]
+
+            saver.proxy.execute_write(
+                "CREATE (tc:ToolCall {call_id: $call_id, tool_name: $name, args_blob: $args, created_at: $created_at}) "
+                "WITH tc "
+                "MATCH (c:Checkpoint {checkpoint_id: $cid}) "
+                "MERGE (c)-[:INVOKED]->(tc)",
+                {
+                    "call_id": "call-upstream-tool-poison-test",
+                    "name": "upstream_tool",
+                    "args": b"{}",
+                    "created_at": "2026-11-22T00:00:00Z",
+                    "cid": cid2,
+                },
+            )
+
+            # Step 3: Failure checkpoint
+            cid3 = "cp-ac183-p-3"
+            cfg3: RunnableConfig = {
+                "configurable": {"thread_id": thread_id, "checkpoint_id": cid3}
+            }
+            cp3: Any = dict(empty_checkpoint())
+            cp3["id"] = cid3
+            cp3["parent_checkpoint_id"] = cid2
+            saver.put(cfg3, cp3, {"step": 3, "node": "failing_step"}, {})  # type: ignore[typeddict-unknown-key]
+            saver.put_writes(
+                cfg3,
+                [("__error__", "Failure occurred downstream")],
+                task_id="task-err",
+            )
+
+            with RelateForensics(saver) as forensics:
+                report = forensics.trace_root_cause(thread_id)
+
+            # AC-183: The channel whose name contains 'poison' IS flagged as poison root cause (Priority 2),
+            # preempting the Priority 3 upstream tool call.
+            assert report.root_channel_write is not None
+            assert report.root_tool_call_id is None
+            assert report.causal_path_length == 2
+
+    def test_ac183_empty_or_whitespace_channel_not_flagged(
+        self, temp_disk_db: str
+    ) -> None:
+        """AC-183: Empty or whitespace channel names are safely handled and not flagged as poison."""
+        thread_id = "thread-ac183-empty-chan"
+        with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
+            cid1 = "cp-ac183-empty-1"
+            cfg1: RunnableConfig = {
+                "configurable": {"thread_id": thread_id, "checkpoint_id": cid1}
+            }
+            cp1: Any = dict(empty_checkpoint())
+            cp1["id"] = cid1
+            saver.put(cfg1, cp1, {"step": 1, "node": "step1"}, {})  # type: ignore[typeddict-unknown-key]
+            saver.put_writes(
+                cfg1,
+                [("", "empty channel text"), ("   ", "whitespace channel text")],
+                task_id="task-empty",
+            )
+
+            cid2 = "cp-ac183-empty-2"
+            cfg2: RunnableConfig = {
+                "configurable": {"thread_id": thread_id, "checkpoint_id": cid2}
+            }
+            cp2: Any = dict(empty_checkpoint())
+            cp2["id"] = cid2
+            cp2["parent_checkpoint_id"] = cid1
+            saver.put(cfg2, cp2, {"step": 2, "node": "step2"}, {})  # type: ignore[typeddict-unknown-key]
+            saver.put_writes(
+                cfg2,
+                [("__error__", "Crash at step 2")],
+                task_id="task-err",
+            )
+
+            with RelateForensics(saver) as forensics:
+                report = forensics.trace_root_cause(thread_id)
+
+            assert report.thread_id == thread_id
+            assert report.error_checkpoint_id == cid2

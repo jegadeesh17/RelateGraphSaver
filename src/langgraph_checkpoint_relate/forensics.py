@@ -1031,21 +1031,12 @@ class RelateForensics:
                 causal_path_length = int(r.get("distance_to_error", 0))
                 break
 
-        # Priority 2: Write with poison or error indicator (non-__error__)
+        # Priority 2: Write with poison indicator on channel name (non-__error__) (AC-183, ADR-0029)
         if not root_channel_write and not root_tool_call_id:
             for r in causal_rows:
                 channel = str(r.get("channel", ""))
                 if channel and channel != "__error__":
-                    # Check write_blob for poison indicators
                     is_poison = "poison" in channel.lower()
-                    if not is_poison and r.get("write_blob"):
-                        try:
-                            val = self._saver.serde.loads(_extract_bytes(r["write_blob"]))
-                            val_str = str(val).lower()
-                            if "poison" in val_str or "fault" in val_str:
-                                is_poison = True
-                        except Exception:
-                            pass
                     if is_poison:
                         root_channel_write = str(r["write_id"])
                         root_tool_call_id = (
