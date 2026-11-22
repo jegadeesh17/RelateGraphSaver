@@ -42,6 +42,7 @@ from langgraph_checkpoint_relate.models import (
     ToolCallChange,
     ToolCallRecord,
 )
+from langgraph_checkpoint_relate.saver import _extract_bytes
 from langgraph_checkpoint_relate.time_travel import TimeTravelEngine
 from langgraph_checkpoint_relate.tool_calls import _error_text, extract_tool_events
 
@@ -532,20 +533,58 @@ def _edited_messages(
     return edited
 
 
+def _is_input_checkpoint(source_saver: RelateSaver, metadata_blob: Any) -> bool:
+    metadata = source_saver.serde.loads(_extract_bytes(metadata_blob))
+    return isinstance(metadata, dict) and metadata.get("source") == "input"
+
+
 def _recorded_leaf(source_saver: RelateSaver, thread_id: str, fork_id: str) -> str:
-    rows = source_saver.proxy.execute_read(
+    """Return the latest leaf of the invoke run that contains ``fork_id`` (AC-107, AC-186).
+
+    Traversal follows ``[:NEXT]`` below the fork but halts before any later checkpoint whose
+    metadata source is ``"input"``: that checkpoint starts a subsequent invoke on the thread.
+    """
+    nodes = source_saver.proxy.execute_read(
         "MATCH (f:Checkpoint {thread_id: $thread_id, checkpoint_id: $fork_id})"
         "-[:NEXT*0..]->(c:Checkpoint) "
-        "OPTIONAL MATCH (c)-[n:NEXT]->(:Checkpoint) "
-        "WITH c, count(n) AS outgoing "
-        "WHERE outgoing = 0 "
-        "RETURN c.checkpoint_id AS checkpoint_id, c.created_at AS created_at, c.step AS step "
-        "ORDER BY c.created_at DESC, c.step DESC LIMIT 1",
+        "RETURN c.checkpoint_id AS checkpoint_id, c.created_at AS created_at, c.step AS step, "
+        "c.metadata_blob AS metadata_blob",
         {"thread_id": thread_id, "fork_id": fork_id},
     )
-    if not rows:
+    edges = source_saver.proxy.execute_read(
+        "MATCH (f:Checkpoint {thread_id: $thread_id, checkpoint_id: $fork_id})"
+        "-[:NEXT*0..]->(p:Checkpoint)-[:NEXT]->(c:Checkpoint) "
+        "RETURN p.checkpoint_id AS parent_id, c.checkpoint_id AS child_id",
+        {"thread_id": thread_id, "fork_id": fork_id},
+    )
+    if not nodes:
         return fork_id
-    return str(rows[0]["checkpoint_id"])
+    by_id = {str(row["checkpoint_id"]): row for row in nodes}
+    children: dict[str, set[str]] = {}
+    for edge in edges:
+        children.setdefault(str(edge["parent_id"]), set()).add(str(edge["child_id"]))
+    halted = {
+        checkpoint_id
+        for checkpoint_id, row in by_id.items()
+        if checkpoint_id != fork_id and _is_input_checkpoint(source_saver, row["metadata_blob"])
+    }
+    reachable: set[str] = set()
+    pending = [fork_id]
+    while pending:
+        current = pending.pop()
+        if current in reachable or current in halted or current not in by_id:
+            continue
+        reachable.add(current)
+        pending.extend(children.get(current, ()))
+    leaves = [
+        by_id[checkpoint_id]
+        for checkpoint_id in reachable
+        if not (children.get(checkpoint_id, set()) & reachable)
+    ]
+    if not leaves:
+        return fork_id
+    leaves.sort(key=lambda row: (str(row["created_at"]), int(row["step"] or 0)), reverse=True)
+    return str(leaves[0]["checkpoint_id"])
 
 
 def replay_from_checkpoint(

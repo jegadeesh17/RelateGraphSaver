@@ -804,6 +804,62 @@ def test_ac154_replay_without_edits_re_executes_the_fork_step() -> None:
         source.close()
 
 
+def _two_invoke_thread(source: RelateSaver, thread_id: str) -> list[Any]:
+    """Run two invokes on one thread and return the history oldest first."""
+    graph = _fork_step_graph(source)
+    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+    graph.invoke({"value": 1}, config)
+    graph.invoke({"value": 5}, config)
+    return list(reversed(list(graph.get_state_history(config))))
+
+
+def test_ac186_recorded_leaf_halts_before_the_next_invoke_input_checkpoint() -> None:
+    source = RelateSaver(":memory:")
+    try:
+        history = _two_invoke_thread(source, "two-invokes")
+        ids = [str(snap.config["configurable"]["checkpoint_id"]) for snap in history]
+        sources = [(snap.metadata or {}).get("source") for snap in history]
+        input_positions = [i for i, kind in enumerate(sources) if kind == "input"]
+        assert len(input_positions) == 2
+        second_input = input_positions[1]
+        first_invoke_leaf = ids[second_input - 1]
+        second_invoke_leaf = ids[-1]
+
+        # Fork inside the first invoke, and at its own input checkpoint.
+        for fork in (ids[input_positions[0]], ids[input_positions[0] + 1]):
+            assert replay_module._recorded_leaf(source, "two-invokes", fork) == first_invoke_leaf
+        # Forking at the second invoke's input checkpoint targets only that invoke.
+        assert (
+            replay_module._recorded_leaf(source, "two-invokes", ids[second_input])
+            == second_invoke_leaf
+        )
+        # An unknown fork id falls back to itself.
+        assert replay_module._recorded_leaf(source, "two-invokes", "missing") == "missing"
+    finally:
+        source.close()
+
+
+def test_ac186_replay_in_a_multi_invoke_thread_diffs_only_the_forked_invoke() -> None:
+    source = RelateSaver(":memory:")
+    try:
+        history = _two_invoke_thread(source, "two-invokes-replay")
+        ids = [str(snap.config["configurable"]["checkpoint_id"]) for snap in history]
+        sources = [(snap.metadata or {}).get("source") for snap in history]
+        second_input = [i for i, kind in enumerate(sources) if kind == "input"][1]
+        fork = next(
+            str(snap.config["configurable"]["checkpoint_id"])
+            for snap in history[:second_input]
+            if snap.next == ("second",)
+        )
+
+        result = replay_from_checkpoint(source, "two-invokes-replay", fork, _fork_step_graph)
+
+        assert result.recorded_checkpoint_id == ids[second_input - 1]
+        assert result.diff.is_empty
+    finally:
+        source.close()
+
+
 class _PlainMessagesState(TypedDict):
     messages: list[Any]
 
