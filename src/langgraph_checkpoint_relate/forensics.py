@@ -346,17 +346,14 @@ class RelateForensics:
 
             # If node_name is not yet resolved, inspect task_paths from writes
             if not node_name:
-                task_paths = r.get("task_paths") or []
-                cand_task_nodes: list[str] = []
-                for tp in task_paths:
-                    if tp:
-                        parts = [p.strip() for p in str(tp).split(",") if p.strip()]
-                        if parts:
-                            cand = parts[-1]
-                            if cand and cand != "loop":
-                                cand_task_nodes.append(cand)
+                cand_task_nodes = sorted(
+                    {
+                        name
+                        for name in (_node_from_task_path(tp) for tp in r.get("task_paths") or [])
+                        if name
+                    }
+                )
                 if cand_task_nodes:
-                    cand_task_nodes.sort()
                     node_name = cand_task_nodes[0]
 
             # If still not resolved, inspect channels from writes

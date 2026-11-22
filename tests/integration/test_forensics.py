@@ -471,6 +471,63 @@ class TestRelateForensics:
             assert report.occurrence_count == 2
             assert report.checkpoint_id_range == ("cp-sub-1", "cp-sub-4")
 
+    @staticmethod
+    def _put_pathed_chain(
+        saver: RelateSaver, thread_id: str, task_paths_per_step: list[list[str]]
+    ) -> None:
+        """Store a linear chain whose metadata names no node; only write task paths do."""
+        prev_cid: str | None = None
+        for idx, task_paths in enumerate(task_paths_per_step):
+            cid = f"cp-tp-{idx}"
+            cfg: RunnableConfig = {
+                "configurable": {"thread_id": thread_id, "checkpoint_ns": "", "checkpoint_id": cid}
+            }
+            cp: Any = dict(empty_checkpoint())
+            cp["id"] = cid
+            cp["channel_values"] = {"counter": idx}
+            if prev_cid:
+                cp["parent_checkpoint_id"] = prev_cid
+            saver.put(cfg, cp, {"step": idx}, {})
+            for n, task_path in enumerate(task_paths):
+                saver.put_writes(cfg, [("out", idx)], f"task-{idx}-{n}", task_path)
+            prev_cid = cid
+
+    def test_detect_loops_non_pull_task_path_is_not_a_node_ac_182(self, temp_disk_db: str) -> None:
+        """AC-182: Verify push-style task paths do not masquerade as node names.
+
+        A trailing path segment such as the push index ``0`` is not a node name, so
+        four distinct checkpoints must not be reported as a repeating ``["0"]`` loop.
+        """
+        thread_id = "thread-push-task-path"
+        with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
+            self._put_pathed_chain(saver, thread_id, [["~__pregel_push,0"]] * 4)
+            assert saver.detect_loops(thread_id, threshold=2) == []
+
+    def test_detect_loops_pull_task_path_names_node_ac_182(self, temp_disk_db: str) -> None:
+        """AC-182: Verify pull-style task paths still resolve the executing node."""
+        thread_id = "thread-pull-task-path"
+        sequence = ["planner", "worker", "planner", "worker"]
+        with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
+            self._put_pathed_chain(saver, thread_id, [[f"~__pregel_pull,{n}"] for n in sequence])
+            reports = saver.detect_loops(thread_id, threshold=2)
+        assert len(reports) == 1
+        assert reports[0].cycle_nodes == ["planner", "worker"]
+        assert reports[0].occurrence_count == 2
+
+    def test_detect_loops_candidate_node_names_sorted_ac_182(self, temp_disk_db: str) -> None:
+        """AC-182: Verify the alphabetically first candidate is chosen whatever the write order."""
+        thread_id = "thread-sorted-candidates"
+        steps = [
+            ["~__pregel_pull,zeta", "~__pregel_pull,alpha"],
+            ["~__pregel_pull,alpha", "~__pregel_pull,zeta"],
+        ]
+        with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
+            self._put_pathed_chain(saver, thread_id, steps)
+            reports = saver.detect_loops(thread_id, threshold=2)
+        assert len(reports) == 1
+        assert reports[0].cycle_nodes == ["alpha"]
+        assert reports[0].occurrence_count == 2
+
     def test_trace_root_cause_tool_call_antecedent(self, temp_disk_db: str) -> None:
         """Verify trace_root_cause pinpoints offending tool call linked via INVOKED edge."""
         thread_id = "thread-tool-fail-001"
