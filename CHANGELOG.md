@@ -49,6 +49,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.4
 - Tool-call capture sends only new statements per saver (ADR-0011) and commits without its own flush; the store is flushed on close (ADR-0014).
 
 ### Fixed
+- `get_tuple()` defaults omitted `checkpoint_ns` to `""` matching SqliteSaver behavior, while `list()` remains unfiltered when no namespace is specified (AC-173).
+- `put()` resolves parent checkpoint IDs strictly from `config["configurable"]["checkpoint_id"]`, ignoring any misleading mappings in `metadata["parents"]` (AC-174).
+- Latest checkpoint resolution, `list()` pagination, and `before` boundaries sort reverse-chronologically by `checkpoint_id DESC` (UUIDv6) rather than step order, matching LangGraph runtime and fork semantics (AC-175, ADR-0026, amending AC-06).
+- `get_tuple()` and `list()` re-raise `RelateConnectionError` and `RelateConcurrencyError` rather than converting database or network failures to empty collections or `None` (AC-176).
+- Passing a custom `SerializerProtocol` to `RelateSaver` automatically wraps it in `RelateStateSerializer(inner_serializer=serde)` (AC-177).
+- Configuration parameters follow strict three-tier precedence: explicit constructor argument -> `RELATE_*` environment variables (`RELATE_DB_PATH`, `RELATE_WAL_ENABLED`, `RELATE_PROXY_TIMEOUT_SEC`, `RELATE_LOG_LEVEL`) -> default values (`:memory:`, `True`, `30.0`, `INFO`), raising `ValueError` on malformed inputs (AC-178, ADR-0028).
+- Calling proxy commands cancels the future on caller timeout and the actor worker skips cancelled commands without executing or committing them to the database (AC-179).
+- `put_writes()` implements first-write-wins (`ON CREATE SET`) for standard channels while preserving overwrite semantics for `WRITES_IDX_MAP` special channels, and orders writes deterministically by `w.task_id, w.idx` (AC-180).
+- `time_travel.py` propagates database read errors directly rather than converting them to `CheckpointNotFoundError` or empty writes, and closes the in-memory saver actor if batch population fails.
+- Actor proxy handles worker initialization timeouts by signalling shutdown and closing database handles, protecting lifecycle state transitions with a unified lock.
+- Concurrency and connection error classification in `proxy.py` uses word-boundary regular expressions, eliminating false-positive matches on substrings like "unlocked" or "block".
 - The replay diff compares non-message channel scalars by type and value (`0 != False`, `1 != 1.0`), preventing false matches across types, and normalizes `float('nan')` so identical NaN values produce an empty diff (AC-168, AC-169, ADR-0025).
 - `GraphFactory` is exported as a runtime type union (`Callable[..., Any] | StateGraph`) without subscripting `StateGraph` at runtime, enabling `GraphFactory | None` and `typing.get_type_hints()` without runtime errors while preserving strict type checker verification (AC-170, ADR-0025).
 - `update_state` exceptions are tagged with an internal attribute (`_relate_update_state_error`) instead of an exception note, eliminating framework clutter from user tracebacks while preserving accurate `--as-node` hint scoping (AC-172, ADR-0025).
