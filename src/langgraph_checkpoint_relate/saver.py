@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import builtins
 import logging
+import math
+import os
 import random
 import uuid
 from collections.abc import AsyncIterator, Iterable, Iterator, Sequence
@@ -48,6 +50,15 @@ from langgraph_checkpoint_relate.tool_calls import (
 
 logger = logging.getLogger(__name__)
 
+_UNSET_DB_PATH: Any = object()
+_UNSET_WAL: Any = object()
+_UNSET_TIMEOUT: Any = object()
+_UNSET_LOG_LEVEL: Any = object()
+
+_TRUTHY_STRINGS = frozenset({"1", "true", "yes", "on"})
+_FALSY_STRINGS = frozenset({"0", "false", "no", "off"})
+_VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+
 
 def _utc_now_iso() -> str:
     """Return current UTC timestamp in ISO-8601 string format."""
@@ -77,20 +88,30 @@ class RelateSaver(BaseCheckpointSaver[str]):
 
     def __init__(
         self,
-        db_path: str | RelateThreadProxy = ":memory:",
+        db_path: str | RelateThreadProxy | Any = _UNSET_DB_PATH,
         *,
-        wal_enabled: bool = True,
+        wal_enabled: bool | Any = _UNSET_WAL,
         proxy: RelateThreadProxy | None = None,
         serde: RelateStateSerializer | SerializerProtocol | None = None,
         connection_factory: Any | None = None,
         read_only: bool = False,
+        default_timeout: float | None | Any = _UNSET_TIMEOUT,
+        log_level: str | None | Any = _UNSET_LOG_LEVEL,
     ) -> None:
         """Initialize RelateSaver checkpointer.
+
+        Resolves configuration using a strict 3-tier hierarchy:
+        1. Explicit constructor argument
+        2. RELATE_* environment variable (RELATE_DB_PATH, RELATE_WAL_ENABLED,
+           RELATE_PROXY_TIMEOUT_SEC, RELATE_LOG_LEVEL)
+        3. Built-in defaults (db_path=":memory:", wal_enabled=True,
+           default_timeout=30.0, log_level="INFO")
 
         Args:
             db_path: Path to the embedded Relate database file (default: ":memory:").
                 Can also be an existing RelateThreadProxy instance.
-            wal_enabled: Whether to enable Write-Ahead Logging for file-based databases.
+            wal_enabled: Whether to enable Write-Ahead Logging for file-based databases
+                (default: True).
             proxy: Optional pre-configured RelateThreadProxy actor instance.
             serde: Optional custom serializer protocol (defaults to RelateStateSerializer).
             connection_factory: Optional custom connection factory for driver injection.
@@ -98,10 +119,112 @@ class RelateSaver(BaseCheckpointSaver[str]):
                 byte-identical: no schema setup, no flush, and writes raise
                 RelateReadOnlyError. With a passed proxy, the saver takes its
                 read-only state from that proxy.
+            default_timeout: Optional proxy operation timeout in seconds (default: 30.0).
+            log_level: Optional logging level name (default: "INFO").
 
         Raises:
             ValueError: If read_only is true with ":memory:" or with a writable proxy.
+            ValueError: If any RELATE_* environment variable contains an invalid value.
         """
+        # Validate and parse environment variables (AC-178, ADR-0028)
+        env_wal = os.environ.get("RELATE_WAL_ENABLED")
+        if env_wal is not None:
+            norm_wal = env_wal.strip().lower()
+            if norm_wal in _TRUTHY_STRINGS:
+                parsed_env_wal: bool | None = True
+            elif norm_wal in _FALSY_STRINGS:
+                parsed_env_wal = False
+            else:
+                raise ValueError(
+                    f"Invalid value for RELATE_WAL_ENABLED: {env_wal!r}. "
+                    "Must be one of: '1', 'true', 'yes', 'on', '0', 'false', 'no', 'off'."
+                )
+        else:
+            parsed_env_wal = None
+
+        env_timeout_str = os.environ.get("RELATE_PROXY_TIMEOUT_SEC")
+        parsed_env_timeout: float | None
+        if env_timeout_str is not None:
+            try:
+                parsed_val = float(env_timeout_str)
+                if parsed_val <= 0 or not math.isfinite(parsed_val):
+                    raise ValueError()
+                parsed_env_timeout = parsed_val
+            except (ValueError, TypeError):
+                raise ValueError(
+                    f"Invalid value for RELATE_PROXY_TIMEOUT_SEC: {env_timeout_str!r} "
+                    "(must be a positive float)"
+                ) from None
+        else:
+            parsed_env_timeout = None
+
+        env_log_level = os.environ.get("RELATE_LOG_LEVEL")
+        if env_log_level is not None:
+            norm_env_log_level = env_log_level.strip().upper()
+            if norm_env_log_level not in _VALID_LOG_LEVELS:
+                raise ValueError(
+                    f"Invalid value for RELATE_LOG_LEVEL: {env_log_level!r}. "
+                    "Must be one of: DEBUG, INFO, WARNING, ERROR, CRITICAL."
+                )
+            parsed_env_log_level: str | None = norm_env_log_level
+        else:
+            parsed_env_log_level = None
+
+        # Resolve db_path: explicit argument -> RELATE_DB_PATH -> ":memory:"
+        if db_path is not _UNSET_DB_PATH:
+            resolved_db_path = db_path
+        elif (env_db_path := os.environ.get("RELATE_DB_PATH")) is not None:
+            resolved_db_path = env_db_path
+        else:
+            resolved_db_path = ":memory:"
+
+        # Resolve wal_enabled: explicit argument -> RELATE_WAL_ENABLED -> True
+        if wal_enabled is not _UNSET_WAL:
+            resolved_wal = bool(wal_enabled)
+        elif parsed_env_wal is not None:
+            resolved_wal = parsed_env_wal
+        else:
+            resolved_wal = True
+
+        # Resolve timeout: explicit argument -> RELATE_PROXY_TIMEOUT_SEC -> 30.0
+        resolved_timeout: float | None
+        if default_timeout is not _UNSET_TIMEOUT:
+            if default_timeout is not None:
+                try:
+                    parsed_timeout = float(default_timeout)
+                    if parsed_timeout <= 0 or not math.isfinite(parsed_timeout):
+                        raise ValueError()
+                    resolved_timeout = parsed_timeout
+                except (ValueError, TypeError):
+                    raise ValueError(
+                        f"Invalid default_timeout: {default_timeout!r} (must be a positive float)"
+                    ) from None
+            else:
+                resolved_timeout = None
+        elif parsed_env_timeout is not None:
+            resolved_timeout = parsed_env_timeout
+        else:
+            resolved_timeout = 30.0
+
+        # Resolve log_level: explicit argument -> RELATE_LOG_LEVEL -> "INFO"
+        if log_level is not _UNSET_LOG_LEVEL and log_level is not None:
+            norm_log = str(log_level).strip().upper()
+            if norm_log not in _VALID_LOG_LEVELS:
+                raise ValueError(
+                    f"Invalid log_level: {log_level!r}. "
+                    "Must be one of: DEBUG, INFO, WARNING, ERROR, CRITICAL."
+                )
+            resolved_log_level = norm_log
+        elif parsed_env_log_level is not None:
+            resolved_log_level = parsed_env_log_level
+        else:
+            resolved_log_level = "INFO"
+
+        self.log_level = resolved_log_level
+        lvl = getattr(logging, resolved_log_level)
+        logger.setLevel(lvl)
+        logging.getLogger("langgraph_checkpoint_relate").setLevel(lvl)
+
         if serde is None:
             resolved_serde = default_serializer
         elif isinstance(serde, RelateStateSerializer):
@@ -112,12 +235,14 @@ class RelateSaver(BaseCheckpointSaver[str]):
         super().__init__(serde=resolved_serde)
         self._applied_tool_calls = AppliedToolCalls()
 
-        passed_proxy = db_path if isinstance(db_path, RelateThreadProxy) else proxy
+        passed_proxy = (
+            resolved_db_path if isinstance(resolved_db_path, RelateThreadProxy) else proxy
+        )
         if read_only:
             if passed_proxy is not None:
                 if getattr(passed_proxy, "read_only", False) is not True:
                     raise ValueError("read_only=True requires a read-only proxy")
-            elif str(db_path) == ":memory:":
+            elif str(resolved_db_path) == ":memory:":
                 raise ValueError(
                     "read_only=True requires a file path; ':memory:' has nothing to inspect"
                 )
@@ -127,13 +252,15 @@ class RelateSaver(BaseCheckpointSaver[str]):
             else read_only
         )
 
-        if isinstance(db_path, RelateThreadProxy):
-            self.proxy = db_path
-            self.db_path = db_path.db_path
+        if isinstance(resolved_db_path, RelateThreadProxy):
+            self.proxy = resolved_db_path
+            self.db_path = resolved_db_path.db_path
             self._owns_proxy = False
             self._connection_factory = connection_factory or getattr(
-                db_path, "_connection_factory", None
+                resolved_db_path, "_connection_factory", None
             )
+            self.wal_enabled = getattr(resolved_db_path, "wal_enabled", resolved_wal)
+            self.default_timeout = getattr(resolved_db_path, "default_timeout", resolved_timeout)
         elif proxy is not None:
             self.proxy = proxy
             self.db_path = proxy.db_path
@@ -141,14 +268,19 @@ class RelateSaver(BaseCheckpointSaver[str]):
             self._connection_factory = connection_factory or getattr(
                 proxy, "_connection_factory", None
             )
+            self.wal_enabled = getattr(proxy, "wal_enabled", resolved_wal)
+            self.default_timeout = getattr(proxy, "default_timeout", resolved_timeout)
         else:
-            self.db_path = str(db_path)
+            self.db_path = str(resolved_db_path)
             self._connection_factory = connection_factory
+            self.wal_enabled = resolved_wal
+            self.default_timeout = resolved_timeout
             self.proxy = RelateThreadProxy(
                 db_path=self.db_path,
-                wal_enabled=wal_enabled,
+                wal_enabled=resolved_wal,
                 connection_factory=connection_factory,
                 auto_init_schema=True,
+                default_timeout=resolved_timeout,
                 read_only=read_only,
             )
             self._owns_proxy = True

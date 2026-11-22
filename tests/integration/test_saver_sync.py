@@ -9,6 +9,7 @@ Verifies AC-173:
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, cast
 from unittest.mock import patch
 
@@ -338,3 +339,106 @@ def test_saver_retains_existing_relate_serializer_ac_177() -> None:
         assert saver.serde is existing_serde
 
 
+def test_explicit_db_path_takes_precedence_over_env_var_ac_178(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """AC-178: Explicit db_path takes precedence over RELATE_DB_PATH environment variable."""
+    env_path = str(tmp_path / "from_env.rl")
+    monkeypatch.setenv("RELATE_DB_PATH", env_path)
+
+    # Explicit :memory: overrides env var
+    with RelateSaver(db_path=":memory:") as saver:
+        assert saver.db_path == ":memory:"
+        assert saver.proxy.db_path == ":memory:"
+
+
+def test_env_var_db_path_takes_precedence_over_default_ac_178(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """AC-178: RELATE_DB_PATH takes precedence over default ':memory:' when db_path is omitted."""
+    env_path = str(tmp_path / "from_env.rl")
+    monkeypatch.setenv("RELATE_DB_PATH", env_path)
+
+    with RelateSaver() as saver:
+        assert saver.db_path == env_path
+        assert saver.proxy.db_path == env_path
+
+    # When RELATE_DB_PATH is cleared, default is :memory:
+    monkeypatch.delenv("RELATE_DB_PATH", raising=False)
+    with RelateSaver() as saver_default:
+        assert saver_default.db_path == ":memory:"
+
+
+def test_explicit_wal_enabled_takes_precedence_over_env_var_ac_178(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-178: Explicit wal_enabled argument overrides RELATE_WAL_ENABLED env var."""
+    # Env says 0 (False), explicit says True
+    monkeypatch.setenv("RELATE_WAL_ENABLED", "0")
+    with RelateSaver(db_path=":memory:", wal_enabled=True) as saver:
+        assert saver.wal_enabled is True
+        assert saver.proxy.wal_enabled is True
+
+    # Env says 1 (True), explicit says False
+    monkeypatch.setenv("RELATE_WAL_ENABLED", "1")
+    with RelateSaver(db_path=":memory:", wal_enabled=False) as saver:
+        assert saver.wal_enabled is False
+        assert saver.proxy.wal_enabled is False
+
+
+def test_relate_wal_enabled_parses_boolean_strings_properly_ac_178(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-178: RELATE_WAL_ENABLED correctly parses truthy and falsy string variations."""
+    for truthy in ("1", "true", "yes", "on", "TRUE", "Yes", "On"):
+        monkeypatch.setenv("RELATE_WAL_ENABLED", truthy)
+        with RelateSaver(db_path=":memory:") as saver:
+            assert saver.wal_enabled is True
+            assert saver.proxy.wal_enabled is True
+
+    for falsy in ("0", "false", "no", "off", "FALSE", "No", "Off"):
+        monkeypatch.setenv("RELATE_WAL_ENABLED", falsy)
+        with RelateSaver(db_path=":memory:") as saver:
+            assert saver.wal_enabled is False
+            assert saver.proxy.wal_enabled is False
+
+
+def test_invalid_relate_wal_enabled_raises_value_error_ac_178(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-178: Invalid RELATE_WAL_ENABLED raises ValueError explicitly naming the variable."""
+    for bad in ("invalid", "2", "yes_please", "", "  "):
+        monkeypatch.setenv("RELATE_WAL_ENABLED", bad)
+        with pytest.raises(ValueError, match="RELATE_WAL_ENABLED"):
+            RelateSaver(db_path=":memory:")
+
+
+def test_invalid_relate_proxy_timeout_sec_raises_value_error_ac_178(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-178: Invalid RELATE_PROXY_TIMEOUT_SEC raises ValueError explicitly naming the variable."""
+    for bad in ("abc", "0", "-5", "-0.1", "nan", "inf"):
+        monkeypatch.setenv("RELATE_PROXY_TIMEOUT_SEC", bad)
+        with pytest.raises(ValueError, match="RELATE_PROXY_TIMEOUT_SEC"):
+            RelateSaver(db_path=":memory:")
+
+    # Valid timeout parses correctly
+    monkeypatch.setenv("RELATE_PROXY_TIMEOUT_SEC", "12.5")
+    with RelateSaver(db_path=":memory:") as saver:
+        assert saver.default_timeout == 12.5
+        assert saver.proxy.default_timeout == 12.5
+
+
+def test_invalid_relate_log_level_raises_value_error_ac_178(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-178: Invalid RELATE_LOG_LEVEL raises ValueError explicitly naming the variable."""
+    for bad in ("VERBOSE", "TRACE", "warn", "not_a_level", ""):
+        monkeypatch.setenv("RELATE_LOG_LEVEL", bad)
+        with pytest.raises(ValueError, match="RELATE_LOG_LEVEL"):
+            RelateSaver(db_path=":memory:")
+
+    # Valid log level parses case-insensitively
+    monkeypatch.setenv("RELATE_LOG_LEVEL", "debug")
+    with RelateSaver(db_path=":memory:") as saver:
+        assert saver.log_level == "DEBUG"
