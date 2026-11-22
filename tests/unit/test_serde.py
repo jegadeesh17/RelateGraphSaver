@@ -12,9 +12,11 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.checkpoint.base import Checkpoint
 from langgraph.checkpoint.serde.base import SerializerProtocol
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from pydantic import BaseModel
 
 from langgraph_checkpoint_relate.errors import CheckpointSerializationError
+from langgraph_checkpoint_relate.saver import RelateSaver
 from langgraph_checkpoint_relate.serde import (
     RelateStateSerializer,
     default_serializer,
@@ -386,3 +388,37 @@ def test_convenience_aliases_and_default_instance_ac_13() -> None:
     hash_a = default_serializer.compute_state_hash(data)
     hash_b = default_serializer.state_hash(data)
     assert hash_a == hash_b
+
+
+def test_relate_state_serializer_accepts_custom_serializer_protocol_ac_177() -> None:
+    """AC-177: RelateStateSerializer accepts any conforming SerializerProtocol."""
+    inner = JsonPlusSerializer()
+    serializer = RelateStateSerializer(inner_serializer=inner)
+    assert serializer.inner_serializer is inner
+
+    payload = {"count": 42, "items": ["a", "b"]}
+    t, b = serializer.dumps_typed(payload)
+    restored = serializer.loads_typed((t, b))
+    assert restored == payload
+
+
+def test_relate_saver_auto_wraps_serializer_protocol_ac_177() -> None:
+    """AC-177: RelateSaver automatically wraps custom SerializerProtocol in RelateStateSerializer."""
+    inner = JsonPlusSerializer()
+    saver = RelateSaver(db_path=":memory:", serde=inner)
+    try:
+        assert isinstance(saver.serde, RelateStateSerializer)
+        assert saver.serde.inner_serializer is inner
+    finally:
+        saver.close()
+
+
+def test_relate_saver_keeps_relate_state_serializer_without_double_wrapping_ac_177() -> None:
+    """AC-177: Initializing RelateSaver with RelateStateSerializer does not double wrap."""
+    existing = RelateStateSerializer()
+    saver = RelateSaver(db_path=":memory:", serde=existing)
+    try:
+        assert saver.serde is existing
+    finally:
+        saver.close()
+

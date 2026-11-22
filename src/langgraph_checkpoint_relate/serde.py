@@ -34,16 +34,23 @@ class RelateStateSerializer(SerializerProtocol):
     def __init__(
         self,
         *,
-        inner_serializer: JsonPlusSerializer | None = None,
+        inner_serializer: SerializerProtocol | None = None,
         pickle_fallback: bool = False,
     ) -> None:
         """Initialize RelateStateSerializer.
 
         Args:
-            inner_serializer: Optional custom JsonPlusSerializer instance.
+            inner_serializer: Optional custom SerializerProtocol instance.
             pickle_fallback: Whether to fall back to pickle for unsupported types.
         """
-        self._serializer = inner_serializer or JsonPlusSerializer(pickle_fallback=pickle_fallback)
+        self._serializer: SerializerProtocol = (
+            inner_serializer or JsonPlusSerializer(pickle_fallback=pickle_fallback)
+        )
+
+    @property
+    def inner_serializer(self) -> SerializerProtocol:
+        """The underlying SerializerProtocol instance."""
+        return self._serializer
 
     def _find_offending_key(
         self,

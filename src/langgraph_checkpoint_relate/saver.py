@@ -102,8 +102,14 @@ class RelateSaver(BaseCheckpointSaver[str]):
         Raises:
             ValueError: If read_only is true with ":memory:" or with a writable proxy.
         """
-        self.serde: RelateStateSerializer | Any = serde or default_serializer
-        super().__init__(serde=self.serde)
+        if serde is None:
+            resolved_serde = default_serializer
+        elif isinstance(serde, RelateStateSerializer):
+            resolved_serde = serde
+        else:
+            resolved_serde = RelateStateSerializer(inner_serializer=serde)
+        self.serde: RelateStateSerializer | Any = resolved_serde
+        super().__init__(serde=resolved_serde)
         self._applied_tool_calls = AppliedToolCalls()
 
         passed_proxy = db_path if isinstance(db_path, RelateThreadProxy) else proxy

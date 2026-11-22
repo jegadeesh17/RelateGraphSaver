@@ -15,6 +15,7 @@ from unittest.mock import patch
 import pytest
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import Checkpoint, empty_checkpoint
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 from langgraph_checkpoint_relate.errors import (
     RelateCheckpointError,
@@ -22,6 +23,7 @@ from langgraph_checkpoint_relate.errors import (
     RelateConnectionError,
 )
 from langgraph_checkpoint_relate.saver import RelateSaver
+from langgraph_checkpoint_relate.serde import RelateStateSerializer
 
 
 def _make_checkpoint(checkpoint_id: str, value: str = "val") -> Checkpoint:
@@ -298,4 +300,41 @@ def test_generic_checkpoint_error_returns_none_or_empty_ac_176() -> None:
         ):
             assert saver.get_tuple(cfg) is None
             assert list(saver.list(cfg)) == []
+
+
+def test_saver_auto_wraps_serializer_protocol_and_roundtrips_state_ac_177() -> None:
+    """AC-177: RelateSaver wraps custom SerializerProtocol and preserves state across put/get_tuple."""
+    custom_serde = JsonPlusSerializer()
+    with RelateSaver(db_path=":memory:", serde=custom_serde) as saver:
+        # Verify auto-wrapping
+        assert isinstance(saver.serde, RelateStateSerializer)
+        assert saver.serde.inner_serializer is custom_serde
+
+        config: RunnableConfig = {
+            "configurable": {
+                "thread_id": "thread-serde-ac177",
+                "checkpoint_ns": "",
+            }
+        }
+        chk = _make_checkpoint("chk-serde-1", "persisted_value")
+        chk["channel_values"]["nested"] = {"sub_key": [1, 2, 3], "flag": True}
+
+        saved_config = saver.put(config, chk, {"source": "input", "step": 1}, {})
+        retrieved = saver.get_tuple(saved_config)
+
+        assert retrieved is not None
+        assert retrieved.checkpoint["id"] == "chk-serde-1"
+        assert retrieved.checkpoint["channel_values"]["data"] == "persisted_value"
+        assert retrieved.checkpoint["channel_values"]["nested"] == {
+            "sub_key": [1, 2, 3],
+            "flag": True,
+        }
+
+
+def test_saver_retains_existing_relate_serializer_ac_177() -> None:
+    """AC-177: RelateSaver initialized with existing RelateStateSerializer preserves it without wrapping."""
+    existing_serde = RelateStateSerializer()
+    with RelateSaver(db_path=":memory:", serde=existing_serde) as saver:
+        assert saver.serde is existing_serde
+
 
