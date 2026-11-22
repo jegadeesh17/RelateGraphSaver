@@ -10,10 +10,17 @@ Verifies AC-173:
 from __future__ import annotations
 
 from typing import Any, cast
+from unittest.mock import patch
 
+import pytest
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import Checkpoint, empty_checkpoint
 
+from langgraph_checkpoint_relate.errors import (
+    RelateCheckpointError,
+    RelateConcurrencyError,
+    RelateConnectionError,
+)
 from langgraph_checkpoint_relate.saver import RelateSaver
 
 
@@ -236,3 +243,59 @@ def test_list_before_pagination_by_checkpoint_id_ac_175() -> None:
         # (d) Invalid input boundary: empty string before returns all checkpoints
         res_invalid_str = list(saver.list(cfg, before="   "))
         assert len(res_invalid_str) == 4
+
+
+def test_get_tuple_reraises_connection_error_ac_176() -> None:
+    """AC-176: get_tuple() re-raises RelateConnectionError from proxy.execute_read."""
+    with RelateSaver(db_path=":memory:") as saver:
+        cfg: RunnableConfig = {"configurable": {"thread_id": "thread-conn-err"}}
+        with patch.object(
+            saver.proxy, "execute_read", side_effect=RelateConnectionError("db disconnected")
+        ):
+            with pytest.raises(RelateConnectionError, match="db disconnected"):
+                saver.get_tuple(cfg)
+
+
+def test_get_tuple_reraises_concurrency_error_ac_176() -> None:
+    """AC-176: get_tuple() re-raises RelateConcurrencyError from proxy.execute_read."""
+    with RelateSaver(db_path=":memory:") as saver:
+        cfg: RunnableConfig = {"configurable": {"thread_id": "thread-conc-err"}}
+        with patch.object(
+            saver.proxy, "execute_read", side_effect=RelateConcurrencyError("write contention")
+        ):
+            with pytest.raises(RelateConcurrencyError, match="write contention"):
+                saver.get_tuple(cfg)
+
+
+def test_list_reraises_connection_error_ac_176() -> None:
+    """AC-176: list() re-raises RelateConnectionError from proxy.execute_read."""
+    with RelateSaver(db_path=":memory:") as saver:
+        cfg: RunnableConfig = {"configurable": {"thread_id": "thread-list-conn-err"}}
+        with patch.object(
+            saver.proxy, "execute_read", side_effect=RelateConnectionError("db disconnected")
+        ):
+            with pytest.raises(RelateConnectionError, match="db disconnected"):
+                list(saver.list(cfg))
+
+
+def test_list_reraises_concurrency_error_ac_176() -> None:
+    """AC-176: list() re-raises RelateConcurrencyError from proxy.execute_read."""
+    with RelateSaver(db_path=":memory:") as saver:
+        cfg: RunnableConfig = {"configurable": {"thread_id": "thread-list-conc-err"}}
+        with patch.object(
+            saver.proxy, "execute_read", side_effect=RelateConcurrencyError("lock timeout")
+        ):
+            with pytest.raises(RelateConcurrencyError, match="lock timeout"):
+                list(saver.list(cfg))
+
+
+def test_generic_checkpoint_error_returns_none_or_empty_ac_176() -> None:
+    """AC-176: Generic RelateCheckpointError continues to return None or empty iterator."""
+    with RelateSaver(db_path=":memory:") as saver:
+        cfg: RunnableConfig = {"configurable": {"thread_id": "thread-generic-err"}}
+        with patch.object(
+            saver.proxy, "execute_read", side_effect=RelateCheckpointError("generic error")
+        ):
+            assert saver.get_tuple(cfg) is None
+            assert list(saver.list(cfg)) == []
+

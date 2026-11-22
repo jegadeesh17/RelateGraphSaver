@@ -31,7 +31,12 @@ from langgraph.checkpoint.base import (
 )
 from langgraph.checkpoint.serde.base import SerializerProtocol
 
-from langgraph_checkpoint_relate.errors import RelateCheckpointError, RelateReadOnlyError
+from langgraph_checkpoint_relate.errors import (
+    RelateCheckpointError,
+    RelateConcurrencyError,
+    RelateConnectionError,
+    RelateReadOnlyError,
+)
 from langgraph_checkpoint_relate.proxy import RelateThreadProxy
 from langgraph_checkpoint_relate.serde import RelateStateSerializer, default_serializer
 from langgraph_checkpoint_relate.tool_calls import (
@@ -493,6 +498,8 @@ class RelateSaver(BaseCheckpointSaver[str]):
 
         try:
             records = self.proxy.execute_read(query, params)
+        except (RelateConnectionError, RelateConcurrencyError):
+            raise
         except RelateCheckpointError:
             return None
 
@@ -634,6 +641,8 @@ class RelateSaver(BaseCheckpointSaver[str]):
 
         try:
             rows = self.proxy.execute_read(query, params)
+        except (RelateConnectionError, RelateConcurrencyError):
+            raise
         except RelateCheckpointError:
             return
 
