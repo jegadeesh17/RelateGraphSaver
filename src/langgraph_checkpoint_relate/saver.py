@@ -220,18 +220,12 @@ class RelateSaver(BaseCheckpointSaver[str]):
         parent_checkpoint_id: str | None = None
         raw_parent = dict(checkpoint).get("parent_checkpoint_id")
 
-        if (
-            isinstance(metadata, dict)
-            and "parents" in metadata
-            and isinstance(metadata["parents"], dict)
-            and metadata["parents"]
-        ):
-            ns_parent = metadata["parents"].get(checkpoint_ns)
-            parent_checkpoint_id = str(ns_parent) if ns_parent else None
+        if parent_candidate:
+            parent_checkpoint_id = str(parent_candidate)
         elif raw_parent:
             parent_checkpoint_id = str(raw_parent)
-        elif parent_candidate:
-            parent_checkpoint_id = str(parent_candidate)
+        else:
+            parent_checkpoint_id = None
 
         if parent_checkpoint_id == checkpoint_id:
             parent_checkpoint_id = None

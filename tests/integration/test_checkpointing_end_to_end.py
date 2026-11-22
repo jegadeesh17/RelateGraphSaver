@@ -236,7 +236,7 @@ class TestRelateSaverEndToEnd:
                     "source": "loop",
                     "step": i,
                     "writes": {},
-                    "parents": {parent_id: "parent"} if parent_id else {},
+                    "parents": {},
                 }
                 cfg: Any = {"configurable": {"thread_id": thread_id, "checkpoint_id": parent_id}}
                 saver.put(cfg, chk, meta, {})
