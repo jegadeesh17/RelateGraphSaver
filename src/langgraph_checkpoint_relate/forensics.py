@@ -622,12 +622,15 @@ class RelateForensics:
 
         first_row, first_name, first_needle = first_match
         fallback = self._writing_nodes(matched_checkpoint_id, thread_id)
-        parsed = {_node_from_task_path(r.get("task_path")) for r in matches}
-        nodes: tuple[str, ...]
-        if None not in parsed and (parsed & set(fallback)):
-            nodes = tuple(sorted(str(n) for n in (parsed & set(fallback))))
-        else:
-            nodes = fallback
+        # Writes without a pull task path name no node; the versions_seen nodes are used only
+        # when no matching write names one or none of them changed versions_seen (ADR-0025).
+        parsed = {
+            node
+            for node in (_node_from_task_path(r.get("task_path")) for r in matches)
+            if node is not None
+        }
+        attributed = parsed & set(fallback)
+        nodes: tuple[str, ...] = tuple(sorted(attributed)) if attributed else fallback
 
         node = ", ".join(nodes) or _UNKNOWN_NODE
         origin = ArgumentOrigin(

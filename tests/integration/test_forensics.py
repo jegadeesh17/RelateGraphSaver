@@ -1211,6 +1211,56 @@ class TestFailureSummary:
         assert origin.node == "fetcher, parser"
         assert report.origin_node == "fetcher, parser"
 
+    @staticmethod
+    def _origin_node_for_task_paths(thread_id: str, task_paths: list[str]) -> str | None:
+        """Write the needle under each task path at step 0, then trace it from step 1.
+
+        Nodes ``a`` and ``b`` both change ``versions_seen`` between the two checkpoints.
+        """
+        needle = "origin-needle-value"
+        with RelateSaver(":memory:") as saver:
+            for idx, cid in enumerate(("cp-vs-0", "cp-vs-1")):
+                cfg: RunnableConfig = {
+                    "configurable": {
+                        "thread_id": thread_id,
+                        "checkpoint_ns": "",
+                        "checkpoint_id": cid,
+                    }
+                }
+                cp: Any = dict(empty_checkpoint())
+                cp["id"] = cid
+                cp["channel_values"] = {"counter": idx}
+                if idx:
+                    cp["parent_checkpoint_id"] = "cp-vs-0"
+                    cp["versions_seen"] = {"a": {"x": 1}, "b": {"x": 1}}
+                saver.put(cfg, cp, {"step": idx}, {})
+                if idx == 0:
+                    for n, task_path in enumerate(task_paths):
+                        saver.put_writes(cfg, [(f"ch{n}", needle)], f"task-{n}", task_path)
+            with RelateForensics(saver) as forensics:
+                origin = forensics.trace_argument_origin(thread_id, "cp-vs-1", {"url": needle})
+        return origin.node if origin is not None else None
+
+    def test_ac172_origin_nodes_use_task_path_node_when_it_intersects(self) -> None:
+        """AC-172: a pull task path narrows the versions_seen nodes to the writer."""
+        node = self._origin_node_for_task_paths("t-vs-narrow", ["~__pregel_pull,a"])
+        assert node == "a"
+
+    def test_ac172_versions_seen_fallback_when_task_path_is_empty(self) -> None:
+        """AC-172: with no task path on any matching write, versions_seen nodes are used."""
+        node = self._origin_node_for_task_paths("t-vs-empty", [""])
+        assert node == "a, b"
+
+    def test_ac172_versions_seen_fallback_when_intersection_is_empty(self) -> None:
+        """AC-172: a task path node absent from the changed versions_seen falls back."""
+        node = self._origin_node_for_task_paths("t-vs-disjoint", ["~__pregel_pull,c"])
+        assert node == "a, b"
+
+    def test_ac172_write_without_task_path_does_not_widen_attributed_origin(self) -> None:
+        """AC-172: fallback needs every task path empty; a write that has one still narrows."""
+        node = self._origin_node_for_task_paths("t-vs-mixed", ["~__pregel_pull,a", ""])
+        assert node == "a"
+
     def test_ac164_failure_summary_origin_nodes_unknown_when_not_found(self) -> None:
         """AC-164: when origin writing nodes cannot be determined, '<unknown>' is reported."""
         thread_id, call_id = "t-unknown-node", "call-unknown-node"
