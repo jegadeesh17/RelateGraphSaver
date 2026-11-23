@@ -317,3 +317,71 @@ def test_readme_tree_sample_uses_flat_layout_ac_185() -> None:
     assert len(step_lines) >= 3
     assert {line.index("[") for line in step_lines} == {4}
     assert not any(line.startswith("    ") for line in sample)
+
+
+LLM_STORE = REPO_ROOT / "examples" / "data" / "demo-llm.rl"
+
+
+def _llm_section() -> str:
+    """Return the body of the README's recorded LLM run subsection."""
+    text = _readme_text()
+    heading = "### Explore the recorded LLM run"
+    rest = text[text.index(heading) + len(heading) :]
+    end = re.search(r"^#{2,3} ", rest, flags=re.MULTILINE)
+    return rest[: end.start()] if end else rest
+
+
+def test_llm_run_section_commands_exit_zero_and_leave_store_unchanged_ac_141() -> None:
+    """AC-141: the recorded LLM run commands read demo-llm.rl and never change it."""
+    section = _llm_section()
+    commands = [
+        line.split()[1:]
+        for line in section.splitlines()
+        if line.startswith("relate-dag ") and "examples/data/demo-llm.rl" in line
+    ]
+    assert [args[:3] for args in commands] == [
+        ["tree", "demo-llm", "--db"],
+        ["forensics", "trace-error", "demo-llm"],
+    ]
+    before = _data_state()
+    assert before[0] == ["demo-llm.rl", "demo.rl"], before[0]
+    for args in commands:
+        assert args[-2] == "--db"
+        args = [*args[:-1], str(REPO_ROOT / args[-1])]
+        result = CliRunner().invoke(app, args)
+        assert result.exit_code == 0, result.output
+        assert "demo-llm" in result.output
+    assert _data_state() == before
+
+
+def test_llm_run_section_names_only_existing_thread_ac_141() -> None:
+    """AC-141: the thread id the README names for demo-llm.rl is the one stored in it."""
+    result = CliRunner().invoke(app, ["forensics", "failures", "--db", str(LLM_STORE)])
+    assert result.exit_code == 0, result.output
+    assert "demo-llm" in result.output
+    assert "demo-llm" in _llm_section()
+
+
+def test_agent_instructions_cover_key_handling_ac_140() -> None:
+    """AC-140: the README shows the llm extra install, the env var and the missing-key exit."""
+    text = _readme_text()
+    section = text[text.index("### Running the LLM agent") :]
+    section = section[: section.index("\n## ")]
+    assert 'pip install -e ".[dev,llm]"' in section
+    assert "OPENROUTER_API_KEY" in section
+    assert "python examples/openrouter_agent.py --model" in section
+    assert "`Error:` line" in section and "exit" in section
+    assert ".env.example" in section
+    # The key is only ever a placeholder: no assignment of a real-looking value.
+    assert not re.search(r"OPENROUTER_API_KEY\s*=\s*(?!<)[^\s<]", section.replace('"', ""))
+    assert "OPENROUTER_API_KEY=" in (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
+
+
+def test_dependency_agent_instructions_name_the_command_ac_132() -> None:
+    """AC-132: the README documents running the key-free dependency audit."""
+    text = _readme_text()
+    section = text[text.index("### Running the dependency audit") :]
+    section = section[: section.index("\n### ")]
+    assert "python examples/dependency_agent.py" in section
+    assert "needs no API key" in section
+    assert "relate-dag forensics trace-error" in section

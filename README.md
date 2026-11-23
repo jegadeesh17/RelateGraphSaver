@@ -147,6 +147,17 @@ Replay result
 
 To find the id of a checkpoint on any thread, run `relate-dag tree <thread> --db examples/data/demo.rl`. The step -1 checkpoint holds no messages yet, so use step 0 or later with `--set-message`.
 
+### Explore the recorded LLM run
+
+`examples/data/demo-llm.rl` is a second committed store, separate from `demo.rl`. It holds one thread, `demo-llm`: a real model, called through OpenRouter, runs the same `lookup_pypi_package` tool as the dependency audit. `build_demo_store.py` never reads or writes this file (AC-141), and you do not need an API key to inspect it. These commands only read it:
+
+```bash
+relate-dag tree demo-llm --db examples/data/demo-llm.rl
+relate-dag forensics trace-error demo-llm --db examples/data/demo-llm.rl
+```
+
+You do not have to know a thread id up front. `relate-dag forensics failures --db <file>` lists every thread that holds a failed tool call, and `relate-dag tree <thread> --db <file>` prints that thread's checkpoints. For `demo-llm.rl` the failures table names `demo-llm`, the one failed `lookup_pypi_package` call, and the node that wrote its bad argument.
+
 ## Usage
 
 Integrate `RelateSaver` directly into any compiled LangGraph workflow:
@@ -225,6 +236,34 @@ relate-dag forensics trace-error demo-1 --db tool_agent.rl
 ```
 
 Pass `--no-fail` to let the tool succeed.
+
+### Running the dependency audit
+
+`examples/dependency_agent.py` needs no API key. It audits this project's runtime dependencies against the real PyPI JSON API, so it needs network access to `pypi.org`. One lookup fails with an HTTP 404, and the run prints a root-cause analysis:
+
+```bash
+python examples/dependency_agent.py --db dependency_agent.rl --thread-id audit-1
+
+# Inspect it again later, from the file only
+relate-dag forensics trace-error audit-1 --db dependency_agent.rl
+```
+
+Without `--thread-id` the agent generates one and prints it. Without `--db` it writes `dependency_agent.rl` in the current directory, which is not committed.
+
+### Running the LLM agent
+
+`examples/openrouter_agent.py` is optional. It runs a real model through OpenRouter and records the run, so it needs the `llm` extra, an OpenRouter account and network access (AC-139):
+
+```bash
+pip install -e ".[dev,llm]"
+export OPENROUTER_API_KEY=<your key>     # Windows PowerShell: $env:OPENROUTER_API_KEY = "<your key>"
+python examples/openrouter_agent.py --model <openrouter-model-id> --db llm_agent.rl --thread-id llm-1
+relate-dag tree llm-1 --db llm_agent.rl
+```
+
+The script reads the key only from the `OPENROUTER_API_KEY` environment variable of the running process. It never reads a `.env` file, so set the variable in your shell and do not commit a key. `.env.example` lists the name, without a value. With the variable unset, the script prints an `Error:` line and exits with code 1 before any network call (AC-140).
+
+Always pass `--db`. Without it the script writes to `examples/data/demo-llm.rl`, the committed recorded run.
 
 ### Async usage
 
