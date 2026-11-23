@@ -166,7 +166,7 @@ Validation and invariants:
 - `(:Checkpoint)-[:FORKED_TO]->(:Checkpoint)`: Branch edge linking a historical checkpoint to the root checkpoint of a branched or replayed thread.
 - `(:Checkpoint)-[:FORKED_TO]->(:Thread)`: Branch edge linking a historical checkpoint to a new branched `:Thread` created from a fork or `update_state` operation (ADR-0003, ADR-0029).
 - `(:Checkpoint)-[:HAS_WRITE]->(:Write)`: Links a checkpoint to its pending or committed writes. `put_writes()`, and a later `put()` of the named checkpoint, create the edge only when the write's `thread_id`, `checkpoint_ns` and `checkpoint_id` all equal the checkpoint's. A write whose config names another thread's or namespace's checkpoint is stored unlinked, and `get_tuple()` returns as pending writes only linked writes whose `thread_id` and `checkpoint_ns` equal the checkpoint's ([ADR-0031](DECISIONS.md#adr-0031-writes-and-tool-calls-attach-only-to-a-checkpoint-of-their-own-thread), AC-190, AC-191).
-- `(:Checkpoint)-[:INVOKED]->(:ToolCall)`: Links the checkpoint at which a thread first recorded a tool call to that call. For `put_writes()` this is the checkpoint named by `config["configurable"]["checkpoint_id"]` (the checkpoint the model's task ran from, AC-41), and only when that checkpoint's `thread_id` is the saving thread's ([ADR-0031](DECISIONS.md#adr-0031-writes-and-tool-calls-attach-only-to-a-checkpoint-of-their-own-thread)); for `put()` it is the checkpoint being stored (AC-42). Exactly one such edge exists per (thread, `call_id`): a later save in the same thread that sees the same call adds no edge. LangGraph saves the model step's writes and the next checkpoint on different threads, so the edge attaches to the step the model ran from or to the next one, whichever save lands first ([ADR-0021](DECISIONS.md#adr-0021-tool-call-root-cause-anchors-on-the-failure-checkpoint)).
+- `(:Checkpoint)-[:INVOKED]->(:ToolCall)`: Links the checkpoint at which a thread first recorded a tool call to that call. For `put_writes()` this is the checkpoint named by `config["configurable"]["checkpoint_id"]` (the checkpoint the model's task ran from, AC-41), and only when that checkpoint's `thread_id` and `checkpoint_ns` both equal the config's ([ADR-0031](DECISIONS.md#adr-0031-writes-and-tool-calls-attach-only-to-a-checkpoint-of-their-own-thread), AC-190); for `put()` it is the checkpoint being stored (AC-42). Exactly one such edge exists per (thread, `call_id`): a later save in the same thread that sees the same call adds no edge. LangGraph saves the model step's writes and the next checkpoint on different threads, so the edge attaches to the step the model ran from or to the next one, whichever save lands first ([ADR-0021](DECISIONS.md#adr-0021-tool-call-root-cause-anchors-on-the-failure-checkpoint)).
 - `(:Write)-[:INVOKED]->(:ToolCall)`: Reserved. The saver does not write this edge; forensics, including `failure_summary` (AC-158), reads it if present, so data that contains it keeps working.
 
 ### Cypher DDL Constraints and Indexes
@@ -244,13 +244,13 @@ class RelateSaver(BaseCheckpointSaver[str]):
 
 #### Tool call capture inside `put()` and `put_writes()`
 - `__init__` creates `self._applied_tool_calls = AppliedToolCalls()` on every construction path (own proxy, passed proxy, proxy as `db_path`). Two savers sharing one proxy each have their own record; that is safe because every statement is idempotent.
-- `put_writes()`: after its `execute_batch` succeeds, calls the private helper `_capture_tool_calls(values=[value for _, value in writes], thread_id=thread_id, checkpoint_id=checkpoint_id_str)`.
-- `put()`: after its `execute_write` succeeds, calls `_capture_tool_calls(values=checkpoint["channel_values"].values(), thread_id=thread_id, checkpoint_id=checkpoint_id)` when `channel_values` is a dict; otherwise does nothing.
+- `put_writes()`: after its `execute_batch` succeeds, calls the private helper `_capture_tool_calls(values=[value for _, value in writes], thread_id=thread_id, checkpoint_ns=checkpoint_ns, checkpoint_id=checkpoint_id_str)`. In both methods `checkpoint_ns` is `str(config["configurable"].get("checkpoint_ns", ""))` from the config passed in, the same value stored on the `:Write` or `:Checkpoint` node.
+- `put()`: after its `execute_write` succeeds, calls `_capture_tool_calls(values=checkpoint["channel_values"].values(), thread_id=thread_id, checkpoint_ns=checkpoint_ns, checkpoint_id=checkpoint_id)` when `channel_values` is a dict; otherwise does nothing.
 - `_capture_tool_calls` runs on the calling thread, in this order ([ADR-0011](DECISIONS.md#adr-0011-send-only-new-tool-call-statements-tracked-per-saver)):
   1. `events = extract_tool_events(values)`.
   2. `plan = self._applied_tool_calls.plan(events, thread_id=thread_id)`.
   3. If `plan.events` has no invocations and no outcomes: return. Nothing is serialized and nothing is submitted to the proxy.
-  4. `statements = build_tool_call_statements(plan.events, thread_id=..., checkpoint_id=..., serde=..., created_at=...)`; if non-empty, `detached = detached_call_ids(self.proxy.execute_batch(statements, flush=False))` ([ADR-0014](DECISIONS.md#adr-0014-tool-call-capture-commits-without-its-own-flush)); otherwise `detached` is empty.
+  4. `statements = build_tool_call_statements(plan.events, thread_id=..., checkpoint_ns=..., checkpoint_id=..., serde=..., created_at=...)`; if non-empty, `detached = detached_call_ids(self.proxy.execute_batch(statements, flush=False))` ([ADR-0014](DECISIONS.md#adr-0014-tool-call-capture-commits-without-its-own-flush)); otherwise `detached` is empty.
   5. `self._applied_tool_calls.mark_applied(plan, thread_id=thread_id, detached=detached)`, reached only when step 4's batch returned normally or had nothing to send (every entry failed serialization).
 - It catches every `Exception`, logs at WARNING with the checkpoint id and the exception class name only (never argument or result content), and returns normally. On any exception nothing is marked, so the next save that sees the same calls sends them again. Tool call capture can never make `put()` or `put_writes()` raise or roll back (AC-47).
 - No messages in the values means no statements, no `:ToolCall` nodes and no `[:INVOKED]` edges (AC-46).
@@ -416,7 +416,7 @@ def extract_tool_events(values: Iterable[Any]) -> ToolEvents:
     """Never raises. Collects tool calls and tool results from written values."""
 
 def build_tool_call_statements(
-    events: ToolEvents, *, thread_id: str, checkpoint_id: str,
+    events: ToolEvents, *, thread_id: str, checkpoint_ns: str, checkpoint_id: str,
     serde: BlobSerializer, created_at: str,
 ) -> list[tuple[str, dict[str, Any]]]:
     """Invocation statements first, then outcome statements."""
@@ -432,21 +432,22 @@ def detached_call_ids(results: Any) -> frozenset[str]:
 - Every other message type is ignored. Each value and each message is processed inside its own `try`/`except Exception`, so one bad entry never hides the others.
 - Duplicates within one call are removed by `call_id`, keeping the first invocation and the first outcome.
 
-**Statements** (`build_tool_call_statements`). Serialization failure for one invocation or outcome skips that entry only. Parameters are `call_id`, `tool_name`, `args_blob`, `created_at`, `thread_id`, `checkpoint_id`, and `result_blob` or `error`.
+**Statements** (`build_tool_call_statements`). Serialization failure for one invocation or outcome skips that entry only. Parameters are `call_id`, `tool_name`, `args_blob`, `created_at`, `thread_id`, `checkpoint_ns`, `checkpoint_id`, and `result_blob` or `error`.
 
 Invocation (one per `ToolInvocation`, AC-41, AC-42, AC-48):
 ```cypher
 MERGE (tc:ToolCall {call_id: $call_id})
 ON CREATE SET tc.tool_name = $tool_name, tc.args_blob = $args_blob, tc.created_at = $created_at
 WITH tc
-OPTIONAL MATCH (c:Checkpoint {checkpoint_id: $checkpoint_id}) WHERE c.thread_id = $thread_id
+OPTIONAL MATCH (c:Checkpoint {checkpoint_id: $checkpoint_id})
+WHERE c.thread_id = $thread_id AND c.checkpoint_ns = $checkpoint_ns
 OPTIONAL MATCH (linked:Checkpoint {thread_id: $thread_id})-[:INVOKED]->(tc)
 WITH tc, c, count(linked) AS linked_count
 FOREACH (_ IN CASE WHEN c IS NOT NULL AND linked_count = 0 THEN [1] ELSE [] END |
   MERGE (c)-[:INVOKED]->(tc))
 RETURN tc.call_id AS call_id, (c IS NOT NULL OR linked_count > 0) AS attached
 ```
-`attached` is false only when the named checkpoint is not in the file (or belongs to another thread) and the thread has no edge to the call yet; `detached_call_ids` counts only rows whose `attached` is exactly `False` and whose `call_id` is a string; outcome statements return no rows.
+`attached` is false only when the named checkpoint is not in the file (or belongs to another thread or namespace, AC-190) and the thread has no edge to the call yet; `detached_call_ids` counts only rows whose `attached` is exactly `False` and whose `call_id` is a string; outcome statements return no rows.
 
 Successful outcome (AC-43, AC-49):
 ```cypher
@@ -484,7 +485,7 @@ class AppliedToolCalls:
     def __len__(self) -> int: ...           # distinct (thread_id, call_id) keys held
 ```
 
-- **Key:** `(thread_id, call_id)`. `thread_id` is part of the key because the `[:INVOKED]` edge condition is per thread; `checkpoint_ns` is not, matching the Cypher. State: two sets of keys, `invoked` (invocation statement committed) and `resolved` (outcome statement committed).
+- **Key:** `(thread_id, call_id)`. `thread_id` is part of the key because the one-edge rule (the `linked` match) is per thread; `checkpoint_ns` is not, because it only limits which checkpoint may take the edge, and a namespace mismatch returns `attached = false`, so it is never recorded. State: two sets of keys, `invoked` (invocation statement committed) and `resolved` (outcome statement committed).
 - **`plan`:** keeps an invocation only if its key is not in `invoked`, and an outcome only if its key is not in `resolved`, preserving the input order. A kept outcome is *confirmable* only if, at the moment `plan` runs, its key is already in `invoked` or its `call_id` is among the kept invocations of the same plan. `plan` never modifies the record.
 - **`mark_applied`:** adds the key of every invocation in `plan.events` whose `call_id` is not in `detached` to `invoked`, and the key of every `call_id` in `plan.confirmable_outcomes` to `resolved`. The saver calls it only after the capture transaction has committed (or when there was nothing to send), never before.
 - **Why invocations need an edge:** under concurrent `ainvoke`, LangGraph can commit a task's `put_writes()`, carrying the AI tool call, before the `put()` of the checkpoint it names. The invocation statement's `OPTIONAL MATCH` then finds no checkpoint, creates the node without an `[:INVOKED]` edge and returns `attached = false`. Such an invocation is not recorded, so the next save that carries the call resends the idempotent statement and attaches the edge to that save's checkpoint. Its outcome, if confirmable, is still recorded, because the node exists.
@@ -776,7 +777,7 @@ None. All graph storage is managed in-process via single-file `.rl` databases or
    - *Components:* `tool_call_id_unique` constraint, `MERGE` on `call_id`, `ToolMessage.tool_call_id` matching.
    - *Why expensive:* Moving to thread-scoped keys later (for example `{thread_id}:{call_id}`) would change the constraint, every stored node, and what `root_tool_call_id` reports to users.
 7. **Tool call recording rules:**
-   - *Components:* one `[:INVOKED]` edge per (thread, call) from the first stored checkpoint of that thread whose save saw the call ([ADR-0031](DECISIONS.md#adr-0031-writes-and-tool-calls-attach-only-to-a-checkpoint-of-their-own-thread)) (a call seen before its named checkpoint is stored attaches to a later one); first outcome wins; orphan results create nothing.
+   - *Components:* one `[:INVOKED]` edge per (thread, call) from the first stored checkpoint of that thread and namespace whose save saw the call ([ADR-0031](DECISIONS.md#adr-0031-writes-and-tool-calls-attach-only-to-a-checkpoint-of-their-own-thread)) (a call seen before its named checkpoint is stored attaches to a later one); first outcome wins; orphan results create nothing.
    - *Why expensive:* Forensics finds tool calls, including the calls counted by `failure_summary()`, through the `[:INVOKED]` edge, and `causal_path_length` depends on where it attaches; for a failing tool call the error checkpoint is the failure checkpoint, not the edge's checkpoint ([ADR-0021](DECISIONS.md#adr-0021-tool-call-root-cause-anchors-on-the-failure-checkpoint)). Changing which checkpoint gets the edge, or allowing outcomes to be overwritten, changes the reports of already stored runs.
 8. **`RootCauseReport.root_tool_name`, the origin fields and the provenance heuristic:**
    - *Components:* `root_tool_name` and the `Failing tool:` summary sentence; `origin_argument`, `origin_node`, `origin_step`, `origin_hops`; `ArgumentOrigin`, `ToolFailureSummary`, `trace_argument_origin()`, `failure_summary()`; the containment rule, the earliest-write rule and hops counted from the failure checkpoint ([ADR-0018](DECISIONS.md#adr-0018-argument-provenance-by-string-containment-earliest-write-wins)).
