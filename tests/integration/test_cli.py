@@ -1410,6 +1410,36 @@ def test_trace_error_omits_origin_line_without_origin_ac_122(
     assert "Bad argument origin" not in result.output
 
 
+def test_combined_forensics_prints_bad_argument_origin_ac_122(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """AC-122: the combined forensics summary shows the same origin line as trace-error."""
+    db_file = str(tmp_path / "origin.rl")
+    _run_origin_graph(db_file, "origin-fail", "pkg-alpha-9000")
+
+    result = runner.invoke(app, ["forensics", "origin-fail", "--db", db_file])
+
+    flat = _flatten(result.output)
+    assert result.exit_code == 0
+    assert "Bad argument origin: url came from node planner (step 0, 2 hops before failure)" in flat
+    assert "hops: checkpoint steps from the write where the argument first appeared" in flat
+    assert "Status: ERROR DETECTED" in flat
+
+
+def test_combined_forensics_omits_origin_line_without_origin_ac_122(
+    runner: CliRunner, seeded_error_db: tuple[str, str, str]
+) -> None:
+    """AC-122: with no traceable argument the combined summary has no origin line or blank gap."""
+    db_file, thread_id, _ = seeded_error_db
+
+    result = runner.invoke(app, ["forensics", thread_id, "--db", db_file])
+
+    assert result.exit_code == 0
+    assert "Root Tool Name:" in result.output
+    assert "Bad argument origin" not in result.output
+    assert not re.search(r"Root Tool Name:.*\n[│|\s]*\n", result.output)
+
+
 def test_trace_error_demo_tool_fail_still_names_the_tool_rc_05(runner: CliRunner) -> None:
     """RC-05: the committed demo store still reports fetch_source and its call id."""
     result = runner.invoke(app, ["forensics", "trace-error", DEMO_THREAD, "--db", str(DEMO_STORE)])

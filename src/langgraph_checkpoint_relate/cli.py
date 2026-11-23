@@ -759,6 +759,7 @@ def forensics_diagnose(
                     f"[bold red]Error Message:[/bold red]       {escape(root_cause.error_message)}\n"
                     f"[bold yellow]Root Tool Call ID:[/bold yellow]   {escape(root_cause.root_tool_call_id or 'None')}\n"
                     f"[bold yellow]Root Tool Name:[/bold yellow]      {escape(root_cause.root_tool_name or 'None')}\n"
+                    f"{_origin_line(root_cause)}"
                     f"[bold yellow]Root Channel Write:[/bold yellow]  {escape(root_cause.root_channel_write or 'None')}\n"
                     f"[bold green]Causal Path Length:[/bold green]  {root_cause.causal_path_length} {_PATH_LENGTH_NOTE}\n"
                     f"[bold white]Diagnostic Summary:[/bold white]  {escape(root_cause.diagnostic_summary)}"
