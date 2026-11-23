@@ -27,15 +27,15 @@ AI Agent Engineers building, debugging, and observing autonomous workflows in La
 ## 2. User Journeys
 
 The product capabilities were delivered in these stages:
-- **Milestone 1:** MVP Vertical Slice (Core `RelateSaver` engine, `RelateThreadProxy` actor, single-file WAL persistence, `put`/`get_tuple`/`list`).
-- **Milestone 2:** Core Flows & Time-Travel Debugger (`put_writes` human-in-the-loop, `checkpoint_ns` subgraphs, `:memory:` sandboxed replay, `relate-dag tree` terminal visualizer).
-- **Milestone 3:** Forensic Diagnostics & Production Polish (Cypher loop detection, poison-tool root-cause analysis, multi-agent demo application, PyPI packaging).
-- **Milestone 4:** Judge Readiness (clean-install CLI fix, lint and type-check baseline, README Relate rationale and limits, `:ToolCall` capture from real runs, async checkpointer methods, SQLite comparison benchmark).
-- **Judge Impact:** tree status fix, graph re-execution replay with a run diff, argument provenance, cross-thread tool failures, a key-free real-API demo thread, README and metadata corrections (updated 2026-11-18).
+- **Core persistence:** Core `RelateSaver` engine, `RelateThreadProxy` actor, single-file WAL persistence, `put`/`get_tuple`/`list`.
+- **Time travel and visualizer:** `put_writes` human-in-the-loop, `checkpoint_ns` subgraphs, `:memory:` sandboxed replay, `relate-dag tree` terminal visualizer.
+- **Forensics and packaging:** Cypher loop detection, poison-tool root-cause analysis, multi-agent demo application, PyPI packaging.
+- **Tool-call forensics and async:** clean-install CLI fix, lint and type-check baseline, README Relate rationale and limits, `:ToolCall` capture from real runs, async checkpointer methods, SQLite comparison benchmark.
+- **Replay and provenance:** tree status fix, graph re-execution replay with a run diff, argument provenance, cross-thread tool failures, a key-free real-API demo thread, README and metadata corrections (updated 2026-11-18).
 - **Replay and forensics hardening (AC-161..AC-172):** CLI markup escaping, import type-annotation robustness, indirect tool-call root-cause parity, fan-out origin nodes, path spec validation, update-state hint scoping, console width restoration, and typed replay channel comparison (updated 2026-11-21).
 - **Write-path and read-side correctness (AC-173..AC-191):** write-path namespace normalization, parent-id extraction, UUIDv6 checkpoint ordering, proxy cancellation, custom serializer wrapping, first-write-wins channel semantics, thread-scoped write and tool-call linking, root-to-leaf loop detection, deterministic failure-checkpoint resolution, non-recursive tree rendering, and read-only diagnostics defaults (updated 2026-11-23).
 
-### 2.1 Milestone 1: MVP Vertical Slice
+### 2.1 Core persistence
 
 #### Journey 1: Basic Workflow Persistence with RelateSaver
 1. The developer installs `langgraph-checkpoint-relate` and instantiates `saver = RelateSaver("checkpoints.rl")`.
@@ -65,7 +65,7 @@ The product capabilities were delivered in these stages:
 
 ---
 
-### 2.2 Milestone 2: Core Flows & Time-Travel Debugger
+### 2.2 Time travel and visualizer
 
 #### Journey 5: Human-In-The-Loop (HITL) Interruption and Pending Writes
 1. The developer configures a LangGraph graph with an interrupt condition (e.g., requiring human approval before executing a critical tool).
@@ -95,7 +95,7 @@ The product capabilities were delivered in these stages:
 
 ---
 
-### 2.3 Milestone 3: Forensics & Production Polish
+### 2.3 Forensics and packaging
 
 #### Journey 9: Cypher Forensic Diagnostics (Loop Detection & Root Cause Analysis)
 1. An autonomous agent enters an unintended cycle or fails with an exception during execution.
@@ -115,9 +115,9 @@ The product capabilities were delivered in these stages:
 2. The developer imports `from langgraph_checkpoint_relate import RelateSaver, RelateThreadProxy, RelateForensics`.
 3. The developer executes `relate-dag --help` in the terminal to view subcommands (`tree`, `replay`, `forensics`).
 
-### 2.4 Milestone 4: Judge Readiness
+### 2.4 Tool-call forensics and async
 
-Milestone 4 changes the finished Milestone 3 package. Each journey states the existing behavior it starts from; synchronous behavior and the graph schema stay unchanged except for the new `:ToolCall` writes.
+This stage changes the finished forensics and packaging stage. Each journey states the existing behavior it starts from; synchronous behavior and the graph schema stay unchanged except for the new `:ToolCall` writes.
 
 #### Journey 12: Clean Install Runs the CLI
 Starts from Journey 11, where `relate-dag` failed in a clean environment because `click` was imported but not declared.
@@ -159,7 +159,7 @@ New journey; no prior behavior.
 3. The script prints the four metrics for both savers and exits with code 0.
 4. The README publishes the measured numbers as measured, including metrics where SQLite is faster.
 
-### 2.5 Judge Impact
+### 2.5 Replay and provenance
 
 These journeys change the finished package so that replay re-runs the graph, forensics traces a bad argument back to the step that produced it and across threads, the committed store holds a failure from a real public API, and the README is correct for a first-time evaluator. Synchronous checkpointer behavior and the graph schema stay unchanged.
 
@@ -201,7 +201,7 @@ Starts from Journey 14 and the committed-store README.
 1. The evaluator reads a plain-language tagline, installs from source (no PyPI install line), and reads a "Why not X?" table comparing Neo4jSaver, SqliteSaver, LangGraph's built-in time travel and tracing tools.
 2. The project URLs in the package metadata lead to the real repository.
 
-#### Journey 25 (optional, only if the project owner approves): Recorded LLM Run
+#### Journey 25: Recorded LLM Run
 1. The developer sets `OPENROUTER_API_KEY` in the environment, installs the `llm` extra, and runs `examples/openrouter_agent.py --model <model>`.
 2. The run is stored once in `examples/data/demo-llm.rl`, separate from the key-free store.
 
@@ -244,7 +244,7 @@ Starts from Journeys 8, 9, and 21.
 
 ## 3. Acceptance Criteria
 
-### 3.1 Milestone 1: MVP Vertical Slice
+### 3.1 Core persistence
 AC-01: Given a non-existent database file path, When RelateSaver is initialized with that path, Then the file is created with initialized schema, constraints, and WAL mode enabled.
 AC-02: Given an initialized RelateSaver, When put() is invoked with a valid config, Checkpoint, CheckpointMetadata, and ChannelVersions, Then the state is persisted as a checkpoint node in the Relate graph and the returned RunnableConfig contains the new checkpoint_id.
 AC-03: Given an existing thread execution with multiple checkpoints, When get_tuple() is called with a thread_id, Then it returns the latest CheckpointTuple with matching checkpoint, metadata, and parent_config.
@@ -259,7 +259,7 @@ AC-11: Given a committed checkpoint in checkpoints.rl, When the host process ter
 AC-12: Given a checkpoint payload containing un-serializable objects (such as open sockets or raw file handles), When put() is invoked, Then a CheckpointSerializationError is raised identifying the offending state key.
 AC-13: Given standard LangGraph types including messages, datetimes, UUIDs, and Pydantic models, When persisted and retrieved through RelateSaver, Then types and data values are preserved across serialization.
 
-### 3.2 Milestone 2: Core Flows & Time-Travel Debugger
+### 3.2 Time travel and visualizer
 AC-14: Given an execution pausing at an interrupt, When put_writes() is called with a task_id and writes sequence, Then writes are persisted and linked to the corresponding checkpoint in the Relate graph.
 AC-15: Given a checkpoint with pending writes stored via put_writes(), When get_tuple() is called, Then the returned CheckpointTuple contains the matching pending_writes list.
 AC-16: Given an interrupted workflow with pending writes, When resumed with put(), Then the newly created checkpoint records the interrupted checkpoint as its parent.
@@ -272,7 +272,7 @@ AC-22: Given a thread with committed checkpoints in checkpoints.rl, When relate-
 AC-23: Given a thread with branches or interrupted pending writes, When relate-dag tree is run, Then branch points and pending writes are visually distinguished with status annotations.
 AC-24: Given a non-existent thread_id passed to relate-dag tree, When the command runs, Then the CLI exits with a non-zero exit code and prints an error indicating the thread was not found.
 
-### 3.3 Milestone 3: Forensics & Production Polish
+### 3.3 Forensics and packaging
 AC-25: Given an agent execution with state oscillation across nodes exceeding a threshold, When detect_loops() is invoked, Then a list of detected execution cycles is returned containing node sequences, occurrence counts, and checkpoint ID intervals.
 AC-26: Given an execution with no repeating cycles, When detect_loops() is invoked, Then an empty cycle report is returned.
 AC-27: Given an execution terminating in an error checkpoint, When trace_root_cause() is invoked, Then a causal path is returned tracing back to the earliest antecedent tool invocation or state write that preceded the error.
@@ -282,7 +282,7 @@ AC-30: Given the demo application halting at a human review prompt, When the use
 AC-31: Given a clean Python 3.11+ virtual environment, When pip install . is run, Then the package installs successfully without dependency resolution errors.
 AC-32: Given the installed package, When relate-dag --help is executed in terminal, Then command options and subcommands (tree, replay, forensics) are displayed with exit code 0.
 
-### 3.4 Milestone 4: Judge Readiness
+### 3.4 Tool-call forensics and async
 
 #### Clean install and CLI dependency
 AC-33: Given a fresh Python 3.11+ virtual environment with no other packages installed, When `pip install .` is run followed by `relate-dag --help`, Then the command exits with code 0 and prints the subcommands without an `ImportError` or `ModuleNotFoundError`.
@@ -322,7 +322,7 @@ AC-56: Given a development install with `langgraph-checkpoint-sqlite` available,
 AC-57: Given `pyproject.toml`, When dependencies are read, Then `langgraph-checkpoint-sqlite` appears only in a development dependency group and not in `[project].dependencies`.
 AC-58: Given `README.md`, When the benchmark section is read, Then it contains the four metrics for both savers as measured values, together with the N and the environment used, regardless of which saver performed better on each metric.
 
-### 3.5 Judge-run fixes
+### 3.5 CLI output, demo store and read-only inspection
 
 These criteria cover what an evaluator hits when following the README on a stock Windows terminal, and the committed store the Devpost rules require. The committed demo store is `examples/data/demo.rl` with three fixed thread ids: `demo-tool-fail` (tool agent, `fetch_source` fails), `demo-tool-ok` (tool agent, no failure) and `demo-research` (research agent).
 
@@ -370,7 +370,7 @@ AC-85: Given a path that does not exist, When `RelateSaver(path, read_only=True)
 AC-86: Given `read_only=True` with `":memory:"` or with a passed writable proxy, When the saver is constructed, Then `ValueError` is raised.
 AC-87: Given `RelateSaver(path)` without `read_only`, When a graph runs and the saver is closed and reopened, Then schema setup, saves and flush-on-close behave as before and the saved checkpoints are readable after reopening.
 
-### 3.6 Judge Impact
+### 3.6 Replay and provenance
 
 #### Tree step status
 AC-88: Given a checkpoint with stored writes that has a child linked by `[:NEXT]` and is neither an error nor an interrupt, When `relate-dag tree <thread>` is run, Then that checkpoint is tagged `[OK]` and not `[PENDING]`.
@@ -449,7 +449,7 @@ AC-136: Given an existing store at the output path and a fetcher that cannot rea
 AC-137: Given two builds, When the stores are compared, Then all four threads have the same checkpoint counts per thread and the same tool names and error/no-error outcomes; tool result text may differ.
 AC-138: Given a fresh clone, When `relate-dag tree demo-real-api`, `relate-dag forensics trace-error demo-real-api` and `relate-dag forensics failures` are run with `--db examples/data/demo.rl`, Then each exits with code 0, trace-error prints a `Bad argument origin:` line at least 2 hops back, the tree shows completed steps as `[OK]`, and the store is byte-identical afterwards.
 
-#### Optional recorded LLM run (only if the project owner approves)
+#### Recorded LLM run
 AC-139: (optional) Given `pyproject.toml`, When dependencies are read, Then an `llm` extra declares `langchain-openai` and `[project].dependencies` does not.
 AC-140: (optional) Given no `OPENROUTER_API_KEY` in the environment, When `examples/openrouter_agent.py` is run, Then it exits with code 1 with an `Error:` line and makes no network call; `.env.example` lists `OPENROUTER_API_KEY=`.
 AC-141: (optional) Given `examples/data/`, When it is listed, Then it holds `demo.rl` and at most `demo-llm.rl`, and `build_demo_store.py` never writes or reads `demo-llm.rl`.
@@ -531,17 +531,17 @@ RC-15: Given standard serialization without a custom serializer, When put() and 
 2. **Distributed Multi-Node Database Server:** Relate is an embedded graph engine designed for single-process, local file, or in-memory persistence. Distributed clustering and remote client-server connections are out of scope.
 3. **Automatic Migration Utilities for SqliteSaver Databases:** No automated schema or data migration tooling from existing SQLite-based checkpointers is provided in initial releases.
 4. **Arbitrary Graph Query Language Extensions:** The engine supports standard Cypher queries supported natively by the embedded Relate engine without custom query language transpilation.
-5. **Milestone 4: Web UI:** Judge readiness adds no web or browser interface; the terminal CLI remains the only user interface.
-6. **Milestone 4: Multi-Process Support:** RelateSaver remains a single-process engine. Multi-worker or multi-pod deployments are documented as a limit (use PostgresSaver), not solved.
-7. **Milestone 4: Native Async Relate Driver:** The async checkpointer methods delegate to the synchronous methods off the event loop; no native async driver for Relate is built.
-8. **Milestone 4: Sync Behavior and Schema Changes:** Existing synchronous behavior and the graph schema are not changed, except for adding `:ToolCall` node and `[:INVOKED]` relationship writes from real runs.
-9. **Milestone 4: Benchmark Claims:** The benchmark reports measured numbers only; it makes no claim that Relate is faster than SQLite, and no tuning work is done to make it so.
-10. **Judge-run fixes: Stored Data Rewrites:** Shortening the trace-error message is display-only; no stored `error` property is rewritten or migrated.
-11. **Judge-run fixes: Byte-Identical Demo Store:** Regenerating `examples/data/demo.rl` reproduces the same threads and tool-call outcomes, not a byte-identical file; checkpoint ids are time-based.
-12. **Judge-run fixes: Fork and Capture Limits:** Forks that miss tool results after trimmed message history, unbounded growth of the applied-tool-call set in long-lived savers, a resent INVOKED edge landing one step late, and silent fork writes-read failures remain documented known limits, not fixes.
-13. **Judge-run fixes: Submission Assets:** Making the repository public, the demo video and the Devpost description are outside this specification.
+5. **Tool-call forensics and async: Web UI:** This stage adds no web or browser interface; the terminal CLI remains the only user interface.
+6. **Tool-call forensics and async: Multi-Process Support:** RelateSaver remains a single-process engine. Multi-worker or multi-pod deployments are documented as a limit (use PostgresSaver), not solved.
+7. **Tool-call forensics and async: Native Async Relate Driver:** The async checkpointer methods delegate to the synchronous methods off the event loop; no native async driver for Relate is built.
+8. **Tool-call forensics and async: Sync Behavior and Schema Changes:** Existing synchronous behavior and the graph schema are not changed, except for adding `:ToolCall` node and `[:INVOKED]` relationship writes from real runs.
+9. **Tool-call forensics and async: Benchmark Claims:** The benchmark reports measured numbers only; it makes no claim that Relate is faster than SQLite, and no tuning work is done to make it so.
+10. **CLI output, demo store and read-only inspection: Stored Data Rewrites:** Shortening the trace-error message is display-only; no stored `error` property is rewritten or migrated.
+11. **CLI output, demo store and read-only inspection: Byte-Identical Demo Store:** Regenerating `examples/data/demo.rl` reproduces the same threads and tool-call outcomes, not a byte-identical file; checkpoint ids are time-based.
+12. **CLI output, demo store and read-only inspection: Fork and Capture Limits:** Forks that miss tool results after trimmed message history, unbounded growth of the applied-tool-call set in long-lived savers, a resent INVOKED edge landing one step late, and silent fork writes-read failures remain documented known limits, not fixes.
+13. **CLI output, demo store and read-only inspection: Submission Assets:** Making the repository public, the demo video and the Devpost description are outside this specification.
 
-Judge impact non-goals:
+Replay and provenance non-goals:
 
 14. **Publishing to PyPI:** the package is installed from source; no release is published.
 15. **Making the repository public, recording the video, submitting on Devpost:** the project owner does these.
@@ -581,67 +581,67 @@ Write-path and read-side correctness non-goals:
    - *Question:* Which library should be used to render the terminal tree?
    - *Assumption:* Use `rich` for rendering the Unicode tree, color highlights, and table formatting in `relate-dag`, with `click` or `typer` for CLI argument parsing.
 
-4. **Milestone 4: Orphan Tool Results:**
+4. **Tool-call forensics and async: Orphan Tool Results:**
    - *Question:* What happens when a tool result message references a `tool_call_id` for which no `:ToolCall` node exists (for example, the AI message was never persisted)?
    - *Assumption:* The result is skipped silently: no `:ToolCall` node is created from a tool result alone, and the write succeeds (AC-49).
 
-5. **Milestone 4: Async Thread Deletion:**
+5. **Tool-call forensics and async: Async Thread Deletion:**
    - *Question:* Should `adelete_thread` be added?
    - *Assumption:* Only if a synchronous `delete_thread` exists on `RelateSaver`. As of 2026-11-17 it does not, so no `adelete_thread` override is added and the base-class behavior is unchanged (AC-55).
 
-6. **Milestone 4: Benchmark Location and Size:**
+6. **Tool-call forensics and async: Benchmark Location and Size:**
    - *Question:* Where does the benchmark script live and what checkpoint count N is used?
    - *Assumption:* A standalone script under `benchmarks/` that accepts N as a command-line argument with a small default suitable for a laptop run; the README records the N and environment used for the published numbers.
 
-7. **Judge-run fixes: Committing a gitignored file type:**
+7. **CLI output, demo store and read-only inspection: Committing a gitignored file type:**
    - *Question:* `.rl` files are gitignored; how is `examples/data/demo.rl` committed?
    - *Assumption:* A negation rule in `.gitignore` (for example `!examples/data/demo.rl`) tracks only that file; all other `.rl` files stay ignored (AC-69).
 
-8. **Judge-run fixes: Demo store without API keys:**
+8. **CLI output, demo store and read-only inspection: Demo store without API keys:**
    - *Question:* The research agent normally calls an LLM; how does `build_demo_store.py` populate `demo-research` without keys?
    - *Assumption:* The script drives both agents with scripted or fake model responses and auto-approves any human-in-the-loop interrupt, so it runs offline (AC-73).
 
-9. **Judge-run fixes: Read-only use of the committed store:**
+9. **CLI output, demo store and read-only inspection: Read-only use of the committed store:**
    - *Question:* Opening a single-file Relate store may create WAL or lock sidecars or touch the file; does that dirty the clone?
    - *Assumption:* Inspection commands open the store read-only ([ADR-0015](DECISIONS.md#adr-0015-read-only-opening-for-inspection-commands)); verified byte-identical with no sidecars (AC-75, AC-81, AC-84).
 
-10. **Judge-run fixes: Replay id in the README:**
+10. **CLI output, demo store and read-only inspection: Replay id in the README:**
     - *Question:* Checkpoint ids change when the store is regenerated; how does the README stay correct?
     - *Assumption:* The README quotes an id from the committed store and is updated whenever the store is regenerated; AC-80 detects drift.
 
-11. **Judge-run fixes: Tree width with full ids:**
+11. **CLI output, demo store and read-only inspection: Tree width with full ids:**
     - *Question:* Full UUID checkpoint ids make tree lines longer; is wrapping acceptable?
     - *Assumption:* Yes, provided each id remains a single unbroken, copyable token in redirected output (AC-62, AC-64).
 
-7. **Milestone 4: Which Writes Are Scanned for Tool Calls:**
+7. **Tool-call forensics and async: Which Writes Are Scanned for Tool Calls:**
    - *Question:* Are tool calls extracted from `put_writes` writes, from `put` checkpoint channel values, or both?
    - *Assumption:* Both: any message list written through `put_writes` or contained in the channel values passed to `put` is scanned. The `call_id` uniqueness constraint makes the overlap harmless (AC-48).
 
-12. **Judge impact: Editing the first human message:**
+12. **Replay and provenance: Editing the first human message:**
     - *Question:* Can a sandbox fork replace the first human message through `update_state` with `as_node="__start__"`?
     - *Answer (verified):* Yes, at the step 0 checkpoint, when the new message reuses the original message id (messages are replaced by id; a new id would append a duplicate, AC-100). The step -1 checkpoint holds no messages yet, so the set-message path forks at step 0 (AC-99, AC-110, AC-147, AC-149) and step -1 is an input error (AC-151).
 
-13. **Judge impact: Graph spec errors:**
+13. **Replay and provenance: Graph spec errors:**
     - *Question:* Which exception does `load_graph_factory` raise for a bad spec?
     - *Assumption:* `ValueError` or a subclass, with the spec in the message (AC-97); the CLI turns it into an `Error:` line (AC-115).
 
-14. **Judge impact: Failure summary contents:**
+14. **Replay and provenance: Failure summary contents:**
     - *Question:* Does `failure_summary()` include tools that never failed?
     - *Assumption:* No; only tools with at least one failure, ordered by failure count (AC-123).
 
-15. **Judge impact: Provenance false matches:**
+15. **Replay and provenance: Provenance false matches:**
     - *Question:* A short or common argument string can appear in an unrelated earlier write.
     - *Assumption:* Accepted as a documented heuristic limit; arguments under 3 characters are ignored and the earliest containing write wins (AC-119, AC-120).
 
-16. **Judge impact: Rebuilding the store depends on pypi.org:**
+16. **Replay and provenance: Rebuilding the store depends on pypi.org:**
     - *Question:* The committed store can now only be rebuilt with network access, and PyPI data drifts.
     - *Assumption:* Accepted: the store is rebuilt once, comparisons use outcomes not result text (AC-137), and a failed fetch leaves the existing store untouched (AC-136). The test for AC-73's offline build is replaced accordingly.
 
-17. **Judge impact: relate-db version:**
+17. **Replay and provenance: relate-db version:**
     - *Question:* Should the package require relate-db 1.1.0?
     - *Assumption:* Decided by running the full suite and benchmark on 1.1.0 in a fresh environment; either outcome satisfies AC-143.
 
-18. **Judge impact: Homepage URL form:**
+18. **Replay and provenance: Homepage URL form:**
     - *Question:* Should `Homepage` point at the repository root or its `#readme` anchor?
     - *Assumption:* `Homepage` uses `#readme`, `Repository` the root, `Issues` `/issues`; AC-142 accepts any URL under the repository.
 
