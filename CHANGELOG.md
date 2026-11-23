@@ -47,6 +47,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.4
 - Replay message previews longer than 120 characters end with `...`; the marker is display-only and never affects the diff.
 - Variable-length ancestry queries start from the target checkpoint instead of scanning the whole chain.
 - Tool-call capture sends only new statements per saver (ADR-0011) and commits without its own flush; the store is flushed on close (ADR-0014).
+- `RelateForensics` and `DAGVisualizer` open a store file read-only unless `read_only=False` is passed; with no arguments they now raise `RelateConnectionError` when `checkpoints.rl` is missing instead of creating it (AC-187, ADR-0029).
+- `detect_loops` and `relate-dag forensics loops --threshold` require a threshold of at least 2 and raise `ValueError` below it (AC-188).
+- `relate-dag tree` renders a thread's checkpoints as a flat list of siblings, with forks nested under the checkpoint they branch from, so long runs no longer indent off screen (AC-185).
+- `relate-dag forensics --help` lists the reserved subcommand names and states that thread IDs starting with `-` are not accepted as positional thread IDs.
+- The combined `relate-dag forensics <thread>` panel shows the bad-argument origin line, as `trace-error` does.
 
 ### Fixed
 - `get_tuple()` defaults omitted `checkpoint_ns` to `""` matching SqliteSaver behavior, while `list()` remains unfiltered when no namespace is specified (AC-173).
@@ -96,3 +101,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.4
 - Aligned research demo pipeline default database path to `checkpoints.rl` for zero-configuration CLI visualization.
 - Propagated startup file-lock concurrency errors and added automatic transaction rollback on failure in `RelateThreadProxy`.
 - Added flag syntax `--checkpoint / -c` support in `relate-dag replay` CLI and guarded metadata dictionary access.
+- Forensics lineage walks stay inside one thread while following forks within it (AC-181), and loop detection runs per namespace and per fork branch, so subgraphs and sibling branches are never merged (AC-182).
+- Loop detection no longer reports a single pass through the graph as a loop, resolves node names from task paths, and orders candidates deterministically (AC-25, AC-182).
+- Root-cause tracing matches poison checks on channel names only instead of value text (AC-183), prefers a tool call on the `__error__` path only at distance <= 1, and orders ties deterministically (AC-184).
+- Argument provenance narrows the origin to named nodes before falling back to `versions_seen` (ADR-0025, AC-172).
+- Replay stops the recorded leaf before the next invoke's input checkpoint (AC-186).
+- Database errors raised by tree queries reach the CLI error handler instead of being swallowed.
+- `trace_root_cause` no longer toggles the process-wide garbage collector, and long threads trace in linear time: about 1.1 s at 4,000 checkpoints, down from 6.6 s (AC-27).
+- Wide CLI tables print through a local Rich `Console` instead of mutating the shared console's private width (AC-167).
