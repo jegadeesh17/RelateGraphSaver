@@ -2013,3 +2013,87 @@ def test_committed_demo_store_tree_and_forensics_leave_it_untouched(
 
     assert result.exit_code == 0, result.output
     assert _file_state(str(DEMO_STORE)) == before
+
+
+_WALK_CLI_ROOT = "cp-cli-walk-root"
+_WALK_CLI_NEXT = "cp-cli-walk-next"
+_WALK_CLI_FORK = "cp-cli-walk-fork"
+
+
+def _build_walk_failure_store(db_file: str, thread_id: str, call_id: str) -> None:
+    """Store a thread whose failed call's result sits on a [:NEXT] child and on a fork.
+
+    Both children hold the ``ToolMessage`` in their pending writes, and the next child also
+    holds it in its channel values, as a LangGraph checkpoint does after its tool node ran.
+    """
+    result = ToolMessage(content="failed", tool_call_id=call_id, status="error")
+    request = AIMessage(
+        content="", tool_calls=[{"id": call_id, "name": "fetch", "args": {"q": "x"}}]
+    )
+
+    def config(checkpoint_id: str) -> RunnableConfig:
+        return {"configurable": {"thread_id": thread_id, "checkpoint_id": checkpoint_id}}
+
+    def checkpoint(checkpoint_id: str, parent: str | None, values: list[Any]) -> Any:
+        cp: Any = dict(empty_checkpoint())
+        cp["id"] = checkpoint_id
+        cp["channel_values"] = {"messages": values}
+        if parent:
+            cp["parent_checkpoint_id"] = parent
+        return cp
+
+    with RelateSaver(db_path=db_file) as saver:
+        saver.put(config(_WALK_CLI_ROOT), checkpoint(_WALK_CLI_ROOT, None, [request]), {}, {})
+        saver.put(
+            config(_WALK_CLI_NEXT),
+            checkpoint(_WALK_CLI_NEXT, _WALK_CLI_ROOT, [result]),
+            {"step": 1},
+            {},
+        )
+        saver.put(
+            config(_WALK_CLI_FORK), checkpoint(_WALK_CLI_FORK, _WALK_CLI_ROOT, []), {"step": 1}, {}
+        )
+        saver.put_writes(config(_WALK_CLI_NEXT), [("messages", [result])], "task-next")
+        saver.put_writes(config(_WALK_CLI_FORK), [("messages", [result])], "task-fork")
+
+
+def test_ac189_trace_error_names_the_next_child_on_every_run(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """AC-189: with the result on the [:NEXT] child and on a [:FORKED_TO] branch, trace-error
+    names the [:NEXT] child, prints the same report on every run, and leaves the store
+    byte-identical (ADR-0015)."""
+    db_file = str(tmp_path / "walk.rl")
+    thread_id = "thread-cli-walk"
+    _build_walk_failure_store(db_file, thread_id, "call-cli-walk")
+    before = _file_state(db_file)
+
+    reports: list[str] = []
+    for _ in range(3):
+        result = runner.invoke(app, ["forensics", "trace-error", thread_id, "--db", db_file])
+        assert result.exit_code == 0, result.output
+        reports.append(_flatten_usage_error(result.output))
+
+    assert all(report == reports[0] for report in reports)
+    match = re.search(r"Error Checkpoint ID: (\S+)", reports[0])
+    assert match is not None, reports[0]
+    assert match.group(1) == _WALK_CLI_NEXT
+    assert _WALK_CLI_FORK not in reports[0]
+    assert _file_state(db_file) == before
+
+
+def test_ac189_trace_error_unknown_thread_on_the_walk_store_exits_one(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """AC-189: a thread id absent from the store is reported as not found, with no error
+    checkpoint named, and the store is left unchanged."""
+    db_file = str(tmp_path / "walk-unknown.rl")
+    _build_walk_failure_store(db_file, "thread-cli-walk", "call-cli-walk-unknown")
+    before = _file_state(db_file)
+
+    result = runner.invoke(app, ["forensics", "trace-error", "thread-missing", "--db", db_file])
+
+    assert result.exit_code == 1
+    assert "Error Checkpoint ID" not in result.output
+    assert "Unexpected error" not in result.output
+    assert _file_state(db_file) == before

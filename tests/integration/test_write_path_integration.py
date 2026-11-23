@@ -16,6 +16,7 @@ Validates end-to-end interactions across:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 import threading
@@ -23,7 +24,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import Checkpoint, CheckpointMetadata, empty_checkpoint
 from langgraph.checkpoint.serde.base import SerializerProtocol
@@ -37,6 +38,7 @@ from langgraph_checkpoint_relate.errors import (
     RelateConcurrencyError,
     RelateConnectionError,
 )
+from langgraph_checkpoint_relate.forensics import RelateForensics
 from langgraph_checkpoint_relate.saver import RelateSaver
 from langgraph_checkpoint_relate.serde import RelateStateSerializer
 
@@ -473,3 +475,158 @@ def test_ac190_get_tuple_filters_a_cross_thread_link_already_in_the_file() -> No
 
         assert tup is not None
         assert tup.pending_writes == [("task-own", "channel_x", "mine")]
+
+
+def _store_child(saver: RelateSaver, thread_id: str, parent_id: str, checkpoint_id: str) -> None:
+    """Store a checkpoint whose parent is ``parent_id`` in the same thread and namespace."""
+    config: RunnableConfig = {
+        "configurable": {"thread_id": thread_id, "checkpoint_ns": "", "checkpoint_id": parent_id}
+    }
+    saver.put(config, _create_checkpoint(checkpoint_id), {"step": 1, "parents": {}}, {})
+
+
+def _failing_call_writes(call_id: str) -> list[tuple[str, Any]]:
+    """Writes for one tool call that the model requested and that then failed."""
+    request = AIMessage(
+        content="", tool_calls=[{"id": call_id, "name": "fetch", "args": {"q": "x"}}]
+    )
+    result = ToolMessage(content="boom", tool_call_id=call_id, status="error")
+    return [("messages", [request, result])]
+
+
+_FOREIGN_CASES = pytest.mark.parametrize(
+    ("other_thread", "other_ns"),
+    [("thread-b", ""), ("thread-a", "sub")],
+    ids=["other-thread", "other-namespace"],
+)
+
+
+@_FOREIGN_CASES
+def test_ac190_failed_call_from_a_mismatched_write_reaches_no_forensics_or_fork_of_thread_a(
+    other_thread: str, other_ns: str
+) -> None:
+    """AC-190: a failed call written with another thread's config is invisible to thread A's
+    root cause, failure summary and in-memory fork (ADR-0031)."""
+    root_id = "1efc0000-0000-6000-8000-0000000000d1"
+    next_id = "1efc0000-0000-6000-8000-0000000000d2"
+    call_id = "call_ac190_forensics"
+    with RelateSaver(db_path=":memory:") as saver:
+        _store_checkpoint(saver, "thread-a", root_id)
+        _store_child(saver, "thread-a", root_id, next_id)
+        saver.put_writes(
+            _write_config(other_thread, root_id, other_ns),
+            _failing_call_writes(call_id),
+            task_id="foreign-task",
+        )
+
+        assert _invoked_count(saver, root_id) == 0
+        forensics = RelateForensics(saver)
+        report = forensics.trace_root_cause("thread-a")
+        assert report.error_message == "No error detected"
+        assert not report.error_checkpoint_id
+        assert forensics.failure_summary() == []
+
+        with saver.fork_in_memory("thread-a", next_id) as fork:
+            assert (
+                _fork_count(fork, "MATCH (w:Write {task_id: 'foreign-task'}) RETURN count(w) AS n")
+                == 0
+            )
+            assert (
+                _fork_count(
+                    fork, "MATCH (tc:ToolCall {call_id: $call_id}) RETURN count(tc) AS n", call_id
+                )
+                == 0
+            )
+            assert (
+                _fork_count(
+                    fork, "MATCH (:Checkpoint)-[r:INVOKED]->(:ToolCall) RETURN count(r) AS n"
+                )
+                == 0
+            )
+
+
+def test_ac190_control_failed_call_written_by_thread_a_is_reported_and_forked() -> None:
+    """AC-190 control: the same failed call written with thread A's own config is reported,
+    so the empty result above is not caused by the forensics read path."""
+    root_id = "1efc0000-0000-6000-8000-0000000000d3"
+    next_id = "1efc0000-0000-6000-8000-0000000000d4"
+    call_id = "call_ac190_control"
+    with RelateSaver(db_path=":memory:") as saver:
+        _store_checkpoint(saver, "thread-a", root_id)
+        _store_child(saver, "thread-a", root_id, next_id)
+        saver.put_writes(_write_config("thread-a", root_id), _failing_call_writes(call_id), "own")
+
+        forensics = RelateForensics(saver)
+        report = forensics.trace_root_cause("thread-a")
+        assert report.error_checkpoint_id == root_id
+        assert [(s.tool_name, s.failures) for s in forensics.failure_summary()] == [("fetch", 1)]
+
+        with saver.fork_in_memory("thread-a", next_id) as fork:
+            assert _fork_count(fork, "MATCH (w:Write {task_id: 'own'}) RETURN count(w) AS n") == 1
+
+
+@_FOREIGN_CASES
+def test_ac190_async_put_writes_with_a_mismatched_config_links_nothing(
+    other_thread: str, other_ns: str
+) -> None:
+    """AC-190: aput_writes() stores a mismatched write unlinked, adds no [:INVOKED] edge, and
+    leaves thread A's pending writes empty (same guard as put_writes())."""
+    cp_id = "1efc0000-0000-6000-8000-0000000000e1"
+    call_id = "call_ac190_async"
+    with RelateSaver(db_path=":memory:") as saver:
+        _store_checkpoint(saver, "thread-a", cp_id)
+
+        asyncio.run(
+            saver.aput_writes(
+                _write_config(other_thread, cp_id, other_ns),
+                _failing_call_writes(call_id),
+                task_id="foreign-async",
+            )
+        )
+
+        assert _stored_writes(saver, "foreign-async") == [
+            {"thread_id": other_thread, "checkpoint_ns": other_ns, "checkpoint_id": cp_id}
+        ]
+        assert _linked_task_ids(saver, cp_id) == []
+        assert _invoked_count(saver, cp_id) == 0
+        tup = asyncio.run(saver.aget_tuple(_write_config("thread-a", cp_id)))
+        assert tup is not None
+        assert tup.pending_writes == []
+        assert RelateForensics(saver).failure_summary() == []
+
+
+@_FOREIGN_CASES
+def test_ac191_async_writes_stored_before_their_checkpoint_link_only_on_match(
+    other_thread: str, other_ns: str
+) -> None:
+    """AC-191: aput_writes() before aput() links on the checkpoint's thread and namespace only."""
+    cp_id = "1efc0000-0000-6000-8000-0000000000f1"
+    with RelateSaver(db_path=":memory:") as saver:
+        asyncio.run(
+            saver.aput_writes(
+                _write_config("thread-a", cp_id), [("channel_x", "mine")], task_id="async-match"
+            )
+        )
+        asyncio.run(
+            saver.aput_writes(
+                _write_config(other_thread, cp_id, other_ns),
+                [("channel_x", "other")],
+                task_id="async-foreign",
+            )
+        )
+        assert _linked_task_ids(saver, cp_id) == []
+
+        _store_checkpoint(saver, "thread-a", cp_id)
+
+        assert _linked_task_ids(saver, cp_id) == ["async-match"]
+        assert len(_stored_writes(saver, "async-foreign")) == 1
+        tup = saver.get_tuple(_write_config("thread-a", cp_id))
+        assert tup is not None
+        assert tup.pending_writes == [("async-match", "channel_x", "mine")]
+
+
+def _fork_count(fork: RelateSaver, query: str, call_id: str | None = None) -> int:
+    """Run a count query on an in-memory fork and return its single ``n`` value."""
+    params = {"call_id": call_id} if call_id is not None else None
+    rows = fork.proxy.execute_read(query, params)
+    return int(rows[0]["n"])

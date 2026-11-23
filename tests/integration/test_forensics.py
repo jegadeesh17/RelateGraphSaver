@@ -2517,3 +2517,98 @@ class TestFailureCheckpointWalk:
                 summary = forensics.failure_summary()
             assert [(s.tool_name, s.failures) for s in summary] == [("walk_tool", 3)]
             assert spy.edge_reads == 2
+
+
+WALK_ROOT = "cp-captured-root"
+WALK_NEXT = "cp-captured-next"
+WALK_FORK = "cp-captured-fork"
+
+
+def _put_captured_walk_thread(
+    saver: RelateSaver, thread_id: str, *, call_id: str, next_values_hold_result: bool = True
+) -> None:
+    """Build root -[:NEXT]-> next and root -[:FORKED_TO]-> fork through the public write path.
+
+    The requesting ``AIMessage`` goes in with ``put_writes()`` on the root, so capture links the
+    call to the root. The failed ``ToolMessage`` is written on the next child and on the fork.
+    When ``next_values_hold_result``, the next child's channel values also carry it, as a
+    LangGraph checkpoint does after its tool node ran.
+    """
+    root_cfg = _put_walk_checkpoint(saver, thread_id, WALK_ROOT, None, 0)
+    request = AIMessage(
+        content="",
+        tool_calls=[{"id": call_id, "name": "walk_tool", "args": {"target": WALK_SECRET}}],
+    )
+    saver.put_writes(root_cfg, [("target", WALK_SECRET), ("messages", [request])], "task-root")
+    result = ToolMessage(content="failed", tool_call_id=call_id, status="error")
+    next_values: list[AnyMessage] = [result] if next_values_hold_result else []
+    next_cfg: RunnableConfig = {
+        "configurable": {"thread_id": thread_id, "checkpoint_id": WALK_NEXT}
+    }
+    next_checkpoint: Any = dict(empty_checkpoint())
+    next_checkpoint["id"] = WALK_NEXT
+    next_checkpoint["parent_checkpoint_id"] = WALK_ROOT
+    next_checkpoint["channel_values"] = {"messages": next_values}
+    saver.put(next_cfg, next_checkpoint, {"step": 1}, {})
+    fork_cfg = _put_walk_checkpoint(saver, thread_id, WALK_FORK, WALK_ROOT, 1)
+    saver.put_writes(next_cfg, [("messages", [result])], "task-next")
+    saver.put_writes(fork_cfg, [("messages", [result])], "task-fork")
+
+
+class TestFailureSummaryAcrossForks:
+    """AC-189 with AC-123: the failure summary over a thread whose failure sits on a fork."""
+
+    THREAD = "thread-captured"
+    CALL_ID = "call-captured-1"
+
+    def test_ac189_failure_summary_counts_the_call_once_and_repeats(self) -> None:
+        """AC-189, AC-123: a result held by the [:NEXT] child and a [:FORKED_TO] branch counts
+        as one failed call, and the summary is identical across repeated calls."""
+        with RelateSaver(db_path=":memory:") as saver:
+            _put_captured_walk_thread(saver, self.THREAD, call_id=self.CALL_ID)
+            forensics = RelateForensics(saver)
+            summaries = [forensics.failure_summary() for _ in range(5)]
+            report = forensics.trace_root_cause(self.THREAD)
+
+        assert all(summary == summaries[0] for summary in summaries)
+        assert [(s.tool_name, s.failures, s.total_calls, s.threads) for s in summaries[0]] == [
+            ("walk_tool", 1, 1, (self.THREAD,))
+        ]
+        assert report.error_checkpoint_id == WALK_NEXT
+
+    def test_ac19_fork_at_the_failure_checkpoint_keeps_the_failure(self) -> None:
+        """AC-19, AC-123: an in-memory fork at the [:NEXT] child holds the failure, and the
+        branch thread named on the fork is not counted as a failing thread."""
+        with RelateSaver(db_path=":memory:") as saver:
+            _put_captured_walk_thread(saver, self.THREAD, call_id=self.CALL_ID)
+            with saver.fork_in_memory(
+                self.THREAD, WALK_NEXT, branch_thread_id="thread-branch"
+            ) as fork:
+                summaries = [RelateForensics(fork).failure_summary() for _ in range(3)]
+
+        assert all(summary == summaries[0] for summary in summaries)
+        assert [(s.tool_name, s.failures, s.threads) for s in summaries[0]] == [
+            ("walk_tool", 1, (self.THREAD,))
+        ]
+
+    def test_ac19_fork_at_the_invoking_checkpoint_has_no_failure_to_report(self) -> None:
+        """AC-19, AC-123: a fork at the checkpoint that requested the call holds no result, so
+        it reports no failed tool; the failure sits above the fork point."""
+        with RelateSaver(db_path=":memory:") as saver:
+            _put_captured_walk_thread(saver, self.THREAD, call_id=self.CALL_ID)
+            with saver.fork_in_memory(self.THREAD, WALK_ROOT) as fork:
+                summary = RelateForensics(fork).failure_summary()
+
+        assert summary == []
+
+    def test_adr0010_result_held_only_by_fork_point_writes_is_not_a_fork_failure(self) -> None:
+        """ADR-0010: a fork counts a result only when the fork point's channel values hold it,
+        so a result that exists only in the fork point's pending writes is not copied as an
+        outcome. The source store still reports the failure."""
+        with RelateSaver(db_path=":memory:") as saver:
+            _put_captured_walk_thread(
+                saver, self.THREAD, call_id=self.CALL_ID, next_values_hold_result=False
+            )
+            assert [s.failures for s in RelateForensics(saver).failure_summary()] == [1]
+            with saver.fork_in_memory(self.THREAD, WALK_NEXT) as fork:
+                assert RelateForensics(fork).failure_summary() == []
