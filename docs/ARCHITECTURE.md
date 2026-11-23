@@ -54,7 +54,7 @@ python benchmarks/bench_checkpointers.py --checkpoints 1000
 ```
 The benchmark is not collected by pytest (`testpaths = ["tests"]`, and the file is not named `test_*`). See [Benchmark](#benchmark).
 
-*Note on test performance:* Tests that run full multi-agent simulation loops, process termination crash simulations, fresh-environment installs, or large graph workloads are marked `@pytest.mark.slow`. The fast suite targets under 15 seconds but measured about 100 seconds on the development machine on 2026-11-18; new replay and demo tests reuse session-scoped stores to avoid adding to it.
+*Note on test performance:* Tests that run full multi-agent simulation loops, process termination crash simulations, fresh-environment installs, or large graph workloads are marked `@pytest.mark.slow`. The fast suite targets under 15 seconds but measured about 270 seconds on the development machine on 2026-11-23; new replay and demo tests reuse session-scoped stores to avoid adding to it.
 
 ## Components
 
