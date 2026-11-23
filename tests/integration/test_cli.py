@@ -1917,7 +1917,7 @@ def _flatten_usage_error(text: str) -> str:
 def test_threshold_below_two_is_a_usage_error_before_the_store_opens(
     runner: CliRunner, seeded_loop_db: tuple[str, str], command: str, threshold: str
 ) -> None:
-    """AC-188: --threshold below 2 is a usage error (exit 2) naming the option and the minimum,
+    """AC-193: --threshold below 2 is a usage error (exit 2) naming the option and the minimum,
     not an unexpected error, and the store file is left byte-identical."""
     db_file, thread_id = seeded_loop_db
     before = _file_state(db_file)
@@ -1938,8 +1938,8 @@ def test_threshold_below_two_is_a_usage_error_before_the_store_opens(
 def test_threshold_below_two_fails_before_a_missing_store_is_checked(
     runner: CliRunner, tmp_path: Path
 ) -> None:
-    """AC-188: validation runs before the store is looked up, so a bad threshold wins over a
-    missing database file."""
+    """AC-193: validation runs before the store is looked up, so a bad threshold wins over a
+    missing database file, and no store file is created at that path."""
     missing = str(tmp_path / "absent.rl")
 
     result = runner.invoke(app, ["forensics", "loops", "t", "--threshold", "1", "--db", missing])
@@ -1947,13 +1947,14 @@ def test_threshold_below_two_fails_before_a_missing_store_is_checked(
     assert result.exit_code == 2
     assert "--threshold" in result.stderr
     assert "not found" not in result.output
+    assert not Path(missing).exists()
 
 
 @pytest.mark.parametrize("command", ["loops", "diagnose"])
 def test_threshold_two_is_accepted(
     runner: CliRunner, seeded_loop_db: tuple[str, str], command: str
 ) -> None:
-    """AC-188: --threshold 2, the minimum, still runs the command."""
+    """AC-193: --threshold 2, the minimum, still runs the command."""
     db_file, thread_id = seeded_loop_db
 
     result = runner.invoke(

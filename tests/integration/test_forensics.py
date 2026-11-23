@@ -936,10 +936,12 @@ class TestRelateForensics:
         assert origin.checkpoint_id == ids[0]
         assert origin.hops == chain_length - 1
         # A per-row lookup on {checkpoint_id, thread_id} probes the thread index and is
-        # quadratic here (several seconds at this size); the lineage is already thread-scoped.
+        # quadratic here (several seconds at this size), so the thread is checked in a WHERE
+        # clause after the id lookup, not in the node map (ADR-0032).
         lineage_queries = [q for q in root_spy.queries + arg_spy.queries if "UNWIND $lineage" in q]
         assert lineage_queries
-        assert all("thread_id" not in q for q in lineage_queries)
+        assert all(".thread_id = $thread_id" in q for q in lineage_queries)
+        assert all("{checkpoint_id: pr.id, thread_id" not in q for q in lineage_queries)
         assert all("{checkpoint_id: pr.id}" in q for q in lineage_queries)
         # The structural bound, independent of machine speed: one thread-edge read per call,
         # and no lineage lookup whose cost grows with the chain length per row (ADR-0030).
@@ -2574,7 +2576,10 @@ class TestFailureSummaryAcrossForks:
         assert [(s.tool_name, s.failures, s.total_calls, s.threads) for s in summaries[0]] == [
             ("walk_tool", 1, 1, (self.THREAD,))
         ]
-        assert report.error_checkpoint_id == WALK_NEXT
+        # The root's own writes hold the requesting AIMessage, so its [:FORKED_TO] child is a
+        # distance-1 candidate beside the [:NEXT] child (ADR-0032); both hold the result and
+        # the lower checkpoint_id wins.
+        assert report.error_checkpoint_id == WALK_FORK
 
     def test_ac19_fork_at_the_failure_checkpoint_keeps_the_failure(self) -> None:
         """AC-19, AC-123: an in-memory fork at the [:NEXT] child holds the failure, and the
@@ -2612,3 +2617,190 @@ class TestFailureSummaryAcrossForks:
             assert [s.failures for s in RelateForensics(saver).failure_summary()] == [1]
             with saver.fork_in_memory(self.THREAD, WALK_NEXT) as fork:
                 assert RelateForensics(fork).failure_summary() == []
+
+
+RESUME_CALL_ID = "call-resume-1"
+RESUME_ROOT = "cp-resume-a-root"
+RESUME_NEW = "cp-resume-c-new"
+
+
+def _request_message(call_id: str) -> AIMessage:
+    """The ``AIMessage`` that requests one ``walk_tool`` call carrying the traceable argument."""
+    return AIMessage(
+        content="",
+        tool_calls=[{"id": call_id, "name": "walk_tool", "args": {"target": WALK_SECRET}}],
+    )
+
+
+def _put_with_messages(
+    saver: RelateSaver,
+    thread_id: str,
+    cid: str,
+    parent: str,
+    step: int,
+    messages: list[AnyMessage],
+) -> RunnableConfig:
+    """Store a checkpoint whose channel values hold ``messages``, as a LangGraph save does."""
+    cfg: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_id": cid}}
+    cp: Any = dict(empty_checkpoint())
+    cp["id"] = cid
+    cp["parent_checkpoint_id"] = parent
+    cp["channel_values"] = {"messages": messages}
+    saver.put(cfg, cp, {"step": step}, {})
+    return cfg
+
+
+def _build_resumed_thread(
+    saver: RelateSaver, thread_id: str, *, put_writes_first: bool, call_id: str = RESUME_CALL_ID
+) -> None:
+    """Build P with a [:NEXT] child, then a resumed checkpoint linked P -[:FORKED_TO]-> Y.
+
+    A tool call requested at P fails with its ``ToolMessage`` in Y's writes. The step's writes
+    (the requesting ``AIMessage``, saved on P by ``put_writes()``) and ``put()`` of Y, whose
+    channel values hold the same message, are saved in the order given, so the ``[:INVOKED]``
+    edge lands on P or on Y.
+    """
+    request = _request_message(call_id)
+    root_cfg = _put_walk_checkpoint(saver, thread_id, RESUME_ROOT, None, 0)
+    saver.put_writes(root_cfg, [("target", WALK_SECRET)], task_id="task-root")
+    _put_with_messages(saver, thread_id, "cp-resume-b-old", RESUME_ROOT, 1, [])
+    if put_writes_first:
+        saver.put_writes(root_cfg, [("messages", [request])], task_id="task-request")
+    resumed_cfg = _put_with_messages(saver, thread_id, RESUME_NEW, RESUME_ROOT, 1, [request])
+    if not put_writes_first:
+        saver.put_writes(root_cfg, [("messages", [request])], task_id="task-request")
+    result = ToolMessage(content="failed result", tool_call_id=call_id, status="error")
+    saver.put_writes(resumed_cfg, [("messages", [result])], task_id="task-tool")
+
+
+def _invoked_checkpoints(saver: RelateSaver, call_id: str) -> list[str]:
+    rows = saver.proxy.execute_read(
+        "MATCH (c:Checkpoint)-[:INVOKED]->(:ToolCall {call_id: $call_id}) "
+        "RETURN c.checkpoint_id AS cid ORDER BY cid",
+        {"call_id": call_id},
+    )
+    return [str(r["cid"]) for r in rows]
+
+
+def _failure_checkpoint(forensics: RelateForensics, thread_id: str, start: str) -> str:
+    return forensics._failure_checkpoint_id(
+        thread_id, start, RESUME_CALL_ID, forensics._thread_edges(thread_id)
+    )
+
+
+class TestFailureWalkAcrossOneFork:
+    """AC-189, AC-192 (ADR-0032): one [:FORKED_TO] first hop after a put_writes() link."""
+
+    THREAD = "thread-resume"
+
+    def test_ac192_resumed_run_reports_the_same_checkpoint_in_both_save_orders(self) -> None:
+        """AC-192: whichever save placed the [:INVOKED] edge, Y is reported with equal hops."""
+        outcomes: dict[bool, tuple[list[str], str, int | None]] = {}
+        for put_writes_first in (True, False):
+            with RelateSaver(db_path=":memory:") as saver:
+                _build_resumed_thread(saver, self.THREAD, put_writes_first=put_writes_first)
+                forks = saver.proxy.execute_read(
+                    "MATCH (:Checkpoint {checkpoint_id: $root})-[:FORKED_TO]->"
+                    "(c:Checkpoint) RETURN c.checkpoint_id AS cid",
+                    {"root": RESUME_ROOT},
+                )
+                assert [r["cid"] for r in forks] == [RESUME_NEW]
+                forensics = RelateForensics(saver)
+                reports = [forensics.trace_root_cause(self.THREAD) for _ in range(3)]
+                assert len({(r.error_checkpoint_id, r.origin_hops) for r in reports}) == 1
+                outcomes[put_writes_first] = (
+                    _invoked_checkpoints(saver, RESUME_CALL_ID),
+                    reports[0].error_checkpoint_id,
+                    reports[0].origin_hops,
+                )
+
+        # The two orders place the edge on different checkpoints (P, then Y) ...
+        assert outcomes[True][0] == [RESUME_ROOT]
+        assert outcomes[False][0] == [RESUME_NEW]
+        # ... and report the same failure checkpoint and origin distance.
+        assert outcomes[True][1] == outcomes[False][1] == RESUME_NEW
+        assert outcomes[True][2] == outcomes[False][2] == 1
+
+    def test_ac189_branch_is_not_followed_when_the_invoked_checkpoint_holds_no_request(
+        self,
+    ) -> None:
+        """AC-189: with no AIMessage in S's writes (an edge placed by put()), a result held only
+        by a [:FORKED_TO] child leaves S as the failure checkpoint."""
+        with RelateSaver(db_path=":memory:") as saver:
+            _build_resumed_thread(saver, self.THREAD, put_writes_first=True)
+            forensics = RelateForensics(saver)
+            assert _failure_checkpoint(forensics, self.THREAD, RESUME_ROOT) == RESUME_NEW
+            saver.proxy.execute_write(
+                "MATCH (:Checkpoint {checkpoint_id: $root})-[:HAS_WRITE]->"
+                "(w:Write {channel: 'messages'}) DETACH DELETE w",
+                {"root": RESUME_ROOT},
+            )
+            assert _failure_checkpoint(forensics, self.THREAD, RESUME_ROOT) == RESUME_ROOT
+
+    def test_ac189_request_for_another_call_does_not_open_the_gate(self) -> None:
+        """AC-189: S's writes hold an AIMessage, but not one requesting the failing call id."""
+        with RelateSaver(db_path=":memory:") as saver:
+            _build_resumed_thread(saver, self.THREAD, put_writes_first=True)
+            saver.proxy.execute_write(
+                "MATCH (:Checkpoint {checkpoint_id: $root})-[:HAS_WRITE]->"
+                "(w:Write {channel: 'messages'}) SET w.write_blob = $blob",
+                {
+                    "root": RESUME_ROOT,
+                    "blob": saver.serde.dumps([_request_message("call-resume-other")]),
+                },
+            )
+            forensics = RelateForensics(saver)
+            assert _failure_checkpoint(forensics, self.THREAD, RESUME_ROOT) == RESUME_ROOT
+
+    @pytest.mark.parametrize(
+        ("holders", "expected"),
+        [
+            (("cp-t-z-next", "cp-t-b-fork"), "cp-t-b-fork"),
+            (("cp-t-z-next", "cp-t-m-fork"), "cp-t-m-fork"),
+            (("cp-t-a-next", "cp-t-m-fork", "cp-t-b-fork"), "cp-t-a-next"),
+            (("cp-t-m-fork", "cp-t-b-fork"), "cp-t-b-fork"),
+        ],
+    )
+    def test_ac189_next_child_and_branches_tie_break_by_checkpoint_id(
+        self, holders: tuple[str, ...], expected: str
+    ) -> None:
+        """AC-189: S's [:NEXT] child and every [:FORKED_TO] child sit at distance 1; the lowest
+        checkpoint_id holding the result wins, on every run."""
+        next_id = "cp-t-z-next" if "cp-t-z-next" in holders else "cp-t-a-next"
+        with RelateSaver(db_path=":memory:") as saver:
+            root_cfg = _put_walk_checkpoint(saver, self.THREAD, "cp-t-root", None, 0)
+            saver.put_writes(
+                root_cfg, [("messages", [_request_message(RESUME_CALL_ID)])], "task-request"
+            )
+            configs = {
+                cid: _put_walk_checkpoint(saver, self.THREAD, cid, "cp-t-root", 1)
+                for cid in (next_id, "cp-t-m-fork", "cp-t-b-fork")
+            }
+            result = ToolMessage(content="x", tool_call_id=RESUME_CALL_ID, status="error")
+            for cid in holders:
+                saver.put_writes(configs[cid], [("messages", [result])], task_id=f"t-{cid}")
+            forensics = RelateForensics(saver)
+            picks = {_failure_checkpoint(forensics, self.THREAD, "cp-t-root") for _ in range(3)}
+
+        assert picks == {expected}
+
+    def test_ac189_branch_chain_is_followed_but_no_second_fork_edge(self) -> None:
+        """AC-189: a branch's [:NEXT] chain is walked; a [:FORKED_TO] edge below the branch is
+        not, so a result held only there leaves S as the failure checkpoint."""
+        with RelateSaver(db_path=":memory:") as saver:
+            root_cfg = _put_walk_checkpoint(saver, self.THREAD, "cp-c-root", None, 0)
+            saver.put_writes(
+                root_cfg, [("messages", [_request_message(RESUME_CALL_ID)])], "task-request"
+            )
+            _put_walk_checkpoint(saver, self.THREAD, "cp-c-next", "cp-c-root", 1)
+            _put_walk_checkpoint(saver, self.THREAD, "cp-c-fork", "cp-c-root", 1)
+            deep = _put_walk_checkpoint(saver, self.THREAD, "cp-c-fork-n1", "cp-c-fork", 2)
+            _put_walk_checkpoint(saver, self.THREAD, "cp-c-fork-n2", "cp-c-fork-n1", 3)
+            second_fork = _put_walk_checkpoint(saver, self.THREAD, "cp-c-fork-f", "cp-c-fork", 2)
+            result = ToolMessage(content="x", tool_call_id=RESUME_CALL_ID, status="error")
+            forensics = RelateForensics(saver)
+
+            saver.put_writes(second_fork, [("messages", [result])], task_id="task-second-fork")
+            assert _failure_checkpoint(forensics, self.THREAD, "cp-c-root") == "cp-c-root"
+            saver.put_writes(deep, [("messages", [result])], task_id="task-deep")
+            assert _failure_checkpoint(forensics, self.THREAD, "cp-c-root") == "cp-c-fork-n1"

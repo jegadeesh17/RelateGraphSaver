@@ -147,6 +147,17 @@ def _holds_tool_message(value: Any, tool_call_id: str) -> bool:
     return False
 
 
+def _holds_tool_call_request(value: Any, tool_call_id: str) -> bool:
+    """Return whether a write value is, or holds, the ``AIMessage`` that requested a call id."""
+    items = value if isinstance(value, (list, tuple)) else (value,)
+    for item in items:
+        if isinstance(item, AIMessage):
+            for tool_call in item.tool_calls:
+                if tool_call.get("id") == tool_call_id:
+                    return True
+    return False
+
+
 _TOOL_KEYS = {
     "direct_call_id",
     "direct_error",
@@ -601,7 +612,8 @@ class RelateForensics:
         Each entry is ``{"id": <checkpoint_id>, "d": <hops from checkpoint_id>}``, nearest
         first, starting with ``checkpoint_id`` itself at distance 0. ``backward`` walks toward
         ancestors, otherwise toward descendants. ``next_only`` ignores ``[:FORKED_TO]`` edges
-        (the failure-checkpoint walk, ADR-0030). Only checkpoints of ``thread_id`` are visited,
+        (the failure-checkpoint walk, ADR-0030; its one permitted ``[:FORKED_TO]`` first hop is
+        added by ``_failure_checkpoint_id``, ADR-0032). Only checkpoints of ``thread_id`` are visited,
         so the walk never crosses into another thread (AC-181). Empty when ``checkpoint_id``
         is not a checkpoint of the thread.
 
@@ -668,12 +680,12 @@ class RelateForensics:
             return None
         rows = self._saver.proxy.execute_read(
             "UNWIND $lineage AS pr "
-            "MATCH (a:Checkpoint {checkpoint_id: pr.id})"
-            "-[:HAS_WRITE]->(w:Write) "
+            "MATCH (a:Checkpoint {checkpoint_id: pr.id}) WHERE a.thread_id = $thread_id "
+            "MATCH (a)-[:HAS_WRITE]->(w:Write) "
             "RETURN a.checkpoint_id AS checkpoint_id, a.step AS step, pr.d + 1 AS hops, "
             "       w.channel AS channel, w.idx AS idx, w.write_blob AS write_blob, "
             "       w.task_path AS task_path",
-            {"lineage": lineage},
+            {"lineage": lineage, "thread_id": thread_id},
         )
         rows = sorted(rows, key=lambda r: (int(r.get("step") or 0), int(r.get("idx") or 0)))
         first_match: tuple[dict[str, Any], str, str] | None = None
@@ -761,36 +773,77 @@ class RelateForensics:
         tool_call_id: str,
         edges: Sequence[_Edge],
     ) -> str:
-        """Return the checkpoint where the tool's result was written (ADR-0030, AC-189).
+        """Return the checkpoint where the tool's result was written (ADR-0030, ADR-0032, AC-189).
 
-        Walks ``[:NEXT]`` edges forward from the ``[:INVOKED]`` checkpoint, within the thread
-        and never across ``[:FORKED_TO]``, visiting checkpoints in ``(distance, checkpoint_id)``
-        order, and returns the first whose writes hold a ``ToolMessage`` for the call. Falls
-        back to the ``[:INVOKED]`` checkpoint when none does or it is not in the thread.
+        Starts at the ``[:INVOKED]`` checkpoint S (distance 0) and follows ``[:NEXT]`` edges
+        forward within the thread. When ``put_writes()`` placed the edge, which holds when one
+        of S's own writes is the ``AIMessage`` requesting the call, every ``[:FORKED_TO]`` child
+        of S is also a candidate at distance 1, each followed by its own ``[:NEXT]`` chain; no
+        other ``[:FORKED_TO]`` edge is followed. Candidates are visited in
+        ``(distance, checkpoint_id)`` order and the first whose writes hold a ``ToolMessage`` for
+        the call is returned. Falls back to S when none does or S is not in the thread.
         """
         lineage = self._lineage(
             thread_id, error_checkpoint_id, edges, backward=False, next_only=True
         )
         if not lineage:
             return error_checkpoint_id
-        distance = {str(entry["id"]): int(entry["d"]) for entry in lineage}
+        next_distance = {str(entry["id"]): int(entry["d"]) for entry in lineage}
+
+        # Branch candidates come from the edges already read: S's [:FORKED_TO] children at
+        # distance 1, then their [:NEXT] chains. They are used only once the gate is true.
+        next_children: dict[str, list[str]] = {}
+        branch_roots: list[str] = []
+        for parent_id, child_id, rel_type in edges:
+            if rel_type == "NEXT":
+                next_children.setdefault(parent_id, []).append(child_id)
+            elif rel_type == "FORKED_TO" and parent_id == error_checkpoint_id:
+                branch_roots.append(child_id)
+        branch_distance: dict[str, int] = {}
+        frontier = list(dict.fromkeys(branch_roots))
+        distance = 1
+        while frontier:
+            following: list[str] = []
+            for node in frontier:
+                if node in branch_distance:
+                    continue
+                branch_distance[node] = distance
+                following.extend(next_children.get(node, ()))
+            frontier = following
+            distance += 1
+
+        candidates = dict(next_distance)
+        for node, hops in branch_distance.items():
+            candidates[node] = min(hops, candidates.get(node, hops))
         rows = self._saver.proxy.execute_read(
             "UNWIND $lineage AS pr "
-            "MATCH (c:Checkpoint {checkpoint_id: pr.id})"
-            "-[:HAS_WRITE]->(w:Write) "
+            "MATCH (c:Checkpoint {checkpoint_id: pr.id}) WHERE c.thread_id = $thread_id "
+            "MATCH (c)-[:HAS_WRITE]->(w:Write) "
             "RETURN c.checkpoint_id AS checkpoint_id, "
             "       w.channel AS channel, w.write_blob AS write_blob",
-            {"lineage": lineage},
+            {
+                "lineage": [{"id": node, "d": hops} for node, hops in candidates.items()],
+                "thread_id": thread_id,
+            },
         )
+        requested_here = False
         for row in sorted(
-            rows, key=lambda r: (distance[str(r["checkpoint_id"])], str(r["checkpoint_id"]))
+            rows, key=lambda r: (candidates[str(r["checkpoint_id"])], str(r["checkpoint_id"]))
         ):
+            checkpoint_id = str(row["checkpoint_id"])
+            if checkpoint_id not in next_distance and not requested_here:
+                # Distance-0 rows sort first, so S's own writes have all been read by now.
+                continue
             channel = str(row.get("channel") or "")
             if channel.startswith("__") or not row.get("write_blob"):
                 continue
             value = self._loads_blob(row["write_blob"], f"write on channel '{channel}'")
             if _holds_tool_message(value, tool_call_id):
-                return str(row["checkpoint_id"])
+                return checkpoint_id
+            if checkpoint_id == error_checkpoint_id and _holds_tool_call_request(
+                value, tool_call_id
+            ):
+                requested_here = True
         return error_checkpoint_id
 
     def _trace_failing_call_origin(
@@ -1097,11 +1150,14 @@ class RelateForensics:
         # 4. Backward causal path traversal across [:NEXT|FORKED_TO], [:HAS_WRITE], [:INVOKED].
         # The lineage walks NEXT and FORKED_TO edges backwards from the uniquely identified
         # error checkpoint within the same thread (AC-181); each antecedent carries its hop
-        # distance to the error checkpoint.
+        # distance to the error checkpoint. The id lookup uses the unique constraint and the
+        # WHERE keeps a row from matching another thread's checkpoint (ADR-0032); thread_id
+        # stays out of the node map so the thread index is not probed per row.
         causal_lineage = self._lineage(thread_id, error_checkpoint_id, edges, backward=True)
         causal_query = (
             "UNWIND $lineage AS pr "
             "MATCH (antecedent:Checkpoint {checkpoint_id: pr.id}) "
+            "WHERE antecedent.thread_id = $thread_id "
             "OPTIONAL MATCH (antecedent)-[:HAS_WRITE]->(w:Write) "
             "OPTIONAL MATCH (antecedent)-[:INVOKED]->(tc1:ToolCall) "
             "OPTIONAL MATCH (w)-[:INVOKED]->(tc2:ToolCall) "
@@ -1123,7 +1179,7 @@ class RelateForensics:
         )
         causal_rows = self._saver.proxy.execute_read(
             causal_query,
-            {"lineage": causal_lineage},
+            {"lineage": causal_lineage, "thread_id": thread_id},
         )
         causal_rows = _expand_causal_rows(causal_rows)
 
