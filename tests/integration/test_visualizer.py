@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import sys
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -144,3 +145,69 @@ def test_database_error_in_supporting_query_propagates(
         visualizer = DAGVisualizer(saver)
         with pytest.raises(RelateCheckpointError, match="simulated database failure"):
             visualizer.render_tree(thread)
+
+
+class TestReadOnlyDefault:
+    """AC-187 (ADR-0029): DAGVisualizer opens a file store read-only unless told otherwise."""
+
+    THREAD = "thread-ro-default"
+
+    def _seed(self, db_path: str) -> RunnableConfig:
+        with RelateSaver(db_path=db_path, wal_enabled=True) as saver:
+            _put(saver, self.THREAD, "cp-ro-1", 0)
+            return {"configurable": {"thread_id": self.THREAD, "checkpoint_id": "cp-ro-1"}}
+
+    def test_ac187_path_defaults_to_read_only_and_leaves_file_unchanged(
+        self, tmp_path: Path
+    ) -> None:
+        """AC-187: a path with no read_only argument opens read-only and the file is untouched."""
+        from langgraph_checkpoint_relate.errors import RelateReadOnlyError
+
+        db = str(tmp_path / "ro.rl")
+        cfg = self._seed(db)
+        before = Path(db).read_bytes()
+        with DAGVisualizer(db) as visualizer:
+            assert visualizer.saver.read_only is True
+            assert "cp-ro-1"[:8] in visualizer.render_to_string(self.THREAD)
+            with pytest.raises(RelateReadOnlyError):
+                visualizer.saver.put(cfg, _checkpoint_for_write(), {"step": 1}, {})
+        assert Path(db).read_bytes() == before
+
+    def test_ac187_db_path_keyword_defaults_to_read_only(self, tmp_path: Path) -> None:
+        """AC-187: the db_path keyword form also defaults to read-only."""
+        db = str(tmp_path / "ro-kw.rl")
+        self._seed(db)
+        with DAGVisualizer(db_path=db) as visualizer:
+            assert visualizer.saver.read_only is True
+
+    def test_ac187_explicit_read_only_false_opens_writable(self, tmp_path: Path) -> None:
+        """AC-187: read_only=False still opens a writable store."""
+        db = str(tmp_path / "rw.rl")
+        cfg = self._seed(db)
+        with DAGVisualizer(db, read_only=False) as visualizer:
+            assert visualizer.saver.read_only is False
+            visualizer.saver.put(cfg, _checkpoint_for_write(), {"step": 1}, {})
+
+    def test_ac187_in_memory_path_stays_writable(self) -> None:
+        """AC-187: ':memory:' has nothing to protect, so the default does not reject it."""
+        with DAGVisualizer(":memory:") as visualizer:
+            assert visualizer.saver.read_only is False
+
+    def test_ac187_missing_file_is_not_created_by_default(self, tmp_path: Path) -> None:
+        """AC-187: the read-only default does not create a missing store."""
+        db = tmp_path / "missing.rl"
+        with pytest.raises(RelateCheckpointError):
+            DAGVisualizer(str(db))
+        assert not db.exists()
+
+
+def _checkpoint_for_write() -> Any:
+    """Return a minimal checkpoint for write-attempt assertions."""
+    return {
+        "v": 1,
+        "id": "cp-ro-2",
+        "channel_values": {},
+        "channel_versions": {},
+        "versions_seen": {},
+        "updated_channels": [],
+    }

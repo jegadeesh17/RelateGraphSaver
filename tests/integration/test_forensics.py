@@ -1908,3 +1908,58 @@ class TestDeterministicTieBreakOrdering:
 
         positions = [output.index(f"task_id='{t}'") for t in ("task-a", "task-b", "task-c")]
         assert positions == sorted(positions)
+
+
+class TestReadOnlyDefault:
+    """AC-187 (ADR-0029): RelateForensics opens a file store read-only unless told otherwise."""
+
+    THREAD = "thread-ro-default"
+
+    def _seed(self, db_path: str) -> RunnableConfig:
+        with RelateSaver(db_path=db_path, wal_enabled=True) as saver:
+            cfg: RunnableConfig = {"configurable": {"thread_id": self.THREAD}}
+            return saver.put(cfg, empty_checkpoint(), {"step": 0}, {})
+
+    def _put_again(self, saver: RelateSaver, cfg: RunnableConfig) -> None:
+        saver.put(cfg, empty_checkpoint(), {"step": 1}, {})
+
+    def test_ac187_path_defaults_to_read_only_and_leaves_file_unchanged(
+        self, temp_disk_db: str
+    ) -> None:
+        """AC-187: a path with no read_only argument opens read-only and the file is untouched."""
+        from langgraph_checkpoint_relate.errors import RelateReadOnlyError
+
+        cfg = self._seed(temp_disk_db)
+        before = Path(temp_disk_db).read_bytes()
+        with RelateForensics(temp_disk_db) as forensics:
+            assert forensics.saver.read_only is True
+            assert forensics.detect_loops(self.THREAD, threshold=2) == []
+            with pytest.raises(RelateReadOnlyError):
+                self._put_again(forensics.saver, cfg)
+        assert Path(temp_disk_db).read_bytes() == before
+
+    def test_ac187_db_path_keyword_defaults_to_read_only(self, temp_disk_db: str) -> None:
+        """AC-187: the db_path keyword form also defaults to read-only."""
+        self._seed(temp_disk_db)
+        with RelateForensics(db_path=temp_disk_db) as forensics:
+            assert forensics.saver.read_only is True
+
+    def test_ac187_explicit_read_only_false_opens_writable(self, temp_disk_db: str) -> None:
+        """AC-187: read_only=False still opens a writable store."""
+        cfg = self._seed(temp_disk_db)
+        with RelateForensics(temp_disk_db, read_only=False) as forensics:
+            assert forensics.saver.read_only is False
+            self._put_again(forensics.saver, cfg)
+
+    def test_ac187_in_memory_path_stays_writable(self) -> None:
+        """AC-187: ':memory:' has nothing to protect, so the default does not reject it."""
+        with RelateForensics(":memory:") as forensics:
+            assert forensics.saver.read_only is False
+
+    def test_ac187_missing_file_is_not_created_by_default(self, temp_disk_db: str) -> None:
+        """AC-187: the read-only default does not create a missing store."""
+        from langgraph_checkpoint_relate.errors import RelateCheckpointError
+
+        with pytest.raises(RelateCheckpointError):
+            RelateForensics(temp_disk_db)
+        assert not Path(temp_disk_db).exists()

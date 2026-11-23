@@ -31,6 +31,7 @@ class DAGVisualizer:
         db_path: str | None = None,
         connection_factory: Callable[..., Any] | None = None,
         wal_enabled: bool = True,
+        read_only: bool = True,
     ) -> None:
         """Initialize DAGVisualizer.
 
@@ -39,6 +40,9 @@ class DAGVisualizer:
             db_path: Optional explicit database path if saver_or_db_path is omitted.
             connection_factory: Optional custom connection factory callable.
             wal_enabled: Whether WAL is enabled for newly initialized saver.
+            read_only: Open a file store without modifying it (AC-187, ADR-0029). Applies only
+                when this object opens the store itself; a passed RelateSaver is used as given,
+                and ":memory:" stays writable because an empty store has nothing to protect.
         """
         if isinstance(saver_or_db_path, RelateSaver):
             self._saver = saver_or_db_path
@@ -48,6 +52,7 @@ class DAGVisualizer:
                 db_path=saver_or_db_path,
                 connection_factory=connection_factory,
                 wal_enabled=wal_enabled,
+                read_only=read_only and saver_or_db_path != ":memory:",
             )
             self._owns_saver = True
         elif saver_or_db_path is None:
@@ -58,6 +63,7 @@ class DAGVisualizer:
                 db_path=resolved_path,
                 connection_factory=connection_factory,
                 wal_enabled=wal_enabled,
+                read_only=read_only and resolved_path != ":memory:",
             )
             self._owns_saver = True
         else:
