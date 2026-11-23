@@ -43,6 +43,7 @@ Reference documents:
 | [ADR-0029](#adr-0029-forensics-lineage-namespace-loop-detection-and-root-cause-priority) | Forensics Lineage, Namespace Loop Detection, and Root-Cause Priority | Accepted | 2026-11-22 |
 | [ADR-0030](#adr-0030-the-failure-checkpoint-walk-follows-next-edges-only) | The Failure-Checkpoint Walk Follows `[:NEXT]` Edges Only | Accepted | 2026-11-23 |
 | [ADR-0031](#adr-0031-writes-and-tool-calls-attach-only-to-a-checkpoint-of-their-own-thread) | Writes and Tool Calls Attach Only to a Checkpoint of Their Own Thread | Accepted | 2026-11-23 |
+| [ADR-0032](#adr-0032-the-failure-checkpoint-walk-may-cross-one-forked_to-edge-after-a-put_writes-link) | The Failure-Checkpoint Walk May Cross One `[:FORKED_TO]` Edge After a `put_writes()` Link | Accepted | 2026-11-23 |
 
 ---
 
@@ -1034,7 +1035,8 @@ We establish five forensic traversal and attribution rules:
 ## ADR-0030: The Failure-Checkpoint Walk Follows `[:NEXT]` Edges Only
 
 Date: 2026-11-23  
-Status: Accepted
+Status: Accepted  
+Amended by: [ADR-0032](#adr-0032-the-failure-checkpoint-walk-may-cross-one-forked_to-edge-after-a-put_writes-link)
 
 ### Context
 
@@ -1095,3 +1097,54 @@ Checkpoint ids are unique across the whole file, and that is exactly why this go
 - **Positive:** No change for writes and tool calls saved by LangGraph's own run loop, so stored runs and the demo store report the same results.
 - **Negative:** A cross-thread link already stored in an older file is still visible to forensics and is still copied into in-memory forks; only `get_tuple()` filters it.
 - **Negative:** A mismatched write is kept in the file with no link, where nothing reads it.
+
+---
+
+## ADR-0032: The Failure-Checkpoint Walk May Cross One `[:FORKED_TO]` Edge After a `put_writes()` Link
+
+Date: 2026-11-23  
+Status: Accepted
+
+### Context
+
+[ADR-0021](#adr-0021-tool-call-root-cause-anchors-on-the-failure-checkpoint) requires that forensics report the same failure checkpoint whichever save linked the tool call: `put_writes()` puts the `[:INVOKED]` edge on the checkpoint P that the requesting step ran from, and `put()` puts it on the next checkpoint Y. LangGraph runs these two saves on different threads, so either can win. [ADR-0030](#adr-0030-the-failure-checkpoint-walk-follows-next-edges-only) then limited the forward walk to `[:NEXT]` edges so that the same file always gives the same answer.
+
+That left one case where the answer still depends on the race. When someone resumes a thread from an earlier checkpoint P that already has a `[:NEXT]` child, `put()` links the new checkpoint as `P -[:FORKED_TO]-> Y`, and the tool's result is written on Y. If `put()` won, the edge is on Y and the walk reports Y. If `put_writes()` won, the edge is on P, the `[:NEXT]`-only walk goes down the old main line, finds no result for this call and falls back to P. We reproduced both layouts by calling the saver directly in each order. Two recordings of the same run then report a different `error_checkpoint_id` and `origin_hops` (AC-119).
+
+Which save placed the edge can be read from data the walk already loads. `put_writes()` stores a step's writes on the checkpoint the step ran from and links the call to that same checkpoint, so when it placed the edge, the `[:INVOKED]` checkpoint's own writes hold the `AIMessage` that requested the call. `put()` links the call to the checkpoint it creates. That checkpoint's channel values hold the `AIMessage`, but its writes come from the step that runs next (the tool and its `ToolMessage`), so they do not hold it.
+
+### Options Considered
+
+1. **Allow one `[:FORKED_TO]` hop as the first step, only when `put_writes()` placed the edge.** The branch the run actually created becomes reachable in exactly the layout that hid it. The other layout is unchanged.
+2. **Walk the main line first and fall back to branches when it holds no result** (alternative 2 in ADR-0030). This reopens a decision already made. When `put()` placed the edge it can name a branch that a later, unrelated resume created, and it adds a second ordering rule.
+3. **Record a known limitation.** No code change, but forensics stays race-dependent in exactly the resume (time-travel) case that the inspection tools are meant for.
+
+How to tell that `put_writes()` placed the edge:
+
+- a. **Look for the requesting `AIMessage` in the `[:INVOKED]` checkpoint's own writes.** The walk already reads and deserializes these rows at distance 0.
+- b. **Check that the `[:INVOKED]` checkpoint's channel values do not hold the `AIMessage`.** This needs an extra read of `checkpoint_blob` and deserializing the whole state.
+- c. **Store which save placed the edge as a property on `[:INVOKED]`.** This changes the write path and stored data (a tool call recording rule, see "Expensive to change" in the architecture), and it does nothing for files already written.
+
+### User's Chosen Architecture
+
+On 2026-11-23 the project owner chose option 1 with check (a). The owner's reasoning: it keeps the same-file determinism of ADR-0030, and it is the only option that restores race independence across recordings (ADR-0021).
+
+- **Start.** The walk starts at the `[:INVOKED]` checkpoint S at distance 0. If S is not a checkpoint of the thread, S is the answer, as before.
+- **Gate: "`put_writes()` placed the edge".** The gate is true when one of S's own writes (skipping channels that start with `__`, and empty or undeserializable blobs) is an `AIMessage`, or a list or tuple holding one, whose `tool_calls` has an entry with `id` equal to the failing call's `call_id`. These are the same message shapes that tool-call capture reads from written values (ADR-0005). Only S's writes are checked. S's `checkpoint_blob` is never read for this.
+- **Candidates.** The `[:NEXT]` chain from S, with distances as in ADR-0030. When the gate is true, every `[:FORKED_TO]` child F of S whose two ends are both checkpoints of the thread is also a candidate at distance 1, followed by the `[:NEXT]` chain from F at distance 1 plus its `[:NEXT]` hops. No other `[:FORKED_TO]` edge is ever followed. When S has several `[:FORKED_TO]` children, all of them sit at distance 1 alongside S's `[:NEXT]` child. A checkpoint reachable by more than one route keeps its smallest distance. Today every checkpoint has one parent, so this cannot happen.
+- **Selection** stays as in ADR-0030. Candidates are visited in `(distance, checkpoint_id)` order. The first whose writes hold a `ToolMessage` for the call is the failure checkpoint. If none does, the answer is S.
+- **Gate false** covers an edge placed by `put()`, or a call attached to a later checkpoint because its named checkpoint was not stored yet (ADR-0011). The walk is then exactly the ADR-0030 walk.
+- **Reads.** The thread's edges, with their types, are still read once per public call and shared by every walk in that call, and nothing is cached between calls. The branch candidates are computed in Python from those same edges. One writes read covers the `[:NEXT]` candidates and the branch candidates together. Distance-0 rows sort first, so the gate is settled before any distance-1 row is considered. Branch rows are skipped when the gate is false.
+- **Defense in depth.** The failure-checkpoint writes read, the causal query and the argument-origin writes read now also match the checkpoint's thread. The id stays in the node map, so the lookup uses the unique constraint, and the thread is checked in a `WHERE` clause (`... {checkpoint_id: pr.id}) WHERE c.thread_id = $thread_id`) rather than in the node map, which would probe the thread index on every row. Checkpoint ids are unique across the file today, and [ADR-0031](#adr-0031-writes-and-tool-calls-attach-only-to-a-checkpoint-of-their-own-thread) relies on that, so results do not change. The filter stops a lineage row from ever matching another thread's checkpoint if that uniqueness is ever lost, for example after a hand-edited or merged file.
+- **AC-189** still describes the walk when the gate is false. When the gate is true and both S's `[:NEXT]` child and a branch hold the result, the lower `checkpoint_id` wins. When only a branch holds it, that branch is reported instead of S.
+
+### Explicit Trade-offs Accepted
+
+- **Positive:** The resume case reports Y under both layouts. If `put()` won, Y is found at distance 0. If `put_writes()` won, the gate is true and Y is found at distance 1. `error_checkpoint_id` and `origin_hops` therefore no longer depend on the race (ADR-0021, AC-119).
+- **Positive:** One file still gives one answer on every run, because the ordering is unchanged.
+- **Positive:** Threads whose `[:INVOKED]` checkpoint has no `[:FORKED_TO]` child, including every thread of the committed demo store, report exactly what they reported before.
+- **Negative:** If the same call id holds a result on both the main line and a branch at distance 1 (a deterministic model, or a resume that re-runs the same call), the lower `checkpoint_id` wins, not necessarily the branch the recorded run produced. LangGraph checkpoint ids are time-ordered, so in practice the older main-line child wins.
+- **Negative:** The gate trusts message content. A node that writes back an `AIMessage` it did not produce, for example by returning the whole message history, makes the gate true for an edge that `put()` placed. This matters only when S's own writes hold no `ToolMessage` for the call and S has a branch.
+- **Negative:** When S has branches and the gate is false, the branch writes are still read in the single writes read and then discarded.
+- **Negative:** The thread filter applies to checkpoints, not writes. A cross-thread `[:HAS_WRITE]` link already stored in an older file (ADR-0031) is still read.
+- **Negative:** ADR-0030's remaining gap gets narrower but does not close. When the gate is false and the only result is on a branch, S is still reported.
