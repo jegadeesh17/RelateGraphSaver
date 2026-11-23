@@ -879,6 +879,76 @@ class TestRelateForensics:
         assert origin.hops == chain_length - 1
         assert arg_elapsed < 1.0
 
+    def test_trace_scales_linearly_on_long_thread_ac_27(self, temp_disk_db: str) -> None:
+        """AC-27: tracing a 2,000-checkpoint chain stays linear; lineage lookups use the id index."""
+        thread_id = "thread-scale-001"
+        chain_length = 2000
+        ids = [f"cp-scale-{n:05d}" for n in range(chain_length)]
+        with RelateSaver(db_path=temp_disk_db, wal_enabled=False) as saver:
+            # Bulk-load the chain: building it through put() would dominate the fast suite.
+            saver.proxy.execute_write(
+                "MERGE (t:Thread {thread_id: $thread_id}) "
+                "WITH t UNWIND $ids AS cid "
+                "CREATE (c:Checkpoint {checkpoint_id: cid, thread_id: $thread_id, "
+                "  checkpoint_ns: '', step: 0, created_at: '2026-11-12T00:00:00Z'}) "
+                "CREATE (t)-[:HAS_CHECKPOINT]->(c)",
+                {"thread_id": thread_id, "ids": ids},
+            )
+            saver.proxy.execute_write(
+                "UNWIND $pairs AS pr "
+                "MATCH (p:Checkpoint {checkpoint_id: pr.parent}) "
+                "MATCH (c:Checkpoint {checkpoint_id: pr.child}) "
+                "CREATE (p)-[:NEXT]->(c)",
+                {"pairs": [{"parent": a, "child": b} for a, b in zip(ids, ids[1:], strict=False)]},
+            )
+            first_cfg: RunnableConfig = {
+                "configurable": {
+                    "thread_id": thread_id,
+                    "checkpoint_ns": "",
+                    "checkpoint_id": ids[0],
+                }
+            }
+            last_cfg: RunnableConfig = {
+                "configurable": {
+                    "thread_id": thread_id,
+                    "checkpoint_ns": "",
+                    "checkpoint_id": ids[-1],
+                }
+            }
+            saver.put_writes(first_cfg, [("poison", "upstream unavailable")], task_id="task-first")
+            saver.put_writes(last_cfg, [("__error__", "Chain aborted")], task_id="task-last")
+
+            seen: list[str] = []
+            real = saver.proxy.execute_read
+
+            def spy(query: str, params: dict[str, Any] | None = None) -> Any:
+                seen.append(query)
+                return real(query, params)
+
+            started = time.perf_counter()
+            with patch.object(saver.proxy, "execute_read", side_effect=spy):
+                report = saver.trace_root_cause(thread_id)
+            root_elapsed = time.perf_counter() - started
+
+            started = time.perf_counter()
+            origin = RelateForensics(saver).trace_argument_origin(
+                thread_id, ids[-1], {"query": "upstream unavailable"}
+            )
+            arg_elapsed = time.perf_counter() - started
+
+        assert report.error_checkpoint_id == ids[-1]
+        assert report.causal_path_length == chain_length - 1
+        assert origin is not None
+        assert origin.checkpoint_id == ids[0]
+        assert origin.hops == chain_length - 1
+        # A per-row lookup on {checkpoint_id, thread_id} probes the thread index and is
+        # quadratic here (several seconds at this size); the lineage is already thread-scoped.
+        lineage_queries = [q for q in seen if "UNWIND $lineage" in q]
+        assert lineage_queries
+        assert all("thread_id" not in q for q in lineage_queries)
+        assert root_elapsed < 1.2
+        assert arg_elapsed < 0.5
+
 
 class ProvenanceState(TypedDict):
     """State for the argument provenance graph: a planner-chosen target and a message log."""

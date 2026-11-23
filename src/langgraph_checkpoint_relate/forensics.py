@@ -638,12 +638,12 @@ class RelateForensics:
             return None
         rows = self._saver.proxy.execute_read(
             "UNWIND $lineage AS pr "
-            "MATCH (a:Checkpoint {checkpoint_id: pr.id, thread_id: $thread_id})"
+            "MATCH (a:Checkpoint {checkpoint_id: pr.id})"
             "-[:HAS_WRITE]->(w:Write) "
             "RETURN a.checkpoint_id AS checkpoint_id, a.step AS step, pr.d + 1 AS hops, "
             "       w.channel AS channel, w.idx AS idx, w.write_blob AS write_blob, "
             "       w.task_path AS task_path",
-            {"lineage": lineage, "thread_id": thread_id},
+            {"lineage": lineage},
         )
         rows = sorted(rows, key=lambda r: (int(r.get("step") or 0), int(r.get("idx") or 0)))
         first_match: tuple[dict[str, Any], str, str] | None = None
@@ -733,11 +733,11 @@ class RelateForensics:
             return error_checkpoint_id
         rows = self._saver.proxy.execute_read(
             "UNWIND $lineage AS pr "
-            "MATCH (c:Checkpoint {checkpoint_id: pr.id, thread_id: $thread_id})"
+            "MATCH (c:Checkpoint {checkpoint_id: pr.id})"
             "-[:HAS_WRITE]->(w:Write) "
             "RETURN c.checkpoint_id AS checkpoint_id, pr.d + 1 AS distance, "
             "       w.channel AS channel, w.write_blob AS write_blob",
-            {"lineage": lineage, "thread_id": thread_id},
+            {"lineage": lineage},
         )
         for row in sorted(rows, key=lambda r: int(r.get("distance") or 0)):
             channel = str(row.get("channel") or "")
@@ -1042,7 +1042,7 @@ class RelateForensics:
         causal_lineage = self._lineage(thread_id, error_checkpoint_id, backward=True)
         causal_query = (
             "UNWIND $lineage AS pr "
-            "MATCH (antecedent:Checkpoint {checkpoint_id: pr.id, thread_id: $thread_id}) "
+            "MATCH (antecedent:Checkpoint {checkpoint_id: pr.id}) "
             "OPTIONAL MATCH (antecedent)-[:HAS_WRITE]->(w:Write) "
             "OPTIONAL MATCH (antecedent)-[:INVOKED]->(tc1:ToolCall) "
             "OPTIONAL MATCH (w)-[:INVOKED]->(tc2:ToolCall) "
@@ -1064,7 +1064,7 @@ class RelateForensics:
         )
         causal_rows = self._saver.proxy.execute_read(
             causal_query,
-            {"thread_id": thread_id, "lineage": causal_lineage},
+            {"lineage": causal_lineage},
         )
         causal_rows = _expand_causal_rows(causal_rows)
 
