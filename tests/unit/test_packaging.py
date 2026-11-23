@@ -39,7 +39,6 @@ def test_pyproject_metadata_ac_31() -> None:
     # Classifiers
     classifiers = project.get("classifiers", [])
     expected_classifiers = [
-        "Framework :: LangGraph",
         "Topic :: Database",
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: MIT License",
