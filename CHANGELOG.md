@@ -3,7 +3,7 @@
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.4.html).
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
@@ -39,6 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.4
 - Integration test suite validating end-to-end checkpointing, pagination, history retrieval, and multi-threaded execution.
 
 ### Changed
+- README documents the `:INVOKED` relationship in the feature list, the `RELATE_DB_PATH`, `RELATE_WAL_ENABLED`, `RELATE_PROXY_TIMEOUT_SEC` and `RELATE_LOG_LEVEL` variables with their defaults, and the `--auto-approve` flag of `examples/research_agent.py`. The Semantic Versioning link points to spec 2.0.0.
+- The example environment file lists the `RELATE_*` variables and no longer lists `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`, which no code reads.
 - Project URLs point to the public repository, and the `relate-db` requirement is now `>=1.1.0` after the full suite and the benchmark passed on 1.1.0 (ADR-0020).
 - README: a plain tagline, a "Why not X?" comparison with Neo4jSaver, SqliteSaver, built-in time travel and tracing tools, install from source, four explore commands with real output, and the benchmark rerun on relate-db 1.1.0.
 - `examples/data/demo.rl` holds a fourth thread, `demo-real-api`, recorded against pypi.org, with one failed lookup to trace; the builder leaves the existing store in place when pypi.org cannot be reached (ADR-0019).

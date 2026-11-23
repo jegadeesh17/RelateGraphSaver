@@ -18,7 +18,7 @@ It is for engineers building LangGraph agents who want durable checkpoints, a re
 ## Features
 
 - **Embedded Single-File WAL Persistence:** Persists checkpoints, intermediate channel updates, and execution metadata into a zero-configuration `.rl` database file with atomic Write-Ahead Logging.
-- **Native Cypher DAG Modeling:** Represents agent execution state as a property graph with `:Thread`, `:Checkpoint`, `:Write`, and `:ToolCall` nodes linked by causal `:NEXT`, `:FORKED_TO`, and `:HAS_WRITE` relationships.
+- **Native Cypher DAG Modeling:** Represents agent execution state as a property graph with `:Thread`, `:Checkpoint`, `:Write`, and `:ToolCall` nodes linked by causal `:NEXT`, `:FORKED_TO`, `:HAS_WRITE`, and `:INVOKED` relationships (`:INVOKED` runs from a checkpoint to the tool calls recorded there).
 - **Sandboxed In-Memory Time Travel:** Clones historical execution subgraphs up to any targeted checkpoint into an isolated `:memory:` database with `fork_in_memory()`, allowing speculative replays without altering production files.
 - **Terminal Execution Trees:** Inspect multi-agent branching structures, pending writes, and error states directly in the terminal using `relate-dag tree`.
 - **Cypher Forensic Diagnostics:** Detect cyclical state oscillations (`relate-dag forensics loops`) and trace backward causal paths from failures to offending antecedent writes or tool calls (`relate-dag forensics trace-error`).
@@ -247,6 +247,12 @@ Run the complete multi-agent research demo (Planner, Researcher, Human Review in
 python examples/research_agent.py --topic "Autonomous Agent Architecture"
 ```
 
+The demo pauses at the human review step and asks for feedback. Pass `--auto-approve` to supply the default reviewer feedback without prompting, which is what a non-interactive run needs:
+
+```bash
+python examples/research_agent.py --topic "Autonomous Agent Architecture" --auto-approve
+```
+
 ### Running the tool-calling demo
 
 `examples/tool_agent.py` needs no API key. A deterministic agent asks a `ToolNode` to run one tool, and the tool fails on purpose. RelateSaver records the call as a `:ToolCall` node, so the root cause can be traced afterwards from the database file alone (ADR-0005):
@@ -292,6 +298,19 @@ Always pass `--db`. Without it the script writes to `examples/data/demo-llm.rl`,
 ### Async usage
 
 `RelateSaver` implements the async checkpointer methods (`aget_tuple`, `alist`, `aput`, `aput_writes`), so compiled graphs work with `ainvoke` and `astream`. The synchronous methods run on worker threads, off the event loop, and writes still go through the single writer thread (ADR-0006).
+
+### Environment variables
+
+`RelateSaver` reads these variables when the matching constructor argument is not passed. The order is: constructor argument, then environment variable, then the default. An invalid value raises `ValueError` when the saver is created.
+
+| Variable | Default | Accepted values |
+| --- | --- | --- |
+| `RELATE_DB_PATH` | `:memory:` (no file) | A file path, or `:memory:` |
+| `RELATE_WAL_ENABLED` | `true` | `1`, `true`, `yes`, `on`, `0`, `false`, `no`, `off` (case-insensitive) |
+| `RELATE_PROXY_TIMEOUT_SEC` | `30.0` | A positive number of seconds |
+| `RELATE_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (case-insensitive) |
+
+`relate-dag` commands take the store path from `--db` (default `checkpoints.rl`) and do not read `RELATE_DB_PATH`. `.env.example` lists these names without values; the library reads the process environment and never loads a `.env` file, so export them in your shell. `OPENROUTER_API_KEY` is separate: only `examples/openrouter_agent.py` reads it (see [Running the LLM agent](#running-the-llm-agent)).
 
 ## How we use Relate, and why
 

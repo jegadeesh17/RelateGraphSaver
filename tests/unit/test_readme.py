@@ -451,3 +451,27 @@ def test_cli_reference_edit_flags_without_graph_are_rejected_rc_10() -> None:
     )
     assert result.exit_code != 0
     assert "--graph" in result.output
+
+
+def test_features_list_names_the_invoked_relationship_rc_10() -> None:
+    """RC-10: the feature list names `:INVOKED` beside the other graph relationships."""
+    text = _readme_text()
+    features = text[text.index("## Features") : text.index("## Why not X?")]
+    for relationship in (":NEXT", ":FORKED_TO", ":HAS_WRITE", ":INVOKED"):
+        assert f"`{relationship}`" in features, relationship
+
+
+def test_research_demo_documents_auto_approve_flag_rc_10() -> None:
+    """RC-10: the multi-agent demo section names `--auto-approve`, which the script accepts."""
+    text = _readme_text()
+    start = text.index("### Running the multi-agent demo")
+    section = text[start : text.index("### Running the tool-calling demo")]
+    assert "--auto-approve" in section
+    script = (README_PATH.parent / "examples" / "research_agent.py").read_text(encoding="utf-8")
+    assert '"--auto-approve"' in script
+
+
+def test_readme_environment_variables_section_rejects_missing_heading_rc_10() -> None:
+    """RC-10: a heading that is not in the README is reported, not silently empty."""
+    with pytest.raises(ValueError):
+        _readme_text().index("### No such section")
