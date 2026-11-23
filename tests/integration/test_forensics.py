@@ -918,22 +918,16 @@ class TestRelateForensics:
             saver.put_writes(first_cfg, [("poison", "upstream unavailable")], task_id="task-first")
             saver.put_writes(last_cfg, [("__error__", "Chain aborted")], task_id="task-last")
 
-            seen: list[str] = []
-            real = saver.proxy.execute_read
-
-            def spy(query: str, params: dict[str, Any] | None = None) -> Any:
-                seen.append(query)
-                return real(query, params)
-
             started = time.perf_counter()
-            with patch.object(saver.proxy, "execute_read", side_effect=spy):
+            with _EdgeReadSpy(saver) as root_spy:
                 report = saver.trace_root_cause(thread_id)
             root_elapsed = time.perf_counter() - started
 
             started = time.perf_counter()
-            origin = RelateForensics(saver).trace_argument_origin(
-                thread_id, ids[-1], {"query": "upstream unavailable"}
-            )
+            with _EdgeReadSpy(saver) as arg_spy:
+                origin = RelateForensics(saver).trace_argument_origin(
+                    thread_id, ids[-1], {"query": "upstream unavailable"}
+                )
             arg_elapsed = time.perf_counter() - started
 
         assert report.error_checkpoint_id == ids[-1]
@@ -943,11 +937,17 @@ class TestRelateForensics:
         assert origin.hops == chain_length - 1
         # A per-row lookup on {checkpoint_id, thread_id} probes the thread index and is
         # quadratic here (several seconds at this size); the lineage is already thread-scoped.
-        lineage_queries = [q for q in seen if "UNWIND $lineage" in q]
+        lineage_queries = [q for q in root_spy.queries + arg_spy.queries if "UNWIND $lineage" in q]
         assert lineage_queries
         assert all("thread_id" not in q for q in lineage_queries)
-        assert root_elapsed < 1.2
-        assert arg_elapsed < 0.5
+        assert all("{checkpoint_id: pr.id}" in q for q in lineage_queries)
+        # The structural bound, independent of machine speed: one thread-edge read per call,
+        # and no lineage lookup whose cost grows with the chain length per row (ADR-0030).
+        assert root_spy.edge_reads == 1
+        assert arg_spy.edge_reads == 1
+        # Wall-clock bounds are a coarse backstop, with several times the measured time.
+        assert root_elapsed < 4.0
+        assert arg_elapsed < 2.0
 
 
 class ProvenanceState(TypedDict):
@@ -1611,11 +1611,16 @@ class TestFailureSummary:
                 assert origin.checkpoint_id == cid_root
                 assert origin.hops == 2
 
-                # _failure_checkpoint_id traverses forward across FORKED_TO to cp_fork
+                # The forward failure-checkpoint walk follows [:NEXT] only (ADR-0030, AC-189):
+                # cp_main holds no result, and cp_fork is reachable only across FORKED_TO, so
+                # the [:INVOKED] checkpoint is reported.
                 fail_cp = forensics._failure_checkpoint_id(
-                    thread_id, cid_root, "call-root-fail-181"
+                    thread_id,
+                    cid_root,
+                    "call-root-fail-181",
+                    forensics._thread_edges(thread_id),
                 )
-                assert fail_cp == cid_fork
+                assert fail_cp == cid_root
 
                 # Under AC-184, distant tool call at distance 2 is not blamed on the __error__ path;
                 # the nearest antecedent write at distance 1 is identified instead.
@@ -1700,7 +1705,10 @@ class TestFailureSummary:
 
                 # Thread 1's _failure_checkpoint_id does NOT traverse into Thread 2
                 fail_cp_t1 = forensics._failure_checkpoint_id(
-                    thread_t1, cid_t1_root, "call-root-fail-181"
+                    thread_t1,
+                    cid_t1_root,
+                    "call-root-fail-181",
+                    forensics._thread_edges(thread_t1),
                 )
                 assert fail_cp_t1 == cid_t1_root
 
@@ -2282,3 +2290,230 @@ class TestReadOnlyDefault:
         with pytest.raises(RelateCheckpointError):
             RelateForensics(temp_disk_db)
         assert not Path(temp_disk_db).exists()
+
+
+WALK_CALL_ID = "call-walk-1"
+WALK_SECRET = "val-walk-secret"
+
+
+def _put_walk_checkpoint(
+    saver: RelateSaver, thread_id: str, cid: str, parent: str | None, step: int
+) -> RunnableConfig:
+    """Store one checkpoint with a fixed id and parent, and return its config."""
+    cfg: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_id": cid}}
+    cp: Any = dict(empty_checkpoint())
+    cp["id"] = cid
+    if parent:
+        cp["parent_checkpoint_id"] = parent
+    saver.put(cfg, cp, {"step": step}, {})
+    return cfg
+
+
+def _add_failing_call(saver: RelateSaver, cid: str, call_id: str) -> None:
+    """Link a failed ``:ToolCall`` carrying one traceable argument to checkpoint ``cid``."""
+    saver.proxy.execute_write(
+        "CREATE (tc:ToolCall {call_id: $call_id, tool_name: 'walk_tool', args_blob: $args, "
+        "error: 'boom', created_at: '2026-11-23T00:00:00Z'}) "
+        "WITH tc MATCH (c:Checkpoint {checkpoint_id: $cid}) MERGE (c)-[:INVOKED]->(tc)",
+        {
+            "call_id": call_id,
+            "args": saver.serde.dumps({"target": WALK_SECRET}),
+            "cid": cid,
+        },
+    )
+
+
+def _build_walk_thread(
+    saver: RelateSaver,
+    thread_id: str,
+    *,
+    root: str,
+    next_chain: list[str],
+    fork: str,
+    next_holder: str | None,
+    fork_holds: bool,
+    call_id: str = WALK_CALL_ID,
+) -> None:
+    """Build root -[:NEXT]-> next_chain... plus root -[:FORKED_TO]-> fork, then store results.
+
+    ``put()`` links a checkpoint's first child by ``[:NEXT]`` and later ones by
+    ``[:FORKED_TO]``, so the fork is stored after the chain. The ``ToolMessage`` for
+    ``call_id`` is written on ``next_holder`` and, when ``fork_holds``, on the fork.
+    """
+    root_cfg = _put_walk_checkpoint(saver, thread_id, root, None, 0)
+    saver.put_writes(root_cfg, [("target", WALK_SECRET)], task_id=f"task-{root}")
+    _add_failing_call(saver, root, call_id)
+    configs: dict[str, RunnableConfig] = {}
+    prev = root
+    for offset, cid in enumerate(next_chain, start=1):
+        configs[cid] = _put_walk_checkpoint(saver, thread_id, cid, prev, offset)
+        prev = cid
+    configs[fork] = _put_walk_checkpoint(saver, thread_id, fork, root, 1)
+    result = ToolMessage(content="failed result", tool_call_id=call_id, status="error")
+    if next_holder is not None:
+        saver.put_writes(configs[next_holder], [("messages", [result])], task_id="task-next")
+    if fork_holds:
+        saver.put_writes(configs[fork], [("messages", [result])], task_id="task-fork")
+
+
+class _EdgeReadSpy:
+    """Counts the thread-edge reads (the ``[:NEXT|FORKED_TO]`` lineage query) a saver issues."""
+
+    def __init__(self, saver: RelateSaver) -> None:
+        self.queries: list[str] = []
+        self._real = saver.proxy.execute_read
+        self._patch = patch.object(saver.proxy, "execute_read", side_effect=self._spy)
+
+    def _spy(self, query: str, params: dict[str, Any] | None = None) -> Any:
+        self.queries.append(query)
+        return self._real(query, params)
+
+    def __enter__(self) -> _EdgeReadSpy:
+        self._patch.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._patch.stop()
+
+    @property
+    def edge_reads(self) -> int:
+        return sum(1 for q in self.queries if "NEXT|FORKED_TO" in q)
+
+
+class TestFailureCheckpointWalk:
+    """AC-189 (ADR-0030): the failure checkpoint follows [:NEXT] only, in a fixed order."""
+
+    THREAD = "thread-walk"
+
+    @pytest.mark.parametrize(
+        ("next_id", "fork_id"),
+        [("cp-walk-z-next", "cp-walk-a-fork"), ("cp-walk-a-next", "cp-walk-z-fork")],
+    )
+    def test_ac189_next_successor_wins_over_fork_at_same_distance(
+        self, next_id: str, fork_id: str
+    ) -> None:
+        """AC-189: both children hold the result; the [:NEXT] one is always reported."""
+        with RelateSaver(db_path=":memory:") as saver:
+            _build_walk_thread(
+                saver,
+                self.THREAD,
+                root="cp-walk-root",
+                next_chain=[next_id],
+                fork=fork_id,
+                next_holder=next_id,
+                fork_holds=True,
+            )
+            forks = saver.proxy.execute_read(
+                "MATCH (:Checkpoint {checkpoint_id: $root})-[:FORKED_TO]->"
+                "(c:Checkpoint {checkpoint_id: $fork}) RETURN count(c) AS n",
+                {"root": "cp-walk-root", "fork": fork_id},
+            )
+            assert forks[0]["n"] == 1
+            forensics = RelateForensics(saver)
+            reports = [forensics.trace_root_cause(self.THREAD) for _ in range(5)]
+
+        assert {r.error_checkpoint_id for r in reports} == {next_id}
+        assert {r.origin_hops for r in reports} == {1}
+        assert {r.origin_argument for r in reports} == {"target"}
+
+    def test_ac189_deeper_next_result_beats_nearer_fork_result(self) -> None:
+        """AC-189: a result on the fork one hop away is ignored for one two hops down [:NEXT]."""
+        with RelateSaver(db_path=":memory:") as saver:
+            _build_walk_thread(
+                saver,
+                self.THREAD,
+                root="cp-walk-root",
+                next_chain=["cp-walk-n1", "cp-walk-n2"],
+                fork="cp-walk-f1",
+                next_holder="cp-walk-n2",
+                fork_holds=True,
+            )
+            forensics = RelateForensics(saver)
+            reports = [forensics.trace_root_cause(self.THREAD) for _ in range(5)]
+
+        assert {r.error_checkpoint_id for r in reports} == {"cp-walk-n2"}
+        assert {r.origin_hops for r in reports} == {2}
+
+    def test_ac189_result_only_on_fork_reports_the_invoked_checkpoint(self) -> None:
+        """AC-189: with no result on the [:NEXT] chain the [:INVOKED] checkpoint is reported."""
+        with RelateSaver(db_path=":memory:") as saver:
+            _build_walk_thread(
+                saver,
+                self.THREAD,
+                root="cp-walk-root",
+                next_chain=["cp-walk-n1"],
+                fork="cp-walk-f1",
+                next_holder=None,
+                fork_holds=True,
+            )
+            forensics = RelateForensics(saver)
+            reports = [forensics.trace_root_cause(self.THREAD) for _ in range(5)]
+
+        assert {r.error_checkpoint_id for r in reports} == {"cp-walk-root"}
+        assert {r.origin_hops for r in reports} == {0}
+
+    def test_ac189_invoked_checkpoint_outside_the_thread_is_returned_unchanged(self) -> None:
+        """AC-189: an unknown thread or checkpoint falls back to the [:INVOKED] checkpoint."""
+        with RelateSaver(db_path=":memory:") as saver:
+            _build_walk_thread(
+                saver,
+                self.THREAD,
+                root="cp-walk-root",
+                next_chain=["cp-walk-n1"],
+                fork="cp-walk-f1",
+                next_holder="cp-walk-n1",
+                fork_holds=False,
+            )
+            forensics = RelateForensics(saver)
+            other_edges = forensics._thread_edges("thread-elsewhere")
+            assert other_edges == []
+            assert (
+                forensics._failure_checkpoint_id(
+                    "thread-elsewhere", "cp-walk-root", WALK_CALL_ID, other_edges
+                )
+                == "cp-walk-root"
+            )
+            edges = forensics._thread_edges(self.THREAD)
+            assert (
+                forensics._failure_checkpoint_id(self.THREAD, "cp-walk-nope", WALK_CALL_ID, edges)
+                == "cp-walk-nope"
+            )
+
+    def test_ac27_each_public_call_reads_a_threads_edges_once(self) -> None:
+        """AC-27, AC-189: one edge read per trace_root_cause, trace_argument_origin and thread."""
+        with RelateSaver(db_path=":memory:") as saver:
+            for thread in ("thread-walk-a", "thread-walk-b"):
+                _build_walk_thread(
+                    saver,
+                    thread,
+                    root=f"cp-{thread}-root",
+                    next_chain=[f"cp-{thread}-n1", f"cp-{thread}-n2"],
+                    fork=f"cp-{thread}-f1",
+                    next_holder=f"cp-{thread}-n2",
+                    fork_holds=True,
+                    call_id=f"call-{thread}",
+                )
+            # A second failed call in thread A must not cause a second read of its edges.
+            _add_failing_call(saver, "cp-thread-walk-a-root", "call-thread-walk-a-second")
+            forensics = RelateForensics(saver)
+
+            with _EdgeReadSpy(saver) as spy:
+                report = forensics.trace_root_cause("thread-walk-a")
+            assert report.error_checkpoint_id == "cp-thread-walk-a-n2"
+            assert spy.edge_reads == 1
+
+            with _EdgeReadSpy(saver) as spy:
+                origin = forensics.trace_argument_origin(
+                    "thread-walk-a", "cp-thread-walk-a-n2", {"target": WALK_SECRET}
+                )
+            assert origin is not None
+            assert spy.edge_reads == 1
+
+            with _EdgeReadSpy(saver) as spy:
+                assert forensics.trace_argument_origin("thread-walk-a", "cp-x", {"n": 1}) is None
+            assert spy.edge_reads == 0
+
+            with _EdgeReadSpy(saver) as spy:
+                summary = forensics.failure_summary()
+            assert [(s.tool_name, s.failures) for s in summary] == [("walk_tool", 3)]
+            assert spy.edge_reads == 2

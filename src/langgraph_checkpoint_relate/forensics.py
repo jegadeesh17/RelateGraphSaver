@@ -24,6 +24,10 @@ from langgraph_checkpoint_relate.saver import RelateSaver, _extract_bytes
 
 logger = logging.getLogger(__name__)
 
+# One stored lineage edge between two checkpoints of a thread: (parent id, child id, type),
+# where type is "NEXT" or "FORKED_TO".
+_Edge = tuple[str, str, str]
+
 # Suffix LangGraph's ToolNode appends to tool error messages; hidden from reports (AC-65).
 _LANGGRAPH_ERROR_SUFFIX = " Please fix your mistakes."
 
@@ -567,19 +571,43 @@ class RelateForensics:
         )
         return tuple(changed)
 
+    def _thread_edges(self, thread_id: str) -> list[_Edge]:
+        """Read the ``[:NEXT|FORKED_TO]`` edges whose two ends are checkpoints of the thread.
+
+        Called once per public forensics call; the result is passed to every walk in that call
+        and is never kept on the instance, because a writable saver can gain checkpoints
+        between calls (ADR-0030).
+        """
+        rows = self._saver.proxy.execute_read(
+            "MATCH (p:Checkpoint {thread_id: $thread_id})-[r:NEXT|FORKED_TO]->"
+            "(c:Checkpoint {thread_id: $thread_id}) "
+            "RETURN p.checkpoint_id AS parent_id, c.checkpoint_id AS child_id, "
+            "       type(r) AS rel_type",
+            {"thread_id": thread_id},
+        )
+        return [(str(r["parent_id"]), str(r["child_id"]), str(r["rel_type"])) for r in rows]
+
     def _lineage(
-        self, thread_id: str, checkpoint_id: str, *, backward: bool
+        self,
+        thread_id: str,
+        checkpoint_id: str,
+        edges: Sequence[_Edge],
+        *,
+        backward: bool,
+        next_only: bool = False,
     ) -> list[dict[str, Any]]:
         """Return the checkpoints reachable from ``checkpoint_id`` along ``[:NEXT|FORKED_TO]``.
 
         Each entry is ``{"id": <checkpoint_id>, "d": <hops from checkpoint_id>}``, nearest
         first, starting with ``checkpoint_id`` itself at distance 0. ``backward`` walks toward
-        ancestors, otherwise toward descendants. Only checkpoints of ``thread_id`` are visited,
-        so the walk never crosses into another thread (AC-180). Empty when ``checkpoint_id``
+        ancestors, otherwise toward descendants. ``next_only`` ignores ``[:FORKED_TO]`` edges
+        (the failure-checkpoint walk, ADR-0030). Only checkpoints of ``thread_id`` are visited,
+        so the walk never crosses into another thread (AC-181). Empty when ``checkpoint_id``
         is not a checkpoint of the thread.
 
-        The thread's edges are read once and walked here: a variable-length Cypher path
-        pattern enumerates every path, which is quadratic on a long chain.
+        ``edges`` are the thread's edges from ``_thread_edges``, read once per public call
+        and walked here: a variable-length Cypher path pattern enumerates every path, which
+        is quadratic on a long chain.
         """
         start = self._saver.proxy.execute_read(
             "MATCH (c:Checkpoint {checkpoint_id: $id, thread_id: $thread_id}) "
@@ -588,20 +616,12 @@ class RelateForensics:
         )
         if not start:
             return []
-        edges = self._saver.proxy.execute_read(
-            "MATCH (p:Checkpoint {thread_id: $thread_id})-[:NEXT|FORKED_TO]->"
-            "(c:Checkpoint {thread_id: $thread_id}) "
-            "RETURN p.checkpoint_id AS parent_id, c.checkpoint_id AS child_id",
-            {"thread_id": thread_id},
-        )
         neighbors: dict[str, list[str]] = {}
-        for edge in edges:
-            near, far = (
-                (edge["child_id"], edge["parent_id"])
-                if backward
-                else (edge["parent_id"], edge["child_id"])
-            )
-            neighbors.setdefault(str(near), []).append(str(far))
+        for parent_id, child_id, rel_type in edges:
+            if next_only and rel_type != "NEXT":
+                continue
+            near, far = (child_id, parent_id) if backward else (parent_id, child_id)
+            neighbors.setdefault(near, []).append(far)
 
         distances: dict[str, int] = {checkpoint_id: 0}
         frontier = [checkpoint_id]
@@ -616,9 +636,17 @@ class RelateForensics:
         return [{"id": node, "d": dist} for node, dist in distances.items()]
 
     def _argument_origin(
-        self, thread_id: str, error_checkpoint_id: str, args: Mapping[str, Any]
+        self,
+        thread_id: str,
+        error_checkpoint_id: str,
+        args: Mapping[str, Any],
+        edges: Sequence[_Edge] | None = None,
     ) -> tuple[ArgumentOrigin, tuple[str, ...]] | None:
-        """Find the earliest write holding a tool call's argument, returning origin and origin nodes (ADR-0018, ADR-0025)."""
+        """Find the earliest write holding a tool call's argument, returning origin and origin nodes (ADR-0018, ADR-0025).
+
+        ``edges`` are the thread's edges when the caller already read them; otherwise they are
+        read here, once, and only when an argument is traceable.
+        """
         if not isinstance(thread_id, str) or not thread_id.strip():
             raise CheckpointNotFoundError("thread_id must be a non-empty string.")
         if not isinstance(error_checkpoint_id, str) or not error_checkpoint_id.strip():
@@ -633,7 +661,9 @@ class RelateForensics:
         if not candidates:
             return None
 
-        lineage = self._lineage(thread_id, error_checkpoint_id, backward=True)
+        if edges is None:
+            edges = self._thread_edges(thread_id)
+        lineage = self._lineage(thread_id, error_checkpoint_id, edges, backward=True)
         if not lineage:
             return None
         rows = self._saver.proxy.execute_read(
@@ -725,21 +755,36 @@ class RelateForensics:
         return res[0] if res is not None else None
 
     def _failure_checkpoint_id(
-        self, thread_id: str, error_checkpoint_id: str, tool_call_id: str
+        self,
+        thread_id: str,
+        error_checkpoint_id: str,
+        tool_call_id: str,
+        edges: Sequence[_Edge],
     ) -> str:
-        """Return the first checkpoint at or after the error whose writes hold the tool's result."""
-        lineage = self._lineage(thread_id, error_checkpoint_id, backward=False)
+        """Return the checkpoint where the tool's result was written (ADR-0030, AC-189).
+
+        Walks ``[:NEXT]`` edges forward from the ``[:INVOKED]`` checkpoint, within the thread
+        and never across ``[:FORKED_TO]``, visiting checkpoints in ``(distance, checkpoint_id)``
+        order, and returns the first whose writes hold a ``ToolMessage`` for the call. Falls
+        back to the ``[:INVOKED]`` checkpoint when none does or it is not in the thread.
+        """
+        lineage = self._lineage(
+            thread_id, error_checkpoint_id, edges, backward=False, next_only=True
+        )
         if not lineage:
             return error_checkpoint_id
+        distance = {str(entry["id"]): int(entry["d"]) for entry in lineage}
         rows = self._saver.proxy.execute_read(
             "UNWIND $lineage AS pr "
             "MATCH (c:Checkpoint {checkpoint_id: pr.id})"
             "-[:HAS_WRITE]->(w:Write) "
-            "RETURN c.checkpoint_id AS checkpoint_id, pr.d + 1 AS distance, "
+            "RETURN c.checkpoint_id AS checkpoint_id, "
             "       w.channel AS channel, w.write_blob AS write_blob",
             {"lineage": lineage},
         )
-        for row in sorted(rows, key=lambda r: int(r.get("distance") or 0)):
+        for row in sorted(
+            rows, key=lambda r: (distance[str(r["checkpoint_id"])], str(r["checkpoint_id"]))
+        ):
             channel = str(row.get("channel") or "")
             if channel.startswith("__") or not row.get("write_blob"):
                 continue
@@ -753,6 +798,7 @@ class RelateForensics:
         thread_id: str,
         error_checkpoint_id: str,
         tool_call_id: str,
+        edges: Sequence[_Edge],
         *,
         anchored: bool = False,
     ) -> ArgumentOrigin | None:
@@ -771,6 +817,7 @@ class RelateForensics:
             error_checkpoint_id,
             tool_call_id,
             rows[0].get("args_blob"),
+            edges,
             anchored=anchored,
         )
         return res[0] if res is not None else None
@@ -781,6 +828,7 @@ class RelateForensics:
         error_checkpoint_id: str,
         tool_call_id: str,
         args_blob: Any,
+        edges: Sequence[_Edge],
         *,
         anchored: bool = False,
     ) -> tuple[ArgumentOrigin, tuple[str, ...]] | None:
@@ -797,9 +845,9 @@ class RelateForensics:
         start = (
             error_checkpoint_id
             if anchored
-            else self._failure_checkpoint_id(thread_id, error_checkpoint_id, tool_call_id)
+            else self._failure_checkpoint_id(thread_id, error_checkpoint_id, tool_call_id, edges)
         )
-        return self._argument_origin(thread_id, start, args)
+        return self._argument_origin(thread_id, start, args, edges)
 
     def failure_summary(self) -> list[ToolFailureSummary]:
         """Summarize failing tool calls across every thread in the store (AC-123).
@@ -837,6 +885,8 @@ class RelateForensics:
         failed_threads: dict[str, set[str]] = {}
         failures: dict[str, int] = {}
         origin_nodes: dict[str, set[str]] = {}
+        # Each thread's edges are read once for this call, however many of its calls failed.
+        thread_edges: dict[str, list[_Edge]] = {}
         for (thread_id, call_id), row in sorted(calls.items()):
             tool_name = str(row.get("tool_name") or "<unknown>")
             totals[tool_name] = totals.get(tool_name, 0) + 1
@@ -844,8 +894,14 @@ class RelateForensics:
                 continue
             failures[tool_name] = failures.get(tool_name, 0) + 1
             failed_threads.setdefault(tool_name, set()).add(thread_id)
+            if thread_id not in thread_edges:
+                thread_edges[thread_id] = self._thread_edges(thread_id)
             res = self._trace_call_args_origin(
-                thread_id, str(row["checkpoint_id"]), call_id, row.get("args_blob")
+                thread_id,
+                str(row["checkpoint_id"]),
+                call_id,
+                row.get("args_blob"),
+                thread_edges[thread_id],
             )
             if res is not None:
                 origin, nodes = res
@@ -986,7 +1042,10 @@ class RelateForensics:
                 diagnostic_summary="Workflow completed without errors.",
             )
 
-        # Failure identified; extract error details
+        # Failure identified; extract error details. The thread's edges are read once here and
+        # shared by the forward failure-checkpoint walk, the causal lineage and the origin
+        # trace (ADR-0030).
+        edges = self._thread_edges(thread_id)
         err_rec = error_records[0]
         error_checkpoint_id = str(err_rec["checkpoint_id"])
         failed_call_id = err_rec.get("tool_call_id")
@@ -996,7 +1055,7 @@ class RelateForensics:
             # the edge can sit on either. Anchor on the checkpoint where the tool failed, which
             # is the same in both cases, so the report does not depend on that race.
             error_checkpoint_id = self._failure_checkpoint_id(
-                thread_id, error_checkpoint_id, str(failed_call_id)
+                thread_id, error_checkpoint_id, str(failed_call_id), edges
             )
 
         error_message = ""
@@ -1037,9 +1096,9 @@ class RelateForensics:
 
         # 4. Backward causal path traversal across [:NEXT|FORKED_TO], [:HAS_WRITE], [:INVOKED].
         # The lineage walks NEXT and FORKED_TO edges backwards from the uniquely identified
-        # error checkpoint within the same thread (AC-180); each antecedent carries its hop
+        # error checkpoint within the same thread (AC-181); each antecedent carries its hop
         # distance to the error checkpoint.
-        causal_lineage = self._lineage(thread_id, error_checkpoint_id, backward=True)
+        causal_lineage = self._lineage(thread_id, error_checkpoint_id, edges, backward=True)
         causal_query = (
             "UNWIND $lineage AS pr "
             "MATCH (antecedent:Checkpoint {checkpoint_id: pr.id}) "
@@ -1165,6 +1224,7 @@ class RelateForensics:
                 thread_id,
                 error_checkpoint_id,
                 root_tool_call_id,
+                edges,
                 anchored=bool(failed_call_id) and root_tool_call_id == str(failed_call_id),
             )
 
