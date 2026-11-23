@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Annotated, Any, TypedDict, cast
 
 import pytest
+import relate
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
@@ -1839,3 +1840,112 @@ def test_print_wide_keeps_cell_wider_than_console_on_one_line(
     assert "…" not in fake_stream.getvalue()
     assert max(len(line) for line in lines) > 40
     assert test_console.width == 40
+
+
+class _FaultyDriverConnection:
+    """Forward to a real relate-db connection, failing any statement that contains a fragment.
+
+    Stands in for a driver fault on one query; every other statement reaches the real driver.
+    """
+
+    def __init__(self, inner: Any, failing_fragment: str) -> None:
+        self._inner = inner
+        self._failing_fragment = failing_fragment
+
+    def execute(self, query: str, params: Any = None) -> Any:
+        if self._failing_fragment in query:
+            raise RuntimeError("simulated driver fault: page read failed")
+        if params is None:
+            return self._inner.execute(query)
+        return self._inner.execute(query, params)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+def test_tree_reports_database_error_and_exits_one(
+    runner: CliRunner, seeded_db: tuple[str, str, list[str]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A database error raised by the tree query reaches the CLI as 'Database error', exit 1."""
+    db_file, thread_id, _ = seeded_db
+    real_connect = relate.connect
+    tree_query = (
+        "MATCH (c:Checkpoint {thread_id: $thread_id}) RETURN c.checkpoint_id AS checkpoint_id"
+    )
+
+    def faulty_connect(*args: Any, **kwargs: Any) -> _FaultyDriverConnection:
+        return _FaultyDriverConnection(real_connect(*args, **kwargs), tree_query)
+
+    monkeypatch.setattr(relate, "connect", faulty_connect)
+    result = runner.invoke(app, ["tree", thread_id, "--db", db_file])
+
+    assert result.exit_code == 1
+    assert "Database error" in result.output
+    assert "simulated driver fault" in result.output
+    assert "Unexpected error" not in result.output
+
+
+def test_loops_threshold_below_two_is_refused_on_stderr(
+    runner: CliRunner, seeded_loop_db: tuple[str, str]
+) -> None:
+    """AC-188: --threshold 1 exits 1 with the threshold message on stderr and prints no table."""
+    db_file, thread_id = seeded_loop_db
+
+    result = runner.invoke(
+        app, ["forensics", "loops", thread_id, "--threshold", "1", "--db", db_file]
+    )
+
+    assert result.exit_code == 1
+    assert "threshold must be an integer >= 2, got 1" in result.stderr
+    assert "Detected Loops" not in result.output
+
+
+@pytest.fixture(scope="module")
+def origin_db(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """Module-scoped store with one run whose failing tool call carries a traceable argument."""
+    db_file = str(tmp_path_factory.mktemp("origin_store") / "origin.rl")
+    _run_origin_graph(db_file, "origin-fail", "pkg-alpha-9000")
+    return db_file
+
+
+def test_combined_forensics_by_path_shows_origin_and_leaves_store_unchanged(
+    runner: CliRunner, origin_db: str
+) -> None:
+    """AC-122, AC-84: the combined summary of a store opened by path shows the origin line
+    and leaves the store file and its directory unchanged."""
+    before = _file_state(origin_db)
+
+    result = runner.invoke(app, ["forensics", "origin-fail", "--db", origin_db])
+
+    assert result.exit_code == 0, result.output
+    assert (
+        "Bad argument origin: url came from node planner (step 0, 2 hops before failure)"
+        in _flatten(result.output)
+    )
+    assert _file_state(origin_db) == before
+
+
+def test_combined_forensics_unknown_thread_leaves_store_unchanged(
+    runner: CliRunner, origin_db: str
+) -> None:
+    """AC-84: a thread with no checkpoints exits 1 and does not modify the store."""
+    before = _file_state(origin_db)
+
+    result = runner.invoke(app, ["forensics", "no-such-thread", "--db", origin_db])
+
+    assert result.exit_code == 1
+    assert "no-such-thread" in result.output
+    assert _file_state(origin_db) == before
+
+
+@pytest.mark.parametrize("command", [["tree"], ["forensics"]], ids=["tree", "forensics"])
+def test_committed_demo_store_tree_and_forensics_leave_it_untouched(
+    runner: CliRunner, command: list[str]
+) -> None:
+    """AC-84, ADR-0015: tree and combined forensics leave the committed demo store unchanged."""
+    before = _file_state(str(DEMO_STORE))
+
+    result = runner.invoke(app, [*command, DEMO_THREAD, "--db", str(DEMO_STORE)])
+
+    assert result.exit_code == 0, result.output
+    assert _file_state(str(DEMO_STORE)) == before
