@@ -63,6 +63,14 @@ def test_relate_section_states_single_process_limit_ac_40() -> None:
     assert "multi-worker" in section and "multi-pod" in section
 
 
+def test_relate_section_describes_the_edge_walk_not_a_path_query_adr_0030() -> None:
+    """ADR-0030: the section describes the Python edge walk, not a single variable-length path."""
+    section = _section(RELATE_HEADING)
+    assert "NEXT*0.." not in section
+    assert "single path query" not in section
+    assert "UNWIND" in section
+
+
 def test_benchmark_section_has_metric_rows_for_both_savers_ac_58() -> None:
     """AC-58: the benchmark section has all metric rows, both savers, N and environment."""
     section = _section(BENCHMARK_HEADING)

@@ -6,7 +6,7 @@ RelateGraphSaver is a LangGraph checkpointer built on Relate by Neo4j, an embedd
 
 ## Use case
 
-An agent fails in the middle of a run, and you need to know which step or tool call caused it. A plain message log shows what the agent said, not how its state moved from one step to the next. RelateGraphSaver stores every LangGraph checkpoint as a node in a graph, so the question becomes a path query.
+An agent fails in the middle of a run, and you need to know which step or tool call caused it. A plain message log shows what the agent said, not how its state moved from one step to the next. RelateGraphSaver stores every LangGraph checkpoint as a node in a graph, so the question becomes a walk over graph edges.
 
 It is for engineers building LangGraph agents who want durable checkpoints, a readable execution history and a way to replay a past step without touching the real run. The relationships that matter:
 
@@ -327,7 +327,7 @@ Relate is an embedded graph database from Neo4j. We use these capabilities, and 
 
 - **Embedded single-file database.** Each saver opens one `.rl` file in-process. Checkpoints need no server, container or credentials, and the whole execution history of an agent is one file you can copy, attach to a bug report or delete (ADR-0001).
 - **Write-ahead logging (WAL).** Every checkpoint and every writes save is committed through the WAL and flushed, so a committed checkpoint survives a process restart and an interrupted write is rolled back on reopen. An agent that resumes a thread after a crash needs exactly that guarantee. Tool-call records are committed without their own flush and become durable with the next flushed save or when `close()` is called; they are best effort, and a lost record does not affect the checkpoint (ADR-0014).
-- **Native Cypher queries.** Agent execution is a graph, so we query it as one. `relate-dag forensics trace-error` walks `[:NEXT*0..]` backwards from a failed checkpoint across `[:HAS_WRITE]` and `[:INVOKED]` edges to the write or tool call that caused it. This is a single path query, where a relational schema needs a recursive join (ADR-0003).
+- **Native Cypher queries.** Agent execution is a graph, so we query it as one. `relate-dag forensics trace-error` reads the thread's `[:NEXT|FORKED_TO]` edges in one Cypher query and walks them back from the failed checkpoint. One `UNWIND` query then joins each antecedent's `[:HAS_WRITE]` writes and `[:INVOKED]` tool calls to find the write or tool call that caused the failure. The walk runs in Python because a variable-length Cypher pattern enumerates every path and is quadratic on long chains (ADR-0030). In a graph, writes and tool calls hang off checkpoints as edges, so that join needs no recursive self-join as a relational schema does (ADR-0003).
 - **Connected schema.** `:Thread`, `:Checkpoint`, `:Write` and `:ToolCall` nodes are linked by `NEXT` (the causal order), `FORKED_TO` (a branch created by replay or a fork), `HAS_WRITE` (pending and channel writes) and `INVOKED` (a tool call made at a checkpoint). Forks and tool calls are edges in the data, so the terminal tree and the forensics reports read them directly instead of reconstructing them.
 - **Uniqueness constraints and indexes.** Constraints on thread, checkpoint, write and tool-call identifiers make writes idempotent and reject duplicates; indexes on thread, namespace, step and state hash keep lookups by thread and by checkpoint from scanning the graph.
 - **`:memory:` databases.** `fork_in_memory()` copies the history up to a chosen checkpoint into a throwaway `:memory:` database, so you can replay and experiment without touching the production file and without cleanup afterwards (ADR-0004).
@@ -391,7 +391,7 @@ What the numbers say:
 - `wal_enabled=False` skips the per-write flush and keeps put latency flat, but its file is larger, and we have not verified that it survives power loss without the flush. It is not recommended for data you cannot lose.
 - Absolute numbers will differ on your machine. Run the command above to get your own.
 
-We choose Relate for what the connected graph lets you ask and do, not for speed. Forks, tool calls and causal order are edges, so `relate-dag` can trace a failure to the write or tool call behind it with one path query; `fork_in_memory()` gives you a sandboxed copy of the history to replay without touching the production file; and the whole history stays in a single file with no server. If write throughput or multi-process access matters more than those, use SqliteSaver or PostgresSaver.
+We choose Relate for what the connected graph lets you ask and do, not for speed. Forks, tool calls and causal order are edges, so `relate-dag` can trace a failure to the write or tool call behind it by walking the checkpoint edges back to it; `fork_in_memory()` gives you a sandboxed copy of the history to replay without touching the production file; and the whole history stays in a single file with no server. If write throughput or multi-process access matters more than those, use SqliteSaver or PostgresSaver.
 
 ## Running tests
 

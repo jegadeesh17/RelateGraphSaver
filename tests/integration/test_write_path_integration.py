@@ -75,7 +75,7 @@ def test_write_path_full_pipeline_cross_task_wiring(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """End-to-end integration proving cross-task wiring across W1, W2, W3, W5, W6, W8 (AC-173..AC-180, AC-06).
+    """End-to-end integration proving write-path wiring (AC-173..AC-180, AC-06).
 
     Proves:
     1. RELATE_PROXY_TIMEOUT_SEC sets proxy default timeout (AC-178).
@@ -274,7 +274,7 @@ def test_proxy_timeout_cancellation_and_error_propagation_wiring(
 
 
 def test_time_travel_error_propagation_and_cleanup_wiring(tmp_path: Path) -> None:
-    """Verifies time travel cloning error propagation and sandboxed saver cleanup (W9).
+    """Verifies time travel cloning error propagation and sandboxed saver cleanup.
 
     Proves:
     1. CheckpointNotFoundError raised with candidate list for invalid checkpoint (AC-21).
