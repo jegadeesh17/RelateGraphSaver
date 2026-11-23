@@ -318,6 +318,18 @@ class TestCliRootAndHelp:
         assert "loops" in output
         assert "trace-error" in output
 
+    def test_cli_forensics_help_documents_reserved_names(self, runner: CliRunner) -> None:
+        """RC-04: group help lists the reserved subcommand names and the leading '-' rule."""
+        result = runner.invoke(app, ["forensics", "--help"], env={"COLUMNS": "300"})
+        assert result.exit_code == 0
+        text = " ".join(result.output.split())
+        assert "Reserved subcommand names" in text
+        reserved = text.split("Reserved subcommand names", 1)[1]
+        for name in ("loops", "trace-error", "trace", "failures", "diagnose"):
+            assert name in reserved
+        assert "cannot be used as a positional thread ID" in text
+        assert "Thread IDs beginning with '-' are not accepted as positional thread IDs" in text
+
     def test_cli_forensics_loops_subcommand_help(self, runner: CliRunner) -> None:
         """Verify relate-dag forensics loops --help displays options and exits with code 0."""
         result = runner.invoke(app, ["forensics", "loops", "--help"])

@@ -484,10 +484,17 @@ class ForensicsGroup(TyperGroup):
         return super().parse_args(ctx, args)
 
 
+# The help text names the subcommands ForensicsGroup treats as reserved (RC-04).
 forensics_app = typer.Typer(
     cls=ForensicsGroup,
     name="forensics",
-    help="Detect cycles, infinite loops, and trace root causes of failures.",
+    help=(
+        "Detect cycles, infinite loops, and trace root causes of failures. "
+        "A bare thread ID runs a full diagnosis. "
+        "Reserved subcommand names (loops, trace-error, trace, failures, diagnose) "
+        "cannot be used as a positional thread ID. "
+        "Thread IDs beginning with '-' are not accepted as positional thread IDs."
+    ),
     no_args_is_help=True,
 )
 app.add_typer(forensics_app)
