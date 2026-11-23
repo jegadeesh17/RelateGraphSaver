@@ -558,7 +558,7 @@ def diff_runs(recorded: RunSnapshot, replayed: RunSnapshot) -> RunDiff: ...
 
 ### 9. Forensic queries, loop detection, and argument provenance (`forensics.py`)
 
-Finds the write that first held a failing tool's argument, detects execution cycles, traces root causes, and summarizes failures across threads (AC-119..AC-125, AC-181..AC-189, [ADR-0018](DECISIONS.md#adr-0018-argument-provenance-by-string-containment-earliest-write-wins), [ADR-0029](DECISIONS.md#adr-0029-forensics-lineage-namespace-loop-detection-and-root-cause-priority), [ADR-0032](DECISIONS.md#adr-0032-the-failure-checkpoint-walk-may-cross-one-forked_to-edge-after-a-put_writes-link)). Argument provenance is a heuristic, not data-flow tracking.
+Finds the write that first held a failing tool's argument, detects execution cycles, traces root causes, and summarizes failures across threads (AC-119..AC-125, AC-181..AC-189, AC-192, AC-193, [ADR-0018](DECISIONS.md#adr-0018-argument-provenance-by-string-containment-earliest-write-wins), [ADR-0029](DECISIONS.md#adr-0029-forensics-lineage-namespace-loop-detection-and-root-cause-priority), [ADR-0032](DECISIONS.md#adr-0032-the-failure-checkpoint-walk-may-cross-one-forked_to-edge-after-a-put_writes-link)). Argument provenance is a heuristic, not data-flow tracking.
 
 ```python
 class RelateForensics:
