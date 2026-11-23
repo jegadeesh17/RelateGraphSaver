@@ -213,6 +213,30 @@ relate-dag forensics loops session-42 --threshold 2 --db checkpoints.rl
 
 # Trace root cause of an execution failure
 relate-dag forensics trace-error session-42 --db checkpoints.rl
+
+# Summarize failing tool calls across every thread in the store (no thread id)
+relate-dag forensics failures --db checkpoints.rl
+```
+
+`--db` (also `--file`, short `-d` or `-f`) defaults to `checkpoints.rl` on every command. `forensics loops` also takes `--threshold` (short `-t`, default `2`), the minimum number of consecutive repeats that counts as a loop. `forensics trace` is an alias for `trace-error`. `forensics failures` takes only `--db`: it reports failing tool calls for the whole store, not one thread.
+
+`replay` without `--graph` forks the checkpoint into an in-memory sandbox and stops. With `--graph` it also re-runs your graph from that checkpoint, still in memory, and prints what changed against the recorded run. The durable file is never modified. Options:
+
+- `--graph`, `-g`: the graph to re-run, as `path/to/file.py:factory` or `module:factory`.
+- `--set-message INDEX=TEXT`: replace message number `INDEX` with `TEXT` before re-running; repeatable. Needs `--graph`.
+- `--update JSON`: a JSON object of channel values to write before re-running. Needs `--graph`.
+- `--as-node NAME`: the node to treat as the writer of the edit. Needs `--graph` and an edit (`--update` or `--set-message`).
+- `--checkpoint`, `-c`: the checkpoint id as a flag instead of the second positional argument.
+- `--branch`, `-b`: a new branch thread id for the fork. Cannot be combined with `--graph`.
+
+For example, to re-run a failed run from a chosen checkpoint with a corrected first message, and then with a state update written as a given node:
+
+```bash
+# Replace message 0, then re-run the graph from that checkpoint
+relate-dag replay session-42 <checkpoint_id> --graph path/to/agent.py:create_graph --set-message 0="corrected input" --db checkpoints.rl
+
+# Write a channel value as the "planner" node, then re-run
+relate-dag replay session-42 <checkpoint_id> --graph path/to/agent.py:create_graph --update '{"topic": "retry"}' --as-node planner --db checkpoints.rl
 ```
 
 ### Running the multi-agent demo

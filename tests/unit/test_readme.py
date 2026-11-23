@@ -385,3 +385,69 @@ def test_dependency_agent_instructions_name_the_command_ac_132() -> None:
     assert "python examples/dependency_agent.py" in section
     assert "needs no API key" in section
     assert "relate-dag forensics trace-error" in section
+
+
+def _cli_section() -> str:
+    """Return the README's "Command-line interface" subsection."""
+    text = _readme_text()
+    section = text[text.index("### Command-line interface") :]
+    return section[: section.index("\n### Running the multi-agent demo")]
+
+
+def _help(*args: str) -> str:
+    """Return `relate-dag <args> --help` output."""
+    result = CliRunner().invoke(app, [*args, "--help"])
+    assert result.exit_code == 0, result.output
+    return result.output
+
+
+def test_cli_reference_documents_forensics_failures_rc_10() -> None:
+    """RC-10: the CLI reference lists `forensics failures`, which takes only --db."""
+    section = _cli_section()
+    assert "relate-dag forensics failures --db checkpoints.rl" in section
+    assert "failures" in _help("forensics")
+    options = _help("forensics", "failures")
+    assert "--db" in options and "--threshold" not in options
+
+
+def test_cli_reference_replay_flags_match_help_rc_10() -> None:
+    """RC-10: every replay flag the README names exists in `replay --help`, and vice versa."""
+    section = _cli_section()
+    replay_help = _help("replay")
+    documented = {"--graph", "--set-message", "--update", "--as-node", "--checkpoint", "--branch"}
+    for flag in documented:
+        assert f"`{flag}" in section, f"README CLI reference does not document {flag}"
+        assert flag in replay_help, f"{flag} is documented but missing from replay --help"
+    help_flags = set(re.findall(r"--[a-z][a-z-]*", replay_help)) - {"--help", "--file", "--db"}
+    assert help_flags == documented
+
+
+def test_cli_reference_defaults_match_help_rc_10() -> None:
+    """RC-10: the documented --db and --threshold defaults are the ones --help prints."""
+    section = _cli_section()
+    assert "defaults to `checkpoints.rl`" in section
+    assert "[default: checkpoints.rl]" in _help("forensics", "failures")
+    assert "`--threshold` (short `-t`, default `2`)" in section
+    assert "[default: 2]" in _help("forensics", "loops")
+
+
+def test_cli_reference_replay_examples_use_documented_flags_rc_10() -> None:
+    """RC-10: the replay usage examples use --graph, --set-message, --update and --as-node."""
+    section = _cli_section()
+    examples = [line for line in section.splitlines() if line.startswith("relate-dag replay ")]
+    joined = "\n".join(examples)
+    for flag in ("--graph", "--set-message", "--update", "--as-node"):
+        assert flag in joined, f"no replay example uses {flag}"
+    for line in examples:
+        if any(flag in line for flag in ("--set-message", "--update", "--as-node")):
+            assert "--graph" in line, f"edit flags need --graph: {line}"
+
+
+def test_cli_reference_edit_flags_without_graph_are_rejected_rc_10() -> None:
+    """RC-10: the README says the edit flags need --graph; the CLI rejects them without it."""
+    assert "Needs `--graph`" in _cli_section()
+    result = CliRunner().invoke(
+        app, ["replay", "t", "c", "--set-message", "0=x", "--db", str(DEMO_STORE)]
+    )
+    assert result.exit_code != 0
+    assert "--graph" in result.output
