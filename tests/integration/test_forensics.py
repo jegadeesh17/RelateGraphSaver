@@ -10,6 +10,7 @@ Validates:
 
 from __future__ import annotations
 
+import gc
 import os
 import sys
 import tempfile
@@ -850,9 +851,19 @@ class TestRelateForensics:
             )
             saver.put_writes(config, [("__error__", "Chain aborted")], task_id="task-long")
 
+            gc_enabled_before = gc.isenabled()
             started = time.perf_counter()
             report = saver.trace_root_cause(thread_id)
             elapsed = time.perf_counter() - started
+            gc_enabled_after = gc.isenabled()
+
+            arg_started = time.perf_counter()
+            origin = RelateForensics(saver).trace_argument_origin(
+                thread_id,
+                config["configurable"]["checkpoint_id"],
+                {"query": "upstream unavailable"},
+            )
+            arg_elapsed = time.perf_counter() - arg_started
 
         assert report.error_checkpoint_id == config["configurable"]["checkpoint_id"]
         assert (
@@ -861,6 +872,12 @@ class TestRelateForensics:
         )
         assert report.causal_path_length == chain_length - 1
         assert elapsed < 1.0
+        # The budget is met without touching interpreter-wide state.
+        assert gc_enabled_after == gc_enabled_before
+        assert origin is not None
+        assert origin.checkpoint_id == first_id
+        assert origin.hops == chain_length - 1
+        assert arg_elapsed < 1.0
 
 
 class ProvenanceState(TypedDict):
@@ -2116,7 +2133,7 @@ class TestDeterministicTieBreakOrdering:
             ):
                 forensics.trace_root_cause(thread_id)
 
-        causal = [q for q in seen if "length(path) AS distance_to_error" in q]
+        causal = [q for q in seen if "AS distance_to_error" in q]
         assert len(causal) == 1
         order_by = causal[0].split("ORDER BY", 1)[1]
         assert order_by.index("distance_to_error") < order_by.index("checkpoint_id")

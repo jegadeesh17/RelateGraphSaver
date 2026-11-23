@@ -7,7 +7,6 @@ path traversals from failure nodes to offending antecedent writes or tool calls.
 from __future__ import annotations
 
 import collections
-import gc
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -568,6 +567,54 @@ class RelateForensics:
         )
         return tuple(changed)
 
+    def _lineage(
+        self, thread_id: str, checkpoint_id: str, *, backward: bool
+    ) -> list[dict[str, Any]]:
+        """Return the checkpoints reachable from ``checkpoint_id`` along ``[:NEXT|FORKED_TO]``.
+
+        Each entry is ``{"id": <checkpoint_id>, "d": <hops from checkpoint_id>}``, nearest
+        first, starting with ``checkpoint_id`` itself at distance 0. ``backward`` walks toward
+        ancestors, otherwise toward descendants. Only checkpoints of ``thread_id`` are visited,
+        so the walk never crosses into another thread (AC-180). Empty when ``checkpoint_id``
+        is not a checkpoint of the thread.
+
+        The thread's edges are read once and walked here: a variable-length Cypher path
+        pattern enumerates every path, which is quadratic on a long chain.
+        """
+        start = self._saver.proxy.execute_read(
+            "MATCH (c:Checkpoint {checkpoint_id: $id, thread_id: $thread_id}) "
+            "RETURN c.checkpoint_id AS checkpoint_id",
+            {"id": checkpoint_id, "thread_id": thread_id},
+        )
+        if not start:
+            return []
+        edges = self._saver.proxy.execute_read(
+            "MATCH (p:Checkpoint {thread_id: $thread_id})-[:NEXT|FORKED_TO]->"
+            "(c:Checkpoint {thread_id: $thread_id}) "
+            "RETURN p.checkpoint_id AS parent_id, c.checkpoint_id AS child_id",
+            {"thread_id": thread_id},
+        )
+        neighbors: dict[str, list[str]] = {}
+        for edge in edges:
+            near, far = (
+                (edge["child_id"], edge["parent_id"])
+                if backward
+                else (edge["parent_id"], edge["child_id"])
+            )
+            neighbors.setdefault(str(near), []).append(str(far))
+
+        distances: dict[str, int] = {checkpoint_id: 0}
+        frontier = [checkpoint_id]
+        while frontier:
+            following: list[str] = []
+            for node in frontier:
+                for other in neighbors.get(node, ()):
+                    if other not in distances:
+                        distances[other] = distances[node] + 1
+                        following.append(other)
+            frontier = following
+        return [{"id": node, "d": dist} for node, dist in distances.items()]
+
     def _argument_origin(
         self, thread_id: str, error_checkpoint_id: str, args: Mapping[str, Any]
     ) -> tuple[ArgumentOrigin, tuple[str, ...]] | None:
@@ -586,14 +633,17 @@ class RelateForensics:
         if not candidates:
             return None
 
+        lineage = self._lineage(thread_id, error_checkpoint_id, backward=True)
+        if not lineage:
+            return None
         rows = self._saver.proxy.execute_read(
-            "MATCH path = (err:Checkpoint {checkpoint_id: $id})<-[:NEXT|FORKED_TO*0..]-"
-            "(a:Checkpoint {thread_id: $thread_id})-[:HAS_WRITE]->(w:Write) "
-            "WHERE ALL(n IN nodes(path) WHERE n.thread_id = $thread_id) "
-            "RETURN a.checkpoint_id AS checkpoint_id, a.step AS step, length(path) AS hops, "
+            "UNWIND $lineage AS pr "
+            "MATCH (a:Checkpoint {checkpoint_id: pr.id, thread_id: $thread_id})"
+            "-[:HAS_WRITE]->(w:Write) "
+            "RETURN a.checkpoint_id AS checkpoint_id, a.step AS step, pr.d + 1 AS hops, "
             "       w.channel AS channel, w.idx AS idx, w.write_blob AS write_blob, "
             "       w.task_path AS task_path",
-            {"id": error_checkpoint_id, "thread_id": thread_id},
+            {"lineage": lineage, "thread_id": thread_id},
         )
         rows = sorted(rows, key=lambda r: (int(r.get("step") or 0), int(r.get("idx") or 0)))
         first_match: tuple[dict[str, Any], str, str] | None = None
@@ -644,7 +694,7 @@ class RelateForensics:
             value=first_needle,
             node=node,
             step=int(first_row.get("step") or 0),
-            # length(path) also counts the closing [:HAS_WRITE] edge.
+            # hops in the query also counts the closing [:HAS_WRITE] edge.
             hops=max(int(first_row.get("hops") or 1) - 1, 0),
             checkpoint_id=matched_checkpoint_id,
         )
@@ -678,13 +728,16 @@ class RelateForensics:
         self, thread_id: str, error_checkpoint_id: str, tool_call_id: str
     ) -> str:
         """Return the first checkpoint at or after the error whose writes hold the tool's result."""
+        lineage = self._lineage(thread_id, error_checkpoint_id, backward=False)
+        if not lineage:
+            return error_checkpoint_id
         rows = self._saver.proxy.execute_read(
-            "MATCH path = (err:Checkpoint {checkpoint_id: $id})-[:NEXT|FORKED_TO*0..]->"
-            "(c:Checkpoint {thread_id: $thread_id})-[:HAS_WRITE]->(w:Write) "
-            "WHERE ALL(n IN nodes(path) WHERE n.thread_id = $thread_id) "
-            "RETURN c.checkpoint_id AS checkpoint_id, length(path) AS distance, "
+            "UNWIND $lineage AS pr "
+            "MATCH (c:Checkpoint {checkpoint_id: pr.id, thread_id: $thread_id})"
+            "-[:HAS_WRITE]->(w:Write) "
+            "RETURN c.checkpoint_id AS checkpoint_id, pr.d + 1 AS distance, "
             "       w.channel AS channel, w.write_blob AS write_blob",
-            {"id": error_checkpoint_id, "thread_id": thread_id},
+            {"lineage": lineage, "thread_id": thread_id},
         )
         for row in sorted(rows, key=lambda r: int(r.get("distance") or 0)):
             channel = str(row.get("channel") or "")
@@ -832,14 +885,7 @@ class RelateForensics:
         if not isinstance(thread_id, str) or not thread_id.strip():
             raise CheckpointNotFoundError("thread_id must be a non-empty string.")
 
-        gc_was_enabled = gc.isenabled()
-        if gc_was_enabled:
-            gc.disable()
-        try:
-            return self._trace_root_cause_impl(thread_id)
-        finally:
-            if gc_was_enabled:
-                gc.enable()
+        return self._trace_root_cause_impl(thread_id)
 
     def _trace_root_cause_impl(
         self,
@@ -990,18 +1036,19 @@ class RelateForensics:
             error_message = f"Execution error at checkpoint {error_checkpoint_id}"
 
         # 4. Backward causal path traversal across [:NEXT|FORKED_TO], [:HAS_WRITE], [:INVOKED].
-        # The variable-length pattern starts from the uniquely identified error checkpoint
-        # and walks NEXT and FORKED_TO edges backwards within the same thread; the reverse direction
-        # (antecedent first) makes the engine expand from every checkpoint in the database.
+        # The lineage walks NEXT and FORKED_TO edges backwards from the uniquely identified
+        # error checkpoint within the same thread (AC-180); each antecedent carries its hop
+        # distance to the error checkpoint.
+        causal_lineage = self._lineage(thread_id, error_checkpoint_id, backward=True)
         causal_query = (
-            "MATCH path = (err:Checkpoint {checkpoint_id: $error_checkpoint_id})<-[:NEXT|FORKED_TO*0..]-(antecedent:Checkpoint {thread_id: $thread_id}) "
-            "WHERE ALL(n IN nodes(path) WHERE n.thread_id = $thread_id) "
+            "UNWIND $lineage AS pr "
+            "MATCH (antecedent:Checkpoint {checkpoint_id: pr.id, thread_id: $thread_id}) "
             "OPTIONAL MATCH (antecedent)-[:HAS_WRITE]->(w:Write) "
             "OPTIONAL MATCH (antecedent)-[:INVOKED]->(tc1:ToolCall) "
             "OPTIONAL MATCH (w)-[:INVOKED]->(tc2:ToolCall) "
             "RETURN antecedent.checkpoint_id AS checkpoint_id, "
             "       antecedent.step AS step, "
-            "       length(path) AS distance_to_error, "
+            "       pr.d AS distance_to_error, "
             "       w.write_id AS write_id, "
             "       w.channel AS channel, "
             "       w.task_id AS task_id, "
@@ -1017,10 +1064,7 @@ class RelateForensics:
         )
         causal_rows = self._saver.proxy.execute_read(
             causal_query,
-            {
-                "thread_id": thread_id,
-                "error_checkpoint_id": error_checkpoint_id,
-            },
+            {"thread_id": thread_id, "lineage": causal_lineage},
         )
         causal_rows = _expand_causal_rows(causal_rows)
 
