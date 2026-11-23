@@ -227,17 +227,13 @@ class RelateThreadProxy:
                 logger.debug("Callable work item raised exception: %s", call_exc)
             return
         if isinstance(item, DbCommand):
-            if item.future.cancelled():
-                return
             if item.is_write and self.read_only:
-                item.future.set_exception(self._read_only_error())
+                self._fail_future(item.future, self._read_only_error())
                 return
             self._handle_db_command(item)
         elif isinstance(item, BatchCommand):
-            if item.future.cancelled():
-                return
             if self.read_only:
-                item.future.set_exception(self._read_only_error())
+                self._fail_future(item.future, self._read_only_error())
                 return
             self._handle_batch_command(item)
         elif isinstance(item, tuple) and len(item) == 4:
@@ -255,6 +251,26 @@ class RelateThreadProxy:
         return RelateReadOnlyError("RelateThreadProxy is read-only; writes are not allowed")
 
     @staticmethod
+    def _fail_future(future: concurrent.futures.Future[Any], err: Exception) -> None:
+        """Fail a queued command's future unless its caller already cancelled it (AC-195)."""
+        if future.set_running_or_notify_cancel():
+            future.set_exception(err)
+
+    @staticmethod
+    def _timeout_error(
+        fut: concurrent.futures.Future[Any], queued_message: str, running_message: str
+    ) -> RelateConcurrencyError:
+        """Build the error for an expired caller timeout (AC-195, ADR-0033).
+
+        ``cancel()`` succeeds only while the worker has not started the command, and then
+        the worker skips it. Once the worker has started it, ``cancel()`` fails, the
+        command runs to completion, and the caller is told it may have committed.
+        """
+        if fut.cancel():
+            return RelateConcurrencyError(f"{queued_message}; not executed")
+        return RelateConcurrencyError(f"{running_message}; it may have committed")
+
+    @staticmethod
     def _fail_tuple_command(item: tuple[Any, Any, Any, Any], err: RelateCheckpointError) -> None:
         """Fail a (query, params, event, result_holder) item without touching the driver."""
         _, _, event, holder = item
@@ -268,7 +284,7 @@ class RelateThreadProxy:
 
     def _handle_db_command(self, cmd: DbCommand) -> None:
         """Execute a single Cypher command."""
-        if cmd.future.cancelled():
+        if not cmd.future.set_running_or_notify_cancel():
             return
         try:
             if cmd.is_write:
@@ -307,7 +323,7 @@ class RelateThreadProxy:
 
     def _handle_batch_command(self, cmd: BatchCommand) -> None:
         """Execute a batch of Cypher commands atomically."""
-        if cmd.future.cancelled():
+        if not cmd.future.set_running_or_notify_cancel():
             return
         try:
             with self._writer_lock:
@@ -394,7 +410,7 @@ class RelateThreadProxy:
                 future=future or concurrent.futures.Future(),
             )
             if db_cmd.is_write and self.read_only:
-                db_cmd.future.set_exception(self._read_only_error())
+                self._fail_future(db_cmd.future, self._read_only_error())
                 return
             self._handle_db_command(db_cmd)
             return
@@ -402,7 +418,7 @@ class RelateThreadProxy:
         if msg_type == "transaction":
             if self.read_only:
                 if future is not None:
-                    future.set_exception(self._read_only_error())
+                    self._fail_future(future, self._read_only_error())
                 return
             batch_cmd = BatchCommand(
                 statements=msg["statements"],
@@ -538,9 +554,10 @@ class RelateThreadProxy:
         try:
             return fut.result(timeout=effective_timeout)
         except (TimeoutError, concurrent.futures.TimeoutError) as to_exc:
-            fut.cancel()
-            raise RelateConcurrencyError(
-                f"Query timed out after {effective_timeout}s: {cypher[:60]}"
+            raise self._timeout_error(
+                fut,
+                f"Query timed out after {effective_timeout}s: {cypher[:60]}",
+                f"Query timed out after {effective_timeout}s while running",
             ) from to_exc
 
     _execute_internal = _dispatch_execute
@@ -593,9 +610,12 @@ class RelateThreadProxy:
         try:
             return fut.result(timeout=effective_timeout)
         except (TimeoutError, concurrent.futures.TimeoutError) as to_exc:
-            fut.cancel()
-            raise RelateConcurrencyError(
-                f"Batch transaction timed out after {effective_timeout}s ({len(statements)} statements)"
+            raise self._timeout_error(
+                fut,
+                f"Batch transaction timed out after {effective_timeout}s "
+                f"({len(statements)} statements)",
+                f"Batch transaction timed out after {effective_timeout}s while running "
+                f"({len(statements)} statements)",
             ) from to_exc
 
     def transaction(
@@ -623,7 +643,7 @@ class RelateThreadProxy:
         fut: concurrent.futures.Future[None] = concurrent.futures.Future()
 
         def do_flush() -> None:
-            if fut.cancelled():
+            if not fut.set_running_or_notify_cancel():
                 return
             try:
                 with self._writer_lock:
@@ -645,8 +665,11 @@ class RelateThreadProxy:
         try:
             fut.result(timeout=effective_timeout)
         except (TimeoutError, concurrent.futures.TimeoutError) as to_exc:
-            fut.cancel()
-            raise RelateConcurrencyError(f"Flush timed out after {effective_timeout}s") from to_exc
+            raise self._timeout_error(
+                fut,
+                f"Flush timed out after {effective_timeout}s",
+                f"Flush timed out after {effective_timeout}s while running",
+            ) from to_exc
 
     def abort(self, timeout: float | None = 2.0) -> None:
         """Abruptly terminate the proxy and connection without graceful flush."""
