@@ -1802,12 +1802,13 @@ def test_ac164_cli_forensics_failures_displays_fanout_origin_nodes(
 def test_ac167_print_wide_preserves_console_width(
     monkeypatch: pytest.MonkeyPatch, initial_width: int | None
 ) -> None:
-    """AC-167: _print_wide preserves and restores console._width to pre-call value (None or fixed width)."""
+    """AC-167: _print_wide prints through a local Console and leaves the shared console unchanged."""
     fake_stream = io.StringIO()
     test_console = Console(file=fake_stream, width=initial_width)
     monkeypatch.setattr(cli, "console", test_console)
 
     assert test_console._width == initial_width
+    width_before = test_console.width
 
     table = Table(title="Wide Table")
     table.add_column("Column 1")
@@ -1816,7 +1817,9 @@ def test_ac167_print_wide_preserves_console_width(
     cli._print_wide(table)
 
     assert test_console._width == initial_width
+    assert test_console.width == width_before
     assert "Wide Table" in fake_stream.getvalue()
+    assert "Value 1" in fake_stream.getvalue()
 
 
 def test_print_wide_keeps_cell_wider_than_console_on_one_line(
