@@ -43,6 +43,7 @@ def temp_db_path() -> Any:
 class TestConcurrencyEngine:
     """Integration test suite for high-concurrency multi-threaded database operations."""
 
+    @pytest.mark.slow
     def test_concurrent_writes_20_threads_ac_08(self, temp_db_path: str) -> None:
         """AC-08: 20 concurrent threads hammering execute_write against disk store.
 

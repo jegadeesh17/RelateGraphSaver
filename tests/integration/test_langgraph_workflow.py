@@ -314,6 +314,7 @@ class TestLangGraphResearchWorkflow:
         assert "Relate Graph Storage Statistics" in stdout
         assert "Checkpoints Persisted:" in stdout
 
+    @pytest.mark.slow
     def test_cli_execution_disk_database_ac_29_ac_30(self, temp_disk_db: str) -> None:
         """AC-29, AC-30: Verify standalone CLI execution with explicit --db and --feedback."""
         custom_guidance = "Verify that WAL write locks serialize multi-threaded graph updates."

@@ -404,6 +404,7 @@ class TestForensicsEndToEnd:
             assert final_stats["causal_edges"] >= 4
             assert final_stats["pending_writes"] >= 15
 
+    @pytest.mark.slow
     def test_clean_installation_and_package_build_ac_31(self) -> None:
         """AC-31: Verify pip install --dry-run . resolves dependencies cleanly without errors.
 
@@ -427,6 +428,7 @@ class TestForensicsEndToEnd:
         assert proc.returncode == 0, f"pip install --dry-run failed: {proc.stderr}"
         assert "Would install langgraph-checkpoint-relate" in proc.stdout or proc.returncode == 0
 
+    @pytest.mark.slow
     def test_cli_subcommands_help_and_execution_options_ac_32(self, runner: CliRunner) -> None:
         """AC-32: Verify relate-dag --help and subcommands display options with exit code 0.
 

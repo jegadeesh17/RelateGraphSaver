@@ -789,16 +789,27 @@ def _run_cli_cp1252(args: list[str], cwd: Path | None = None) -> subprocess.Comp
     return subprocess.run(command, capture_output=True, env=env, timeout=120, check=False, cwd=cwd)
 
 
+def _assert_cp1252_cases(cases: list[tuple[list[str], str]]) -> None:
+    """Run each command on a cp1252 pipe: exit 0, no UnicodeEncodeError, expected text shown."""
+    for args, expected in cases:
+        proc = _run_cli_cp1252(args)
+        stdout = proc.stdout.decode("cp1252")
+        stderr = proc.stderr.decode("cp1252")
+        assert proc.returncode == 0, f"{args}: {stderr}"
+        assert "UnicodeEncodeError" not in stderr, args
+        assert expected in stdout, f"{args}: {stdout}"
+
+
 class TestCliCp1252Output:
     """Every relate-dag command prints only text a cp1252 stdout can encode (AC-59..AC-61)."""
 
-    def test_all_commands_exit_zero_on_cp1252_stdout_ac_59_ac_60(
+    def test_each_command_exits_zero_on_cp1252_stdout_ac_59_ac_60(
         self,
         seeded_db: tuple[str, str, list[str]],
         seeded_loop_db: tuple[str, str],
         seeded_tool_error_db: tuple[str, str],
     ) -> None:
-        """AC-59, AC-60: each command exits 0 with its expected text on a cp1252 pipe."""
+        """AC-59, AC-60: one case per command exits 0 with its expected text on a cp1252 pipe."""
         clean_db, clean_thread, clean_ids = seeded_db
         loop_db, loop_thread = seeded_loop_db
         tool_db, tool_thread = seeded_tool_error_db
@@ -806,22 +817,30 @@ class TestCliCp1252Output:
         cases: list[tuple[list[str], str]] = [
             (["--help"], "RelateGraphSaver CLI"),
             (["tree", clean_thread, "--db", clean_db], clean_thread),
-            (["tree", clean_thread, "--db", clean_db], clean_ids[0]),
             (["replay", clean_thread, clean_ids[1], "--db", clean_db], clean_ids[1]),
-            (["forensics", clean_thread, "--db", clean_db], "Total Checkpoints: 3"),
             (["forensics", tool_thread, "--db", tool_db], "fetch_source"),
             (["forensics", "loops", loop_thread, "--db", loop_db], "Detected Loops"),
-            (["forensics", "loops", clean_thread, "--db", clean_db], "No loops"),
             (["forensics", "trace-error", tool_thread, "--db", tool_db], "fetch_source"),
+        ]
+        _assert_cp1252_cases(cases)
+
+    @pytest.mark.slow
+    def test_remaining_command_variants_exit_zero_on_cp1252_stdout_ac_59_ac_60(
+        self,
+        seeded_db: tuple[str, str, list[str]],
+        seeded_loop_db: tuple[str, str],
+        seeded_tool_error_db: tuple[str, str],
+    ) -> None:
+        """AC-59, AC-60: the repeated tree id, summary and no-finding variants on a cp1252 pipe."""
+        clean_db, clean_thread, clean_ids = seeded_db
+
+        cases: list[tuple[list[str], str]] = [
+            (["tree", clean_thread, "--db", clean_db], clean_ids[0]),
+            (["forensics", clean_thread, "--db", clean_db], "Total Checkpoints: 3"),
+            (["forensics", "loops", clean_thread, "--db", clean_db], "No loops"),
             (["forensics", "trace-error", clean_thread, "--db", clean_db], "No error detected"),
         ]
-        for args, expected in cases:
-            proc = _run_cli_cp1252(args)
-            stdout = proc.stdout.decode("cp1252")
-            stderr = proc.stderr.decode("cp1252")
-            assert proc.returncode == 0, f"{args}: {stderr}"
-            assert "UnicodeEncodeError" not in stderr, args
-            assert expected in stdout, f"{args}: {stdout}"
+        _assert_cp1252_cases(cases)
 
     def test_no_finding_messages_are_ascii_ac_60(
         self,
