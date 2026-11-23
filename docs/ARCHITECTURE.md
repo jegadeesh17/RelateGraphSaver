@@ -83,7 +83,6 @@ graph TD
     Graph -->|put / get_tuple / list| Saver
     AsyncGraph -->|aput / aget_tuple / alist via asyncio.to_thread| Saver
     Workers -->|concurrent calls| Saver
-    Saver -->|serialize / deserialize| Saver
     Saver -->|scan written messages| ToolCapture
     ToolCapture -->|ToolCall Cypher statements| Saver
     Saver -->|dispatch transactions| Proxy
@@ -101,8 +100,8 @@ graph TD
 - **`tool_calls` (tool call extractor):** Pure functions that find AI tool calls and tool result messages in written values and turn them into idempotent `:ToolCall` Cypher statements, plus `AppliedToolCalls`, the per-saver record of what has already been committed so each save sends only new statements. It never raises; malformed entries are skipped.
 - **`RelateThreadProxy`:** Actor queue and thread-affinity broker running on a dedicated thread, serializing database write transactions and enforcing single-writer access to prevent thread-affinity exceptions and file lock collisions.
 - **`TimeTravelEngine`:** In-memory replay controller that extracts execution subgraphs and clones them into isolated `:memory:` database instances for zero-side-effect what-if debugging.
-- **`DAGVisualizer`:** Graph forensics and diagnostic renderer that executes Cypher path queries to produce Unicode execution trees, cycle detection reports, and failure root-cause traces. Status tags follow the [tree status rule](#tree-status-rule).
-- **`RelateForensics`** (`forensics.py`): loop detection, root-cause tracing, [argument provenance and the cross-thread failure summary](#9-argument-provenance-and-tool-failure-summary-forensicspy).
+- **`DAGVisualizer`:** Graph forensics and diagnostic renderer that executes Cypher path queries to produce Unicode execution trees, cycle detection reports, and failure root-cause traces. Status tags follow the [tree status rule](#tree-layout-and-status-rule).
+- **`RelateForensics`** (`forensics.py`): loop detection, root-cause tracing, [argument provenance and the cross-thread failure summary](#9-forensic-queries-loop-detection-and-argument-provenance-forensicspy).
 - **`replay`** (`replay.py`): loads a user's graph from a spec, re-runs it from a checkpoint against an in-memory fork, and diffs it against the recorded run ([Replay engine](#8-replay-engine-replaypy)).
 
 ## Graph schema and data models
@@ -165,9 +164,9 @@ Validation and invariants:
 - `(:Thread)-[:HAS_CHECKPOINT]->(:Checkpoint)`: Connects a thread to all checkpoints within its lineage.
 - `(:Checkpoint)-[:NEXT]->(:Checkpoint)`: Direct causal edge linking step $N$ to step $N+1$ along the primary execution branch.
 - `(:Checkpoint)-[:FORKED_TO]->(:Checkpoint)`: Branch edge linking a historical checkpoint to the root checkpoint of a branched or replayed thread.
-- `(:Checkpoint)-[:FORKED_TO]->(:Thread)`: Branch edge linking a historical checkpoint to a new branched `:Thread` created from a fork or `update_state` operation (ADR-0003, ADR-0029, W12).
-- `(:Checkpoint)-[:HAS_WRITE]->(:Write)`: Links a checkpoint to its pending or committed writes.
-- `(:Checkpoint)-[:INVOKED]->(:ToolCall)`: Links the checkpoint at which a thread first recorded a tool call to that call. For `put_writes()` this is the checkpoint named by `config["configurable"]["checkpoint_id"]` (the checkpoint the model's task ran from, AC-41); for `put()` it is the checkpoint being stored (AC-42). Exactly one such edge exists per (thread, `call_id`): a later save in the same thread that sees the same call adds no edge. LangGraph saves the model step's writes and the next checkpoint on different threads, so the edge attaches to the step the model ran from or to the next one, whichever save lands first ([ADR-0021](DECISIONS.md#adr-0021-tool-call-root-cause-anchors-on-the-failure-checkpoint)).
+- `(:Checkpoint)-[:FORKED_TO]->(:Thread)`: Branch edge linking a historical checkpoint to a new branched `:Thread` created from a fork or `update_state` operation (ADR-0003, ADR-0029).
+- `(:Checkpoint)-[:HAS_WRITE]->(:Write)`: Links a checkpoint to its pending or committed writes. `put_writes()`, and a later `put()` of the named checkpoint, create the edge only when the write's `thread_id`, `checkpoint_ns` and `checkpoint_id` all equal the checkpoint's. A write whose config names another thread's or namespace's checkpoint is stored unlinked, and `get_tuple()` returns as pending writes only linked writes whose `thread_id` and `checkpoint_ns` equal the checkpoint's ([ADR-0031](DECISIONS.md#adr-0031-writes-and-tool-calls-attach-only-to-a-checkpoint-of-their-own-thread), AC-190, AC-191).
+- `(:Checkpoint)-[:INVOKED]->(:ToolCall)`: Links the checkpoint at which a thread first recorded a tool call to that call. For `put_writes()` this is the checkpoint named by `config["configurable"]["checkpoint_id"]` (the checkpoint the model's task ran from, AC-41), and only when that checkpoint's `thread_id` is the saving thread's ([ADR-0031](DECISIONS.md#adr-0031-writes-and-tool-calls-attach-only-to-a-checkpoint-of-their-own-thread)); for `put()` it is the checkpoint being stored (AC-42). Exactly one such edge exists per (thread, `call_id`): a later save in the same thread that sees the same call adds no edge. LangGraph saves the model step's writes and the next checkpoint on different threads, so the edge attaches to the step the model ran from or to the next one, whichever save lands first ([ADR-0021](DECISIONS.md#adr-0021-tool-call-root-cause-anchors-on-the-failure-checkpoint)).
 - `(:Write)-[:INVOKED]->(:ToolCall)`: Reserved. The saver does not write this edge; forensics, including `failure_summary` (AC-158), reads it if present, so data that contains it keeps working.
 
 ### Cypher DDL Constraints and Indexes
@@ -195,12 +194,6 @@ FOR (c:Checkpoint) ON (c.state_hash);
 `RelateSaver` inherits from `langgraph.checkpoint.base.BaseCheckpointSaver` and implements the synchronous checkpoint operations plus their async counterparts. `put()` and `put_writes()` capture tool calls after the checkpoint or writes are committed.
 
 ```python
-from collections.abc import AsyncIterator, Iterator, Sequence
-from typing import Any
-from langgraph.checkpoint.base import (BaseCheckpointSaver, Checkpoint, CheckpointMetadata,
-                                       CheckpointTuple, ChannelVersions)
-from langchain_core.runnables import RunnableConfig
-
 class RelateSaver(BaseCheckpointSaver[str]):
     def __init__(
         self,
@@ -216,12 +209,10 @@ class RelateSaver(BaseCheckpointSaver[str]):
     # --- synchronous ---
     def put(self, config: RunnableConfig, checkpoint: Checkpoint,
             metadata: CheckpointMetadata, new_versions: ChannelVersions) -> RunnableConfig:
-        """Persist a checkpoint node, connect NEXT/FORKED_TO, then capture tool calls
-        found in checkpoint["channel_values"] (AC-42)."""
+        """Persist a checkpoint, connect NEXT/FORKED_TO, capture tool calls (AC-42)."""
     def put_writes(self, config: RunnableConfig, writes: Sequence[tuple[str, Any]],
                    task_id: str, task_path: str = "") -> None:
-        """Store pending writes linked via HAS_WRITE, then capture tool calls found in
-        the written values (AC-41)."""
+        """Store writes linked via HAS_WRITE, then capture tool calls (AC-41)."""
     def get_tuple(self, config: RunnableConfig) -> CheckpointTuple | None: ...
     def list(self, config: RunnableConfig | None, *, filter: dict[str, Any] | None = None,
              before: RunnableConfig | None = None, limit: int | None = None
@@ -312,10 +303,6 @@ One row per edge. A `RelateCheckpointError` from this read propagates to the cal
 Embedded databases require strict thread affinity for file writing. `RelateThreadProxy` runs every driver call on one dedicated worker thread, the only thread that touches the driver; callers on any thread (LangGraph worker threads, `asyncio.to_thread` workers) block on the command future.
 
 ```python
-import concurrent.futures
-from dataclasses import dataclass
-from typing import Any
-
 @dataclass(frozen=True)
 class DbCommand:
     cypher: str
@@ -348,8 +335,6 @@ class RelateThreadProxy:
 ### 3. Forensic Data Models
 
 ```python
-from dataclasses import dataclass
-
 @dataclass(frozen=True)
 class LoopReport:
     thread_id: str
@@ -393,7 +378,7 @@ Every command takes `--db/-d PATH` (`tree` also accepts `--file/-f`). Errors pri
 #### Tree layout and status rule
 
 - **Flat tree layout ([ADR-0027](DECISIONS.md#adr-0027-flat-tree-layout-with-fork-indentation), AC-185):** `DAGVisualizer` renders `[:NEXT]` children as siblings at the same depth and indentation level, built iteratively without recursion. Only `[:FORKED_TO]` relationships nest child branches into indented sub-trees. This flat iterative layout eliminates call-stack recursion limits on 1,500+ checkpoint runs without stack overflow and prevents severe rightward terminal drift.
-- **Status determination:** `DAGVisualizer._determine_status(info, writes, has_successor)` returns the first match: `[ERROR]` (detection unchanged), `[INTERRUPT]`, `[OK]` when the checkpoint has a `[:NEXT]` child, `[PENDING]` when it has stored writes, else `[OK]` ([ADR-0016](DECISIONS.md#adr-0016-tree-status-depends-on-whether-a-checkpoint-has-a-next-step), AC-88..AC-92). `has_successor` comes from the `[:NEXT]` children map only; a `[:FORKED_TO]` child does not count. Writes under a checkpoint with a `[:NEXT]` child are labelled `write: channel=..., task_id=...`; on a leaf they keep `pending write:` (AC-93). Writes in the tree order deterministically by `w.task_id, w.idx` (R8).
+- **Status determination:** `DAGVisualizer._determine_status(info, writes, has_successor)` returns the first match: `[ERROR]` (detection unchanged), `[INTERRUPT]`, `[OK]` when the checkpoint has a `[:NEXT]` child, `[PENDING]` when it has stored writes, else `[OK]` ([ADR-0016](DECISIONS.md#adr-0016-tree-status-depends-on-whether-a-checkpoint-has-a-next-step), AC-88..AC-92). `has_successor` comes from the `[:NEXT]` children map only; a `[:FORKED_TO]` child does not count. Writes under a checkpoint with a `[:NEXT]` child are labelled `write: channel=..., task_id=...`; on a leaf they keep `pending write:` (AC-93). Writes in the tree order deterministically by `w.task_id, w.idx` (AC-180).
 - **Default read-only opening ([ADR-0029](DECISIONS.md#adr-0029-forensics-lineage-namespace-loop-detection-and-root-cause-priority), AC-187):** `RelateForensics` and `DAGVisualizer` default to `read_only=True` on open.
 
 **Read-only store access ([ADR-0015](DECISIONS.md#adr-0015-read-only-opening-for-inspection-commands)).** `tree`, `forensics` (the combined summary), `forensics loops`, `forensics trace-error`, `forensics failures` and the source side of `replay` (with or without `--graph`, AC-117) open the store with `RelateSaver(db, read_only=True)`. They pass that saver to `DAGVisualizer`, `RelateForensics` or `TimeTravelEngine.fork_in_memory` and close it in a `finally` or `with` block. Given a saver, the `DAGVisualizer` and `RelateForensics` constructors do not own or close it. The "Database file not found" check runs before opening, so a missing path still exits 1 with that message and is not created. `RelateReadOnlyError` is a `RelateCheckpointError`, so it is reported by the "Database error" handler. When `--db` is `:memory:`, the commands keep a writable saver, because an empty in-memory store has nothing to protect. After any of these commands, a closed file store is byte-identical and has no sidecar files.
@@ -407,10 +392,6 @@ For fast unit tests without disk I/O, `tests/fakes/fake_relate_driver.py` provid
 A small module with no database access, so parsing and statement building are tested without a saver ([ADR-0005](DECISIONS.md#adr-0005-capture-tool-calls-from-persisted-langchain-messages)).
 
 ```python
-from collections.abc import Iterable
-from dataclasses import dataclass
-from typing import Any, Protocol
-
 class BlobSerializer(Protocol):
     def dumps(self, obj: Any) -> bytes: ...
 
@@ -458,14 +439,14 @@ Invocation (one per `ToolInvocation`, AC-41, AC-42, AC-48):
 MERGE (tc:ToolCall {call_id: $call_id})
 ON CREATE SET tc.tool_name = $tool_name, tc.args_blob = $args_blob, tc.created_at = $created_at
 WITH tc
-OPTIONAL MATCH (c:Checkpoint {checkpoint_id: $checkpoint_id})
+OPTIONAL MATCH (c:Checkpoint {checkpoint_id: $checkpoint_id}) WHERE c.thread_id = $thread_id
 OPTIONAL MATCH (linked:Checkpoint {thread_id: $thread_id})-[:INVOKED]->(tc)
 WITH tc, c, count(linked) AS linked_count
 FOREACH (_ IN CASE WHEN c IS NOT NULL AND linked_count = 0 THEN [1] ELSE [] END |
   MERGE (c)-[:INVOKED]->(tc))
 RETURN tc.call_id AS call_id, (c IS NOT NULL OR linked_count > 0) AS attached
 ```
-`attached` is false only when the named checkpoint is not in the file and the thread has no edge to the call yet; `detached_call_ids` counts only rows whose `attached` is exactly `False` and whose `call_id` is a string; outcome statements return no rows.
+`attached` is false only when the named checkpoint is not in the file (or belongs to another thread) and the thread has no edge to the call yet; `detached_call_ids` counts only rows whose `attached` is exactly `False` and whose `call_id` is a string; outcome statements return no rows.
 
 Successful outcome (AC-43, AC-49):
 ```cypher
@@ -576,11 +557,11 @@ def diff_runs(recorded: RunSnapshot, replayed: RunSnapshot) -> RunDiff: ...
 
 ### 9. Forensic queries, loop detection, and argument provenance (`forensics.py`)
 
-Finds the write that first held a failing tool's argument, detects execution cycles, traces root causes, and summarizes failures across threads (AC-119..AC-125, AC-181..AC-188, [ADR-0018](DECISIONS.md#adr-0018-argument-provenance-by-string-containment-earliest-write-wins), [ADR-0029](DECISIONS.md#adr-0029-forensics-lineage-namespace-loop-detection-and-root-cause-priority)). Argument provenance is a heuristic, not data-flow tracking.
+Finds the write that first held a failing tool's argument, detects execution cycles, traces root causes, and summarizes failures across threads (AC-119..AC-125, AC-181..AC-189, [ADR-0018](DECISIONS.md#adr-0018-argument-provenance-by-string-containment-earliest-write-wins), [ADR-0029](DECISIONS.md#adr-0029-forensics-lineage-namespace-loop-detection-and-root-cause-priority)). Argument provenance is a heuristic, not data-flow tracking.
 
 ```python
 class RelateForensics:
-    def __init__(self, db_path_or_saver: str | RelateSaver, *, read_only: bool = True) -> None: ...
+    def __init__(self, saver_or_db_path: RelateSaver | str | None = None, *, db_path: str | None = None, connection_factory: Callable[..., Any] | None = None, wal_enabled: bool = True, read_only: bool = True) -> None: ...
     def detect_loops(self, thread_id: str, threshold: int = 2) -> list[LoopReport]: ...
     def trace_root_cause(self, thread_id: str) -> RootCauseReport: ...
     def trace_argument_origin(self, thread_id: str, error_checkpoint_id: str,
@@ -590,22 +571,23 @@ class RelateForensics:
 
 | Dataclass (`models.py`, frozen) | Fields |
 | :--- | :--- |
-| `ArgumentOrigin` | `argument: str` (argument name, for example `url`), `value: str`, `node: str` (`<unknown>` when not found), `step: int`, `hops: int` (`[:NEXT]` steps from the origin checkpoint to `error_checkpoint_id`), `checkpoint_id: str` |
+| `ArgumentOrigin` | `argument: str` (argument name, for example `url`), `value: str`, `node: str` (`<unknown>` when not found), `step: int`, `hops: int` (fewest `[:NEXT]` or `[:FORKED_TO]` edges between the origin checkpoint and `error_checkpoint_id`, within the thread), `checkpoint_id: str` |
 | `ToolFailureSummary` | `tool_name: str`, `failures: int`, `total_calls: int`, `threads: tuple[str, ...]` (sorted ids of threads where it failed), `origin_nodes: tuple[str, ...]` (sorted distinct origin nodes of its failed calls) |
 
 **Forensic traversal, loop detection, and root-cause priority rules:**
-- **Thread-constrained lineage traversal ([ADR-0029](DECISIONS.md#adr-0029-forensics-lineage-namespace-loop-detection-and-root-cause-priority), AC-181):** Lineage walks across checkpoints traverse `[:NEXT|FORKED_TO*0..]` restricted strictly to checkpoints belonging to the same `thread_id` (`c.thread_id = $thread_id`).
-- **Namespace-isolated root-to-leaf loop detection (`detect_loops`, AC-182, AC-188):** Rather than sorting all thread checkpoints globally across steps, `detect_loops` walks `[:NEXT]` edges from root to leaf separately per `checkpoint_ns`, isolating subgraphs. Node names along the path are extracted via `_node_from_task_path` with candidates sorted (R9). A `threshold < 2` raises `ValueError`.
+- **Construction (AC-187):** a `RelateSaver` argument is used as given and never closed by `close()` or the context manager. A path, or `db_path` when the first argument is `None` (default `checkpoints.rl`), opens an owned saver with `read_only` (default `True`), except `:memory:`, which stays writable. Any other type raises `TypeError`.
+- **Thread-constrained ancestor lineage ([ADR-0029](DECISIONS.md#adr-0029-forensics-lineage-namespace-loop-detection-and-root-cause-priority), AC-181, AC-27):** `_lineage` reads the thread's `[:NEXT|FORKED_TO]` edges whose two ends are both checkpoints of the thread, then walks them breadth-first in Python, giving each checkpoint reached its fewest-edge distance `d` (0 for the start); a start checkpoint outside the thread gives an empty lineage. A Cypher variable-length pattern is not used, because it enumerates every path and is quadratic on long chains. Lineage rows are then matched by id alone, `UNWIND $lineage AS pr MATCH (c:Checkpoint {checkpoint_id: pr.id})`: `checkpoint_id` is globally unique and the walk already kept to the thread, while adding `thread_id` to that node map probes the thread index per row and is quadratic. One public call (`trace_root_cause`, `trace_argument_origin`, or one thread inside `failure_summary`) reads a thread's edges once, with each edge's type, and reuses them for every walk in that call ([ADR-0030](DECISIONS.md#adr-0030-the-failure-checkpoint-walk-follows-next-edges-only)); nothing is cached on the instance between calls, because a writable saver passed in can gain checkpoints.
+- **Namespace-isolated root-to-leaf loop detection (`detect_loops`, AC-182, AC-188):** Rather than sorting all thread checkpoints globally across steps, `detect_loops` walks `[:NEXT]` edges from root to leaf separately per `checkpoint_ns`, isolating subgraphs. When checkpoint metadata names no node, the node is the first, in sorted order, of the nodes that `_node_from_task_path` finds in the checkpoint's write task paths. A `threshold < 2` raises `ValueError`.
 - **Poison detection (AC-183):** Poison checks in `trace_root_cause` inspect channel names exclusively (e.g. channel named `poison`). Substring searches for `"poison"` and `"fault"` within serialized state payload text are omitted to prevent false-positive classifications on conversational text.
-- **Root-cause priority rules (AC-184):** When an execution terminates along an `__error__` path, an antecedent tool-call error is accepted as root cause only when `distance_to_error <= 1` (immediately preceding or within the error checkpoint). Causal queries break ties using `ORDER BY distance_to_error, c.checkpoint_id, tool_call_id` (R8).
-- **Default read-only:** `RelateForensics` instances default to `read_only=True` on open (AC-187).
+- **Root-cause priority rules (AC-184):** When an execution terminates along an `__error__` path, an antecedent tool-call error is accepted as root cause only when `distance_to_error <= 1` (immediately preceding or within the error checkpoint). The causal query orders rows by `distance_to_error, checkpoint_id, direct_call_id, linked_call_id` (the call reached by the checkpoint's own `[:INVOKED]` edge, then one reached through a write, [ADR-0030](DECISIONS.md#adr-0030-the-failure-checkpoint-walk-follows-next-edges-only)).
+- **Known limitations:** (1) Loops across a fork point are not reported: a `[:FORKED_TO]` child has no incoming `[:NEXT]`, so `detect_loops` starts a new root-to-leaf walk there, and repetitions before and after the fork are counted separately (consistent with AC-182). (2) `Send` tasks: only `__pregel_pull` task paths name a node, so a write from a push task (`__pregel_push` path) contributes no origin node and the origin falls back to the `versions_seen` nodes, which may name the dispatching node or none (AC-172). (3) At a checkpoint with no `[:NEXT]` child the `versions_seen` fallback is empty, so the origin node is `<unknown>` even when a matching write's task path names a node.
 
 **`trace_argument_origin` rules:**
 - Candidates are top-level argument values that are `str` with at least 3 characters; anything else returns `None` (AC-120).
-- One read, anchored like `trace_root_cause`: `MATCH path = (err:Checkpoint {checkpoint_id: $id})<-[:NEXT*0..]-(a:Checkpoint {thread_id: $thread_id})-[:HAS_WRITE]->(w:Write)` returning `a.checkpoint_id`, `a.step`, `length(path) - 1` (the `[:NEXT]` hops; the path also contains the closing `[:HAS_WRITE]` edge), `w.channel`, `w.idx`, `w.write_blob`. Python deserializes writes in `step`, then `idx`, order, skips channels `__*` and `branch:*` and undeserializable blobs, and searches strings: plain strings, `BaseMessage.content` (string or text parts), `AIMessage.tool_calls[*]["args"]` values, and nested dicts, lists and tuples to depth 6. A match is case-sensitive substring containment; the first matching write wins (AC-119; open question 15).
+- The ancestor lineage of `error_checkpoint_id` (as above), then one read of its writes: `UNWIND $lineage AS pr MATCH (a:Checkpoint {checkpoint_id: pr.id})-[:HAS_WRITE]->(w:Write)` returning `a.checkpoint_id`, `a.step`, the lineage distance as `hops`, `w.channel`, `w.idx`, `w.write_blob`, `w.task_path`. Python deserializes writes in `step`, then `idx`, order, skips channels `__*` and `branch:*` and undeserializable blobs, and searches strings: plain strings, `BaseMessage.content` (string or text parts), `AIMessage.tool_calls[*]["args"]` values, and nested dicts, lists and tuples to depth 6. A match is case-sensitive substring containment; the first matching write wins (AC-119; open question 15).
 - Node: a write sits on the checkpoint its task ran from; origin nodes are derived from the `task_path` node of each matching write in the earliest matching checkpoint, intersected with nodes whose `versions_seen` entry differs between that checkpoint and its `[:NEXT]` child. When `task_path` is empty or the intersection is empty, it falls back to the `versions_seen` nodes; a matching write with no task path contributes no node but does not force the fallback when another matching write names one ([ADR-0025](DECISIONS.md#adr-0025-typed-channel-keys-write-level-origin-nodes-and-an-attribute-tag-for-update_state-errors), AC-172); several are joined with `, ` in sorted order.
 
-**`trace_root_cause`** fills `origin_*` only when the root is a failing `:ToolCall` with a traceable argument (AC-121). When the error comes from a failing tool call, `error_checkpoint_id` is the *failure checkpoint*: the first checkpoint at or after the call's `[:INVOKED]` checkpoint on the `[:NEXT]` path whose writes hold the `ToolMessage` for `root_tool_call_id`, or the `[:INVOKED]` checkpoint if none. The origin trace deserializes that call's `args_blob` and starts at `error_checkpoint_id`, which `trace_root_cause` passes in already resolved, so it is resolved once; hops count from where the tool failed (AC-129) and `origin_hops` equals `trace_argument_origin(thread_id, error_checkpoint_id, args).hops` whichever step the `[:INVOKED]` edge sits on (AC-119, [ADR-0021](DECISIONS.md#adr-0021-tool-call-root-cause-anchors-on-the-failure-checkpoint)). Errors found through an `__error__` write or checkpoint metadata keep the checkpoint they were found on.
+**`trace_root_cause`** fills `origin_*` only when the root is a failing `:ToolCall` with a traceable argument (AC-121). When the error comes from a failing tool call, `error_checkpoint_id` is the *failure checkpoint* ([ADR-0030](DECISIONS.md#adr-0030-the-failure-checkpoint-walk-follows-next-edges-only), AC-189): starting at the call's `[:INVOKED]` checkpoint (distance 0), the walk follows outgoing `[:NEXT]` edges between checkpoints of the thread only, never `[:FORKED_TO]`, and visits checkpoints in `(distance, checkpoint_id)` order; the first whose writes (skipping channels starting `__` and empty blobs) hold a `ToolMessage` with `tool_call_id` equal to `root_tool_call_id` is the failure checkpoint. If none does, or the `[:INVOKED]` checkpoint is not in the thread, it is the `[:INVOKED]` checkpoint. `put()` gives a checkpoint at most one `[:NEXT]` child, so the walk is one chain and the result is the same on every run; a result stored only on a fork branch is ignored. The origin trace deserializes that call's `args_blob` and starts at `error_checkpoint_id`, which `trace_root_cause` passes in already resolved, so it is resolved once; hops count from where the tool failed (AC-129) and `origin_hops` equals `trace_argument_origin(thread_id, error_checkpoint_id, args).hops` whichever step the `[:INVOKED]` edge sits on (AC-119, [ADR-0021](DECISIONS.md#adr-0021-tool-call-root-cause-anchors-on-the-failure-checkpoint)). Errors found through an `__error__` write or checkpoint metadata keep the checkpoint they were found on.
 
 **`failure_summary`** (AC-123, AC-158) runs two store-wide reads returning `c.thread_id, c.checkpoint_id, tc.call_id, tc.tool_name, tc.error, tc.args_blob`: `MATCH (c:Checkpoint)-[:INVOKED]->(tc:ToolCall)` and `MATCH (c:Checkpoint)-[:HAS_WRITE]->(:Write)-[:INVOKED]->(tc:ToolCall)`. It merges the rows, then counts distinct `(thread_id, call_id)` pairs, keeping the smallest `checkpoint_id` per pair; a call failed when `error IS NOT NULL AND error <> ''`. Each failed call is traced as in `trace_root_cause`. Only tools with at least one failure are returned, by `failures` descending, then `tool_name` (open question 14). It runs one trace per failed call, which suits demo-sized stores and is not tuned for large ones.
 
@@ -660,7 +642,7 @@ The event loop (`ainvoke` / `astream`) awaits `asyncio.to_thread(saver.put, ...)
 | On-disk size | KiB | After the saver and connection are closed: total size of the database file plus those of its `-wal`, `-shm` and `-journal` sidecars that exist |
 | Ancestry query | ms, median of 5 | All ancestors of the branch leaf back to the root. Both queries below; all three runs must return `N // 2 + 1 + max(1, N // 10)` checkpoints. |
 
-**Relate ancestry query** (through `saver.proxy.execute_read`), anchored on the leaf: `MATCH (leaf:Checkpoint {checkpoint_id: $leaf})<-[:NEXT|FORKED_TO*0..]-(a:Checkpoint) RETURN count(DISTINCT a) AS n`. The anchor matters: in relate-db 1.0 the unanchored direction expands from every checkpoint and took about 2.3 s at N=1000 against about 9 ms anchored. `trace_root_cause` uses the same anchored shape.
+**Relate ancestry query** (through `saver.proxy.execute_read`), anchored on the leaf: `MATCH (leaf:Checkpoint {checkpoint_id: $leaf})<-[:NEXT|FORKED_TO*0..]-(a:Checkpoint) RETURN count(DISTINCT a) AS n`. The anchor matters: in relate-db 1.0 the unanchored direction expands from every checkpoint and took about 2.3 s at N=1000 against about 9 ms anchored. Forensics does not use this pattern; it walks lineage in Python ([thread lineage](#9-forensic-queries-loop-detection-and-argument-provenance-forensicspy)).
 
 **SQLite ancestry query** (`SQLITE_ANCESTRY_SQL`, parameters `(thread_id, leaf_id, thread_id)`):
 ```sql
@@ -714,19 +696,14 @@ RelateGraphSaver/
 │       └── visualizer.py       # Rich/Unicode tree terminal renderer
 ├── tests/                      # no __init__.py here (see ADR-0007)
 │   ├── conftest.py             # Shared fixtures; deselects `network` tests by default
-│   ├── unit/                   # test_errors, test_models, test_packaging (AC-34, AC-57),
-│   │                           # test_proxy, test_readme (README checks), test_saver, test_serde,
-│   │                           # test_tool_calls (AC-46, AC-47), test_visualizer (tree status),
-│   │                           # test_replay_diff.py (diff rules, AC-104..AC-106)
-│   ├── integration/            # test_async_saver, test_checkpointing_end_to_end,
-│   │                           # test_clean_install (slow, AC-33), test_cli, test_concurrency,
-│   │                           # test_crash_recovery, test_demo_store (committed store),
-│   │                           # test_forensics, test_forensics_end_to_end, test_langgraph_workflow,
-│   │                           # test_read_only (ADR-0015), test_time_travel(_end_to_end),
-│   │                           # test_tool_call_capture, test_tool_calls_end_to_end,
-│   │                           # test_tool_forensics_demo (AC-45),
-│   │                           # test_replay.py (AC-94..AC-103, AC-107, AC-108),
-│   │                           # test_dependency_agent.py (AC-127..AC-132; one `network` test)
+│   ├── unit/                   # test_errors, test_models, test_packaging (AC-34, AC-57), test_proxy, test_readme,
+│   │                           # test_saver, test_serde, test_tool_calls (AC-46, AC-47), test_visualizer,
+│   │                           # test_replay_diff (AC-104..AC-106)
+│   ├── integration/            # test_async_saver, test_checkpointing_end_to_end, test_clean_install (slow, AC-33),
+│   │                           # test_cli, test_concurrency, test_crash_recovery, test_demo_store, test_forensics(_end_to_end),
+│   │                           # test_langgraph_workflow, test_read_only (ADR-0015), test_time_travel(_end_to_end),
+│   │                           # test_tool_call_capture, test_tool_calls_end_to_end, test_tool_forensics_demo (AC-45),
+│   │                           # test_replay (AC-94..AC-103, AC-107, AC-108), test_dependency_agent (AC-127..AC-132; one `network` test)
 │   └── fakes/                  # __init__.py, fake_relate_driver.py
 ├── benchmarks/
 │   └── bench_checkpointers.py  # RelateSaver vs SqliteSaver (not a test)
@@ -799,7 +776,7 @@ None. All graph storage is managed in-process via single-file `.rl` databases or
    - *Components:* `tool_call_id_unique` constraint, `MERGE` on `call_id`, `ToolMessage.tool_call_id` matching.
    - *Why expensive:* Moving to thread-scoped keys later (for example `{thread_id}:{call_id}`) would change the constraint, every stored node, and what `root_tool_call_id` reports to users.
 7. **Tool call recording rules:**
-   - *Components:* one `[:INVOKED]` edge per (thread, call) from the first stored checkpoint whose save saw the call (a call seen before its named checkpoint is stored attaches to a later one); first outcome wins; orphan results create nothing.
+   - *Components:* one `[:INVOKED]` edge per (thread, call) from the first stored checkpoint of that thread whose save saw the call ([ADR-0031](DECISIONS.md#adr-0031-writes-and-tool-calls-attach-only-to-a-checkpoint-of-their-own-thread)) (a call seen before its named checkpoint is stored attaches to a later one); first outcome wins; orphan results create nothing.
    - *Why expensive:* Forensics finds tool calls, including the calls counted by `failure_summary()`, through the `[:INVOKED]` edge, and `causal_path_length` depends on where it attaches; for a failing tool call the error checkpoint is the failure checkpoint, not the edge's checkpoint ([ADR-0021](DECISIONS.md#adr-0021-tool-call-root-cause-anchors-on-the-failure-checkpoint)). Changing which checkpoint gets the edge, or allowing outcomes to be overwritten, changes the reports of already stored runs.
 8. **`RootCauseReport.root_tool_name`, the origin fields and the provenance heuristic:**
    - *Components:* `root_tool_name` and the `Failing tool:` summary sentence; `origin_argument`, `origin_node`, `origin_step`, `origin_hops`; `ArgumentOrigin`, `ToolFailureSummary`, `trace_argument_origin()`, `failure_summary()`; the containment rule, the earliest-write rule and hops counted from the failure checkpoint ([ADR-0018](DECISIONS.md#adr-0018-argument-provenance-by-string-containment-earliest-write-wins)).

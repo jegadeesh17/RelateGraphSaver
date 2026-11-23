@@ -41,6 +41,8 @@ Reference documents:
 | [ADR-0027](#adr-0027-flat-tree-layout-with-fork-indentation) | Flat Tree Layout with Fork Indentation | Accepted | 2026-11-22 |
 | [ADR-0028](#adr-0028-relate_-environment-variable-configuration) | `RELATE_*` Environment Variable Configuration | Accepted | 2026-11-22 |
 | [ADR-0029](#adr-0029-forensics-lineage-namespace-loop-detection-and-root-cause-priority) | Forensics Lineage, Namespace Loop Detection, and Root-Cause Priority | Accepted | 2026-11-22 |
+| [ADR-0030](#adr-0030-the-failure-checkpoint-walk-follows-next-edges-only) | The Failure-Checkpoint Walk Follows `[:NEXT]` Edges Only | Accepted | 2026-11-23 |
+| [ADR-0031](#adr-0031-writes-and-tool-calls-attach-only-to-a-checkpoint-of-their-own-thread) | Writes and Tool Calls Attach Only to a Checkpoint of Their Own Thread | Accepted | 2026-11-23 |
 
 ---
 
@@ -1026,3 +1028,69 @@ We establish five forensic traversal and attribution rules:
 - **Positive:** Eliminates false-positive poison reports on legitimate conversational content.
 - **Positive:** Deterministic, localized root-cause attribution prioritizing proximate tool failures (`distance_to_error <= 1`).
 - **Positive:** Diagnostic tools preserve database file immutability by defaulting to `read_only=True`.
+
+---
+
+## ADR-0030: The Failure-Checkpoint Walk Follows `[:NEXT]` Edges Only
+
+Date: 2026-11-23  
+Status: Accepted
+
+### Context
+
+When a tool call fails, `trace_root_cause()` reports the *failure checkpoint*: the first checkpoint, from the one linked to the call by `[:INVOKED]` onward, whose writes hold the tool's result message ([ADR-0021](#adr-0021-tool-call-root-cause-anchors-on-the-failure-checkpoint)). ADR-0021 and AC-129 define that walk along `[:NEXT]` edges, the main line of the run. The implementation reused the lineage walk from [ADR-0029](#adr-0029-forensics-lineage-namespace-loop-detection-and-root-cause-priority), which also follows `[:FORKED_TO]` edges. When someone resumes a thread from an earlier checkpoint, the tool runs again on the branch with the same call id, so the main line and the branch can both hold a result for that call at the same distance. The walk then picked whichever row the database returned first, because it ordered only by distance. The same stored data could give a different `error_checkpoint_id` and `origin_hops` from one run of the command to the next, and could name a checkpoint on a branch that did not produce the recorded outcome.
+
+### Decision
+
+- The failure-checkpoint walk starts at the `[:INVOKED]` checkpoint (distance 0) and follows outgoing `[:NEXT]` edges between checkpoints of the same thread only. It never follows `[:FORKED_TO]`.
+- Checkpoints are visited in `(distance, checkpoint_id)` order. The first one whose writes (skipping channels that start with `__` and empty blobs) hold a `ToolMessage` for the call is the failure checkpoint. If none does, or the `[:INVOKED]` checkpoint is not in the thread, the `[:INVOKED]` checkpoint is used, as ADR-0021 already says.
+- AC-181's rule (follow `[:NEXT]` and `[:FORKED_TO]`, stay in the thread) applies to walks toward ancestors: the causal query and argument provenance. It does not apply to this forward walk.
+- The thread's edges are read once per public call, with each edge's type, and shared by the ancestor walks and this forward walk. Nothing is cached between calls.
+- For the record, the causal query's tie-break that ADR-0029 calls `tool_call_id` is the pair `direct_call_id, linked_call_id`: the call reached through the checkpoint's own `[:INVOKED]` edge, then one reached through a write.
+
+### Alternatives considered
+
+1. **Keep following `[:FORKED_TO]` and only add a tie-break on `checkpoint_id`:** Rejected; the answer would be repeatable but could still name a branch checkpoint, which contradicts ADR-0021 and AC-129.
+2. **Walk the main line first and fall back to branches when it holds no result:** Rejected for now; it adds a second ordering rule for an uncommon case, and the existing fallback to the `[:INVOKED]` checkpoint already gives a stable answer.
+3. **Record the behavior as a known limitation:** Rejected; it is a determinism defect in a public report, and the fix restores the documented contract without changing stored data.
+
+### Consequences
+
+- **Positive:** `trace_root_cause()`, `failure_summary()` and the `trace-error` command give the same answer on every run for the same file.
+- **Positive:** Threads without branches, including every thread of the committed demo store, report exactly what they reported before.
+- **Positive:** Reading edges once per call removes two of the three edge reads on long threads.
+- **Negative:** When a tool's only result was recorded on a branch, the failure checkpoint is the `[:INVOKED]` checkpoint, so `origin_hops` counts from there rather than from the branch checkpoint where the tool ran.
+
+---
+
+## ADR-0031: Writes and Tool Calls Attach Only to a Checkpoint of Their Own Thread
+
+Date: 2026-11-23  
+Status: Accepted
+
+### Context
+
+`put_writes()` stores each write with the `thread_id`, `checkpoint_ns` and `checkpoint_id` from its config, then links it to a checkpoint with `[:HAS_WRITE]`, finding that checkpoint by `checkpoint_id` alone. A later `put()` links any earlier write that has the new checkpoint's id, again by id alone. Tool-call capture in `put_writes()` finds the checkpoint for the `[:INVOKED]` edge the same way.
+
+Checkpoint ids are unique across the whole file, and that is exactly why this goes wrong: there is only one checkpoint with that id, and the id-only match finds it whichever thread owns it. LangGraph's own run loop always pairs a thread with that thread's checkpoint, so normal runs are not affected. But `put_writes()` and `aput_writes()` are public methods, and a script, test helper or migration tool that calls them with thread B in the config and a checkpoint id from thread A attaches the write, and any tool call in it, to thread A. `get_tuple()` for thread A then returns thread B's write as a pending write, so resuming thread A would apply data from another conversation, and forensics on thread A would count it. LangGraph's SQLite saver keys writes by thread, namespace and checkpoint id together, so such a write is simply never seen by thread A.
+
+### Decision
+
+- `put_writes()` creates `[:HAS_WRITE]` only to a checkpoint whose `thread_id`, `checkpoint_ns` and `checkpoint_id` all equal the write's: `OPTIONAL MATCH (c:Checkpoint {checkpoint_id: $checkpoint_id}) WHERE c.thread_id = $thread_id AND c.checkpoint_ns = $checkpoint_ns`. The id stays in the node map so the lookup uses the unique constraint.
+- `put()` links earlier writes only when they belong to the same thread and namespace: `OPTIONAL MATCH (w:Write {checkpoint_id: $checkpoint_id}) WHERE w.thread_id = $thread_id AND w.checkpoint_ns = $checkpoint_ns`. Writes that legitimately arrive before their checkpoint are still linked.
+- The tool-call invocation statement matches its checkpoint with `WHERE c.thread_id = $thread_id`. A mismatched call is then treated like any call whose checkpoint is not stored yet: it is not linked and is sent again by the next save that names a stored checkpoint of its own thread.
+- `get_tuple()` returns as pending writes only linked writes whose `thread_id` and `checkpoint_ns` equal the checkpoint's, so files that already contain such a cross-thread link stop leaking it into a resume.
+- A mismatched write is stored, not rejected. Writes may arrive before their checkpoint is stored, so the saver cannot tell a mistake from a race without an extra read on every save, and the other LangGraph savers do not reject it either.
+
+### Alternatives considered
+
+1. **Leave it, because checkpoint ids are unique:** Rejected; uniqueness is what makes the id-only match find the other thread's checkpoint. It does not make the match safe.
+2. **Raise an error when the named checkpoint belongs to another thread:** Rejected; it needs an extra read on every `put_writes()`, and no other LangGraph saver raises here.
+3. **Migrate existing files to remove cross-thread links:** Rejected; such links come only from mismatched direct calls, and the `get_tuple()` filter already stops them from affecting a resume.
+
+### Consequences
+
+- **Positive:** One thread's resume state can no longer contain another thread's writes, matching the other LangGraph savers.
+- **Positive:** No change for writes and tool calls saved by LangGraph's own run loop, so stored runs and the demo store report the same results.
+- **Negative:** A cross-thread link already stored in an older file is still visible to forensics and is still copied into in-memory forks; only `get_tuple()` filters it.
+- **Negative:** A mismatched write is kept in the file with no link, where nothing reads it.
