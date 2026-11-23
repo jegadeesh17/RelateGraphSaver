@@ -1885,19 +1885,61 @@ def test_tree_reports_database_error_and_exits_one(
     assert "Unexpected error" not in result.output
 
 
-def test_loops_threshold_below_two_is_refused_on_stderr(
-    runner: CliRunner, seeded_loop_db: tuple[str, str]
+def _flatten_usage_error(text: str) -> str:
+    """Join a boxed, wrapped usage error into one line so its wording can be matched."""
+    return " ".join(text.replace("|", " ").replace("│", " ").split())
+
+
+@pytest.mark.parametrize("command", ["loops", "diagnose"])
+@pytest.mark.parametrize("threshold", ["1", "0"])
+def test_threshold_below_two_is_a_usage_error_before_the_store_opens(
+    runner: CliRunner, seeded_loop_db: tuple[str, str], command: str, threshold: str
 ) -> None:
-    """AC-188: --threshold 1 exits 1 with the threshold message on stderr and prints no table."""
+    """AC-188: --threshold below 2 is a usage error (exit 2) naming the option and the minimum,
+    not an unexpected error, and the store file is left byte-identical."""
+    db_file, thread_id = seeded_loop_db
+    before = _file_state(db_file)
+
+    result = runner.invoke(
+        app, ["forensics", command, thread_id, "--threshold", threshold, "--db", db_file]
+    )
+
+    assert result.exit_code == 2
+    assert "--threshold" in result.stderr
+    assert "greater than or equal to 2" in _flatten_usage_error(result.stderr)
+    assert "Unexpected error" not in result.output
+    assert "Unexpected error" not in result.stderr
+    assert "Detected Loops" not in result.output
+    assert _file_state(db_file) == before
+
+
+def test_threshold_below_two_fails_before_a_missing_store_is_checked(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """AC-188: validation runs before the store is looked up, so a bad threshold wins over a
+    missing database file."""
+    missing = str(tmp_path / "absent.rl")
+
+    result = runner.invoke(app, ["forensics", "loops", "t", "--threshold", "1", "--db", missing])
+
+    assert result.exit_code == 2
+    assert "--threshold" in result.stderr
+    assert "not found" not in result.output
+
+
+@pytest.mark.parametrize("command", ["loops", "diagnose"])
+def test_threshold_two_is_accepted(
+    runner: CliRunner, seeded_loop_db: tuple[str, str], command: str
+) -> None:
+    """AC-188: --threshold 2, the minimum, still runs the command."""
     db_file, thread_id = seeded_loop_db
 
     result = runner.invoke(
-        app, ["forensics", "loops", thread_id, "--threshold", "1", "--db", db_file]
+        app, ["forensics", command, thread_id, "--threshold", "2", "--db", db_file]
     )
 
-    assert result.exit_code == 1
-    assert "threshold must be an integer >= 2, got 1" in result.stderr
-    assert "Detected Loops" not in result.output
+    assert result.exit_code == 0
+    assert "Unexpected error" not in result.output
 
 
 @pytest.fixture(scope="module")

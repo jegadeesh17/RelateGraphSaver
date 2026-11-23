@@ -56,6 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The combined `relate-dag forensics <thread>` panel shows the bad-argument origin line, as `trace-error` does.
 
 ### Fixed
+- `relate-dag forensics loops` and `forensics diagnose` reject `--threshold` below 2 as a usage error (exit code 2, naming the option and the minimum) before the store is opened, instead of reporting "Unexpected error" (AC-188).
 - `trace_root_cause()`, `failure_summary()` and `trace-error` report the same failure checkpoint on every run: the walk from the `[:INVOKED]` checkpoint follows `[:NEXT]` edges only, in `(distance, checkpoint_id)` order, so a retry on a `[:FORKED_TO]` branch can no longer be reported, and a result stored only on a branch falls back to the `[:INVOKED]` checkpoint (AC-189, ADR-0030). Each public call reads a thread's edges once instead of up to three times.
 - `put_writes()` and a later `put()` link a write to a checkpoint only when its `thread_id`, `checkpoint_ns` and `checkpoint_id` all match, the tool-call `[:INVOKED]` edge attaches only to a checkpoint of the saving thread and namespace, and `get_tuple()` returns as pending writes only linked writes of the checkpoint's own thread and namespace. A write whose config names another thread's checkpoint is stored unlinked instead of leaking into that thread's resume state (ADR-0031, AC-190, AC-191).
 - `get_tuple()` defaults omitted `checkpoint_ns` to `""` matching SqliteSaver behavior, while `list()` remains unfiltered when no namespace is specified (AC-173).

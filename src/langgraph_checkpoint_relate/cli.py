@@ -511,7 +511,8 @@ def forensics_loops(
         2,
         "--threshold",
         "-t",
-        help="Minimum consecutive cycle occurrence threshold.",
+        min=2,
+        help="Minimum consecutive cycle occurrence threshold (at least 2).",
     ),
     db: str = typer.Option(
         "checkpoints.rl",
@@ -700,7 +701,8 @@ def forensics_diagnose(
         2,
         "--threshold",
         "-t",
-        help="Minimum consecutive cycle occurrence threshold.",
+        min=2,
+        help="Minimum consecutive cycle occurrence threshold (at least 2).",
     ),
     db: str = typer.Option(
         "checkpoints.rl",
