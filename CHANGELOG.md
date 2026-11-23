@@ -56,6 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The combined `relate-dag forensics <thread>` panel shows the bad-argument origin line, as `trace-error` does.
 
 ### Fixed
+- `put_writes()` and a later `put()` link a write to a checkpoint only when its `thread_id`, `checkpoint_ns` and `checkpoint_id` all match, the tool-call `[:INVOKED]` edge attaches only to a checkpoint of the saving thread and namespace, and `get_tuple()` returns as pending writes only linked writes of the checkpoint's own thread and namespace. A write whose config names another thread's checkpoint is stored unlinked instead of leaking into that thread's resume state (ADR-0031, AC-190, AC-191).
 - `get_tuple()` defaults omitted `checkpoint_ns` to `""` matching SqliteSaver behavior, while `list()` remains unfiltered when no namespace is specified (AC-173).
 - `put()` resolves parent checkpoint IDs strictly from `config["configurable"]["checkpoint_id"]`, ignoring any misleading mappings in `metadata["parents"]` (AC-174).
 - Latest checkpoint resolution, `list()` pagination, and `before` boundaries sort reverse-chronologically by `checkpoint_id DESC` (UUIDv6) rather than step order, matching LangGraph runtime and fork semantics (AC-175, ADR-0026, amending AC-06).

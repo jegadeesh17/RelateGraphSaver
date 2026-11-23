@@ -9,6 +9,7 @@ Validates end-to-end interactions across:
 - AC-178: Configuration resolution priority (constructor, env vars, defaults)
 - AC-179: Proxy command timeout cancellation and worker skipping
 - AC-180: First-write-wins semantics and pending writes ordering
+- AC-190, AC-191: Thread-scoped write linking (ADR-0031)
 """
 
 # ruff: noqa: E402
@@ -22,6 +23,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import Checkpoint, CheckpointMetadata, empty_checkpoint
 from langgraph.checkpoint.serde.base import SerializerProtocol
@@ -302,3 +304,172 @@ def test_time_travel_error_propagation_and_cleanup_wiring(tmp_path: Path) -> Non
         assert tup is not None
         assert tup.checkpoint["channel_values"] == {"val": 42}
         sandbox.close()
+
+
+def _store_checkpoint(saver: RelateSaver, thread_id: str, checkpoint_id: str, ns: str = "") -> None:
+    """Store a root checkpoint for ``thread_id`` and ``ns`` through put()."""
+    config: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ns}}
+    saver.put(config, _create_checkpoint(checkpoint_id), {"step": 0, "parents": {}}, {})
+
+
+def _write_config(thread_id: str, checkpoint_id: str, ns: str = "") -> RunnableConfig:
+    return {
+        "configurable": {
+            "thread_id": thread_id,
+            "checkpoint_ns": ns,
+            "checkpoint_id": checkpoint_id,
+        }
+    }
+
+
+def _linked_task_ids(saver: RelateSaver, checkpoint_id: str) -> list[str]:
+    rows = saver.proxy.execute_read(
+        "MATCH (:Checkpoint {checkpoint_id: $cid})-[:HAS_WRITE]->(w:Write) "
+        "RETURN w.task_id AS task_id ORDER BY w.task_id",
+        {"cid": checkpoint_id},
+    )
+    return [str(row["task_id"]) for row in rows]
+
+
+def _stored_writes(saver: RelateSaver, task_id: str) -> list[dict[str, Any]]:
+    rows = saver.proxy.execute_read(
+        "MATCH (w:Write {task_id: $task_id}) "
+        "RETURN w.thread_id AS thread_id, w.checkpoint_ns AS checkpoint_ns, "
+        "w.checkpoint_id AS checkpoint_id",
+        {"task_id": task_id},
+    )
+    return [dict(row) for row in rows]
+
+
+def _invoked_count(saver: RelateSaver, checkpoint_id: str) -> int:
+    rows = saver.proxy.execute_read(
+        "MATCH (:Checkpoint {checkpoint_id: $cid})-[r:INVOKED]->(:ToolCall) RETURN count(r) AS n",
+        {"cid": checkpoint_id},
+    )
+    return int(rows[0]["n"])
+
+
+@pytest.mark.parametrize(
+    ("other_thread", "other_ns"),
+    [("thread-b", ""), ("thread-a", "sub")],
+    ids=["other-thread", "other-namespace"],
+)
+def test_ac190_put_writes_naming_another_threads_checkpoint_stays_unlinked(
+    other_thread: str, other_ns: str
+) -> None:
+    """AC-190: a write whose config names another thread or namespace is stored, not linked."""
+    cp_id = "1efc0000-0000-6000-8000-0000000000a1"
+    with RelateSaver(db_path=":memory:") as saver:
+        _store_checkpoint(saver, "thread-a", cp_id)
+        saver.put_writes(
+            _write_config(other_thread, cp_id, other_ns),
+            [("channel_x", "foreign")],
+            task_id="foreign-task",
+        )
+
+        stored = _stored_writes(saver, "foreign-task")
+        assert stored == [
+            {"thread_id": other_thread, "checkpoint_ns": other_ns, "checkpoint_id": cp_id}
+        ]
+        assert _linked_task_ids(saver, cp_id) == []
+
+        tup = saver.get_tuple(_write_config("thread-a", cp_id))
+        assert tup is not None
+        assert tup.pending_writes == []
+
+
+@pytest.mark.parametrize(
+    ("other_thread", "other_ns"),
+    [("thread-b", ""), ("thread-a", "sub")],
+    ids=["other-thread", "other-namespace"],
+)
+def test_ac190_mismatched_tool_call_is_not_invoked_from_the_named_checkpoint(
+    other_thread: str, other_ns: str
+) -> None:
+    """AC-190: a tool call carried by a mismatched put_writes() adds no [:INVOKED] edge."""
+    cp_id = "1efc0000-0000-6000-8000-0000000000a2"
+    message = AIMessage(content="", tool_calls=[{"id": "call_ac190", "name": "search", "args": {}}])
+    with RelateSaver(db_path=":memory:") as saver:
+        _store_checkpoint(saver, "thread-a", cp_id)
+        saver.put_writes(
+            _write_config(other_thread, cp_id, other_ns),
+            [("messages", [message])],
+            task_id="foreign-task",
+        )
+
+        assert _invoked_count(saver, cp_id) == 0
+        assert _linked_task_ids(saver, cp_id) == []
+        tup = saver.get_tuple(_write_config("thread-a", cp_id))
+        assert tup is not None
+        assert tup.pending_writes == []
+
+
+def test_ac190_matching_put_writes_still_links_and_returns_pending_write() -> None:
+    """AC-190 control: a write from the checkpoint's own thread and namespace links as before."""
+    cp_id = "1efc0000-0000-6000-8000-0000000000a3"
+    with RelateSaver(db_path=":memory:") as saver:
+        _store_checkpoint(saver, "thread-a", cp_id, ns="sub")
+        saver.put_writes(
+            _write_config("thread-a", cp_id, "sub"),
+            [("channel_x", "own")],
+            task_id="own-task",
+        )
+
+        assert _linked_task_ids(saver, cp_id) == ["own-task"]
+        tup = saver.get_tuple(_write_config("thread-a", cp_id, "sub"))
+        assert tup is not None
+        assert tup.pending_writes == [("own-task", "channel_x", "own")]
+
+
+def test_ac191_put_links_only_earlier_writes_of_its_own_thread_and_namespace() -> None:
+    """AC-191: writes stored before their checkpoint link only when thread and namespace match."""
+    cp_id = "1efc0000-0000-6000-8000-0000000000b1"
+    with RelateSaver(db_path=":memory:") as saver:
+        saver.put_writes(
+            _write_config("thread-a", cp_id), [("channel_x", "mine")], task_id="task-match"
+        )
+        saver.put_writes(
+            _write_config("thread-b", cp_id), [("channel_x", "other")], task_id="task-thread"
+        )
+        saver.put_writes(
+            _write_config("thread-a", cp_id, "sub"), [("channel_x", "ns")], task_id="task-ns"
+        )
+        assert _linked_task_ids(saver, cp_id) == []
+
+        _store_checkpoint(saver, "thread-a", cp_id)
+
+        assert _linked_task_ids(saver, cp_id) == ["task-match"]
+        assert len(_stored_writes(saver, "task-thread")) == 1
+        assert len(_stored_writes(saver, "task-ns")) == 1
+        tup = saver.get_tuple(_write_config("thread-a", cp_id))
+        assert tup is not None
+        assert tup.pending_writes == [("task-match", "channel_x", "mine")]
+
+
+def test_ac190_get_tuple_filters_a_cross_thread_link_already_in_the_file() -> None:
+    """AC-190: a [:HAS_WRITE] edge created by an older mismatched save is not returned."""
+    cp_id = "1efc0000-0000-6000-8000-0000000000c1"
+    with RelateSaver(db_path=":memory:") as saver:
+        _store_checkpoint(saver, "thread-a", cp_id)
+        saver.put_writes(
+            _write_config("thread-a", cp_id), [("channel_x", "mine")], task_id="task-own"
+        )
+        saver.put_writes(
+            _write_config("thread-b", cp_id), [("channel_x", "other")], task_id="task-thread"
+        )
+        saver.put_writes(
+            _write_config("thread-a", cp_id, "sub"), [("channel_x", "ns")], task_id="task-ns"
+        )
+        # Reproduce the links an id-only match used to create.
+        saver.proxy.execute_write(
+            "MATCH (c:Checkpoint {checkpoint_id: $cid}), (w:Write) "
+            "WHERE w.task_id IN ['task-thread', 'task-ns'] "
+            "MERGE (c)-[:HAS_WRITE]->(w)",
+            {"cid": cp_id},
+        )
+        assert _linked_task_ids(saver, cp_id) == ["task-ns", "task-own", "task-thread"]
+
+        tup = saver.get_tuple(_write_config("thread-a", cp_id))
+
+        assert tup is not None
+        assert tup.pending_writes == [("task-own", "channel_x", "mine")]

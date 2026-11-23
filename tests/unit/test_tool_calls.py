@@ -61,6 +61,7 @@ def _build(events: ToolEvents, serde: Any = None) -> list[tuple[str, dict[str, A
     return build_tool_call_statements(
         events,
         thread_id="t1",
+        checkpoint_ns="",
         checkpoint_id="cp1",
         serde=serde or _FakeSerde(),
         created_at="2026-01-01T00:00:00+00:00",
@@ -239,6 +240,7 @@ def test_invocation_statement_is_merge_on_call_id_ac_48() -> None:
         "args_blob": repr({"q": 1}).encode(),
         "created_at": "2026-01-01T00:00:00+00:00",
         "thread_id": "t1",
+        "checkpoint_ns": "",
         "checkpoint_id": "cp1",
     }
 

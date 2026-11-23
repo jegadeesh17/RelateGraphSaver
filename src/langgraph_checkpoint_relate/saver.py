@@ -412,6 +412,7 @@ class RelateSaver(BaseCheckpointSaver[str]):
             "FOREACH (_ IN CASE WHEN p IS NOT NULL AND next_count = 0 AND p.thread_id = c.thread_id AND p.checkpoint_ns = c.checkpoint_ns THEN [1] ELSE [] END | CREATE (p)-[:NEXT]->(c)) "
             "WITH c "
             "OPTIONAL MATCH (w:Write {checkpoint_id: $checkpoint_id}) "
+            "WHERE w.thread_id = $thread_id AND w.checkpoint_ns = $checkpoint_ns "
             "FOREACH (_ IN CASE WHEN w IS NOT NULL THEN [1] ELSE [] END | MERGE (c)-[:HAS_WRITE]->(w))"
         )
         params = {
@@ -433,6 +434,7 @@ class RelateSaver(BaseCheckpointSaver[str]):
             self._capture_tool_calls(
                 values=channel_values.values(),
                 thread_id=thread_id,
+                checkpoint_ns=checkpoint_ns,
                 checkpoint_id=checkpoint_id,
             )
 
@@ -509,6 +511,7 @@ class RelateSaver(BaseCheckpointSaver[str]):
                 "    w.created_at = $created_at "
                 "WITH w "
                 "OPTIONAL MATCH (c:Checkpoint {checkpoint_id: $checkpoint_id}) "
+                "WHERE c.thread_id = $thread_id AND c.checkpoint_ns = $checkpoint_ns "
                 "FOREACH (_ IN CASE WHEN c IS NOT NULL THEN [1] ELSE [] END | MERGE (c)-[:HAS_WRITE]->(w))"
             )
             params = {
@@ -530,6 +533,7 @@ class RelateSaver(BaseCheckpointSaver[str]):
         self._capture_tool_calls(
             values=[value for _, value in writes],
             thread_id=thread_id,
+            checkpoint_ns=checkpoint_ns,
             checkpoint_id=checkpoint_id_str,
         )
 
@@ -537,6 +541,7 @@ class RelateSaver(BaseCheckpointSaver[str]):
         self,
         values: Iterable[Any],
         thread_id: str,
+        checkpoint_ns: str,
         checkpoint_id: str,
     ) -> None:
         """Record new tool calls found in saved values as :ToolCall nodes (best effort).
@@ -555,6 +560,7 @@ class RelateSaver(BaseCheckpointSaver[str]):
             statements = build_tool_call_statements(
                 plan.events,
                 thread_id=thread_id,
+                checkpoint_ns=checkpoint_ns,
                 checkpoint_id=checkpoint_id,
                 serde=self.serde,
                 created_at=_utc_now_iso(),
@@ -666,7 +672,7 @@ class RelateSaver(BaseCheckpointSaver[str]):
         # Retrieve any pending writes associated with this checkpoint
         writes_query = (
             "MATCH (c:Checkpoint {thread_id: $thread_id, checkpoint_id: $checkpoint_id})-[:HAS_WRITE]->(w:Write) "
-            "WHERE w.checkpoint_ns = $checkpoint_ns "
+            "WHERE w.thread_id = c.thread_id AND w.checkpoint_ns = c.checkpoint_ns "
             "RETURN w.task_id AS task_id, "
             "       w.channel AS channel, "
             "       w.write_blob AS write_blob, "
