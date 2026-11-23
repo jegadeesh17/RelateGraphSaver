@@ -609,6 +609,7 @@ Worker threads enqueue `DbCommand`s (from `put()`, `put_writes()` and the rest);
 1. **Serialized Writes:** All mutating operations (`put`, `put_writes`, tool call capture, `fork`) pass through the `RelateThreadProxy` command queue. The proxy executes strictly on a single dedicated background thread, eliminating DB-API thread-affinity violations and file-lock collisions.
 2. **Crash Resilience:** Every commit flushes through the Write-Ahead Log before acknowledging caller futures, except the tool call capture transaction (see [Tool call capture ordering](#tool-call-capture-ordering)). If the host process crashes mid-step, uncommitted transactions are rolled back during WAL recovery on restart, guaranteeing zero orphaned nodes or dangling edges. Measured cost: in relate-db 1.0 each flush takes time proportional to the database file size, so with the default `wal_enabled=True` save latency grows as a thread's history grows (about 25 ms per save early and about 110 ms after 1,000 checkpoints in our benchmark). `wal_enabled=False` skips only the per-write flush and keeps saves flat (about 3 ms); a process kill still kept committed checkpoints in our tests, but durability across power loss without the flush is not verified, and the file grows larger. We keep the flush as the default.
 3. **Deadlock Prevention:** Calling threads wait synchronously on lightweight `concurrent.futures.Future` objects with configurable timeout guards. Reads and writes cannot interleave within an active atomic transaction.
+4. **Caller timeout ([ADR-0033](DECISIONS.md#adr-0033-relate_-variables-are-parsed-only-when-used-none-means-unset-and-a-timeout-reports-whether-the-command-started), AC-195):** When a caller's timeout expires for a single execute, a batch or a flush, the proxy cancels the command's future. If the worker has not started the command, it skips it and never executes it, and `RelateConcurrencyError` says it was not executed (AC-179). If the worker already started it, the command runs to completion, because the single writer cannot interrupt a running `conn.execute`, and `RelateConcurrencyError` says the operation timed out while running and may have committed.
 
 ### Tool call capture ordering
 
@@ -622,7 +623,7 @@ The event loop (`ainvoke` / `astream`) awaits `asyncio.to_thread(saver.put, ...)
 
 - The event loop never blocks on database work. Concurrent `asyncio.gather` runs on distinct thread_ids (AC-53) occupy at most the default executor's worker count (`min(32, cpu_count + 4)`); beyond that, calls queue in the executor.
 - The proxy remains the single writer, so async and sync callers can share one `RelateSaver` safely.
-- `RELATE_PROXY_TIMEOUT_SEC` applies as for synchronous calls; a timeout surfaces as `RelateConcurrencyError` from the `await`.
+- `RELATE_PROXY_TIMEOUT_SEC` applies as for synchronous calls; a timeout surfaces as `RelateConcurrencyError` from the `await`, with the started or not-started wording of AC-195 ([ADR-0033](DECISIONS.md#adr-0033-relate_-variables-are-parsed-only-when-used-none-means-unset-and-a-timeout-reports-whether-the-command-started)).
 
 ## Benchmark
 
@@ -722,18 +723,18 @@ RelateGraphSaver/
 ## Configuration
 
 Configuration parameters can be supplied directly to `RelateSaver` or resolved from environment variables. The resolution order is:
-1. Explicit constructor argument (if not `None` or sentinel).
+1. Explicit constructor argument (if passed and not `None`).
 2. `RELATE_*` environment variable (`RELATE_DB_PATH`, `RELATE_WAL_ENABLED`, `RELATE_PROXY_TIMEOUT_SEC`, `RELATE_LOG_LEVEL`).
 3. Built-in defaults (`":memory:"`, `True`, `30.0`, `"INFO"`).
 
-If an environment variable contains an invalid or unparseable value, initialization raises `ValueError` naming the offending variable ([ADR-0028](DECISIONS.md#adr-0028-relate_-environment-variable-configuration), AC-178). The benchmark takes command-line arguments only.
+A variable is parsed only when its argument is not passed, so an invalid or unparseable value raises `ValueError` naming the offending variable only in that case ([ADR-0028](DECISIONS.md#adr-0028-relate_-environment-variable-configuration), [ADR-0033](DECISIONS.md#adr-0033-relate_-variables-are-parsed-only-when-used-none-means-unset-and-a-timeout-reports-whether-the-command-started), AC-178, AC-194). The `langgraph_checkpoint_relate` logger's level is set only when `log_level` or `RELATE_LOG_LEVEL` is given; otherwise it is left unchanged ([ADR-0033](DECISIONS.md#adr-0033-relate_-variables-are-parsed-only-when-used-none-means-unset-and-a-timeout-reports-whether-the-command-started), AC-194). The benchmark takes command-line arguments only.
 
 | Environment Variable | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `RELATE_DB_PATH` | string | `":memory:"` | Target database file path or `":memory:"` for embedded graph storage ([ADR-0028](DECISIONS.md#adr-0028-relate_-environment-variable-configuration)) |
 | `RELATE_WAL_ENABLED` | boolean | `true` | Enables the per-write WAL flush for crash safety; tool call capture never flushes on its own ([ADR-0014](DECISIONS.md#adr-0014-tool-call-capture-commits-without-its-own-flush)). Measured cost under the concurrency and crash safety model |
 | `RELATE_PROXY_TIMEOUT_SEC` | float | `30.0` | Maximum wait time for actor queue transactions before raising timeout |
-| `RELATE_LOG_LEVEL` | string | `"INFO"` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+| `RELATE_LOG_LEVEL` | string | `"INFO"` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`); applied to the package logger only when configured |
 | `OPENROUTER_API_KEY` | string | unset | Optional; read only by `examples/openrouter_agent.py` from the process environment, never by the package or tests. Listed empty in `.env.example` |
 
 ## Setup requirements

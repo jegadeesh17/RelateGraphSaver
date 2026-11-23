@@ -44,6 +44,7 @@ Reference documents:
 | [ADR-0030](#adr-0030-the-failure-checkpoint-walk-follows-next-edges-only) | The Failure-Checkpoint Walk Follows `[:NEXT]` Edges Only | Accepted | 2026-11-23 |
 | [ADR-0031](#adr-0031-writes-and-tool-calls-attach-only-to-a-checkpoint-of-their-own-thread) | Writes and Tool Calls Attach Only to a Checkpoint of Their Own Thread | Accepted | 2026-11-23 |
 | [ADR-0032](#adr-0032-the-failure-checkpoint-walk-may-cross-one-forked_to-edge-after-a-put_writes-link) | The Failure-Checkpoint Walk May Cross One `[:FORKED_TO]` Edge After a `put_writes()` Link | Accepted | 2026-11-23 |
+| [ADR-0033](#adr-0033-relate_-variables-are-parsed-only-when-used-none-means-unset-and-a-timeout-reports-whether-the-command-started) | RELATE_* variables are parsed only when used, None means unset, and a timeout reports whether the command started | Accepted | 2026-11-23 |
 
 ---
 
@@ -1148,3 +1149,43 @@ On 2026-11-23 the project owner chose option 1 with check (a). The owner's reaso
 - **Negative:** When S has branches and the gate is false, the branch writes are still read in the single writes read and then discarded.
 - **Negative:** The thread filter applies to checkpoints, not writes. A cross-thread `[:HAS_WRITE]` link already stored in an older file (ADR-0031) is still read.
 - **Negative:** ADR-0030's remaining gap gets narrower but does not close. When the gate is false and the only result is on a branch, S is still reported.
+
+---
+
+## ADR-0033: RELATE_* variables are parsed only when used, None means unset, and a timeout reports whether the command started
+
+Date: 2026-11-23
+Status: Accepted
+
+This amends [ADR-0028](#adr-0028-relate_-environment-variable-configuration), AC-178 (configuration) and AC-179 (proxy timeout).
+
+### Context
+
+Four defects came out of a review of how `RelateSaver` and `RelateThreadProxy` handle configuration and timeouts:
+
+- The README says a `RELATE_*` variable is read only when it is used. The saver parsed all four on every construction, so an invalid `RELATE_LOG_LEVEL` broke a saver whose caller had passed `log_level` explicitly.
+- `RelateSaver(db_path=None)` created a database file named `None` instead of using `RELATE_DB_PATH` or the default.
+- Every `RelateSaver` set the level of the `langgraph_checkpoint_relate` logger, even when nothing was configured, which overwrote the level the application had chosen for that logger.
+- AC-179 cancelled the future when the caller's timeout expired. Cancelling cannot stop a command the worker has already started, so that command ran and committed while the caller was told it had failed.
+
+### Decision
+
+- **`None` means unset.** For `db_path`, `wal_enabled`, `default_timeout` and `log_level`, an argument that is `None` counts as not passed, and resolution continues with the `RELATE_*` variable and then the default (AC-194).
+- **Parse when used.** A `RELATE_*` variable is parsed only when its argument is not passed. An invalid value raises `ValueError` naming the variable only in that case (AC-194). The message texts are unchanged.
+- **Logger level only when configured.** The package logger's level is set only when `log_level` or `RELATE_LOG_LEVEL` is given. Otherwise it is left unchanged. `RELATE_LOG_LEVEL` accepts `DEBUG`, `INFO`, `WARNING`, `ERROR` and `CRITICAL`.
+- **A timeout reports whether the command started.** When a caller's timeout expires for a single execute, a batch or a flush, the proxy tries to cancel the command's future. If that succeeds, the worker has not started the command and never will, and `RelateConcurrencyError` says it was not executed. If it fails, the worker has started the command and it runs to completion, and `RelateConcurrencyError` says the operation timed out while running and may have committed (AC-195).
+
+### Options Considered
+
+1. **Keep eager parsing.** Rejected: it contradicts the README environment-variables section.
+2. **Keep `default_timeout=None` meaning "no timeout".** Rejected: nothing in `src`, tests, examples or benchmarks uses it, and the architecture already says `None` falls back to the environment variable or default.
+3. **Abort a running write on timeout.** Rejected: the single writer thread cannot interrupt `conn.execute` safely.
+
+### Explicit Trade-offs Accepted
+
+- **Positive:** An explicit argument fully replaces its environment variable, so an unrelated bad variable cannot break a caller that did not need it.
+- **Positive:** The application's own level for the package logger survives creating a saver.
+- **Positive:** A caller that sees "not executed" can retry safely. "May have committed" tells it to check the store before retrying.
+- **Negative:** `default_timeout=None` now means the environment or default timeout (30.0 s), not no timeout. Code that passed `None` to wait forever now times out.
+- **Negative:** An invalid `RELATE_*` variable that the caller's arguments cover is no longer reported at all.
+- **Negative:** After a timeout on a running command, the caller cannot tell whether it committed without reading the store.
