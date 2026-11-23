@@ -82,6 +82,38 @@ class FailureState(TypedDict):
     status: str
 
 
+def _put_node_chain(
+    saver: RelateSaver,
+    thread_id: str,
+    nodes: list[str],
+    prefix: str,
+    parent_id: str | None = None,
+    namespace: str = "",
+    first_step: int = 0,
+) -> list[str]:
+    """Store one checkpoint per node name, chained to ``parent_id``, and return their ids."""
+    ids: list[str] = []
+    prev = parent_id
+    for offset, node_name in enumerate(nodes):
+        cid = f"{prefix}-{offset}"
+        cfg: RunnableConfig = {
+            "configurable": {
+                "thread_id": thread_id,
+                "checkpoint_ns": namespace,
+                "checkpoint_id": cid,
+            }
+        }
+        cp: Any = dict(empty_checkpoint())
+        cp["id"] = cid
+        cp["channel_values"] = {"marker": cid}
+        if prev:
+            cp["parent_checkpoint_id"] = prev
+        saver.put(cfg, cp, {"node": node_name, "step": first_step + offset}, {})  # type: ignore[typeddict-unknown-key]
+        ids.append(cid)
+        prev = cid
+    return ids
+
+
 class TestRelateForensics:
     """Comprehensive test suite for RelateForensics engine and RelateSaver delegation."""
 
@@ -127,24 +159,25 @@ class TestRelateForensics:
             res = app.invoke({"counter": 0, "signal": "", "history": []}, config=config)
             assert res["counter"] >= 6
 
-            # Check via saver delegation
+            # Check via saver delegation: three ping -> pong rounds, spanning step 0 to step 5
+            step_ids = {
+                c.metadata["step"]: c.config["configurable"]["checkpoint_id"]
+                for c in saver.list(config)
+            }
             reports = saver.detect_loops(thread_id, threshold=2)
-            assert len(reports) >= 1
+            assert len(reports) == 1
 
             rep = reports[0]
             assert isinstance(rep, LoopReport)
             assert rep.thread_id == thread_id
             assert rep.cycle_nodes == ["ping", "pong"]
-            assert rep.occurrence_count >= 2
-            assert isinstance(rep.checkpoint_id_range, tuple)
-            assert len(rep.checkpoint_id_range) == 2
-            assert rep.checkpoint_id_range[0] != rep.checkpoint_id_range[1]
+            assert rep.occurrence_count == 3
+            assert rep.checkpoint_id_range == (step_ids[0], step_ids[5])
 
             # Check via direct RelateForensics instance
             with RelateForensics(saver) as forensics:
                 forensics_reports = forensics.detect_loops(thread_id, threshold=2)
-                assert len(forensics_reports) == len(reports)
-                assert forensics_reports[0].cycle_nodes == ["ping", "pong"]
+                assert forensics_reports == reports
 
             # Higher threshold should filter out if cycle count < threshold
             high_reports = saver.detect_loops(thread_id, threshold=10)
@@ -549,6 +582,111 @@ class TestRelateForensics:
         assert len(reports) == 1
         assert reports[0].cycle_nodes == ["alpha"]
         assert reports[0].occurrence_count == 2
+
+    def test_detect_loops_each_fork_branch_reports_its_own_cycle_ac_181(
+        self, temp_disk_db: str
+    ) -> None:
+        """AC-181, AC-182: Verify a cycle in the main branch and one in a fork are reported apart.
+
+        The fork's first checkpoint hangs off the shared root by a FORKED_TO edge, so its
+        branch is walked from its own root and never joined to the main branch's sequence.
+        """
+        thread_id = "thread-fork-branch-loops"
+        with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
+            (root_id,) = _put_node_chain(saver, thread_id, ["start"], "cp-fb-root")
+            main_ids = _put_node_chain(
+                saver,
+                thread_id,
+                ["planner", "worker", "planner", "worker"],
+                "cp-fb-main",
+                parent_id=root_id,
+                first_step=1,
+            )
+            fork_ids = _put_node_chain(
+                saver,
+                thread_id,
+                ["critic", "editor", "critic", "editor"],
+                "cp-fb-fork",
+                parent_id=root_id,
+                first_step=1,
+            )
+
+            fork_edges = saver.proxy.execute_read(
+                "MATCH (:Checkpoint {checkpoint_id: $root})-[r:FORKED_TO]->"
+                "(c:Checkpoint {checkpoint_id: $fork}) RETURN count(r) AS count",
+                {"root": root_id, "fork": fork_ids[0]},
+            )
+            assert fork_edges[0]["count"] == 1
+
+            reports = saver.detect_loops(thread_id, threshold=2)
+
+        found = {(tuple(r.cycle_nodes), r.occurrence_count, r.checkpoint_id_range) for r in reports}
+        assert len(reports) == 2
+        assert found == {
+            (("planner", "worker"), 2, (main_ids[0], main_ids[3])),
+            (("critic", "editor"), 2, (fork_ids[0], fork_ids[3])),
+        }
+        assert all(r.thread_id == thread_id for r in reports)
+
+    def test_detect_loops_namespaces_with_equal_steps_report_per_namespace_ac_182(
+        self, temp_disk_db: str
+    ) -> None:
+        """AC-182: Verify sibling subgraph namespaces with identical steps stay separate.
+
+        Both namespaces run steps 1-4 with the same node names, so a sort across steps would
+        interleave them. Walking NEXT per namespace yields one report for each.
+        """
+        thread_id = "thread-sibling-namespaces"
+        nodes = ["draft", "review", "draft", "review"]
+        with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
+            (root_id,) = _put_node_chain(saver, thread_id, ["entry"], "cp-sn-root")
+            ids_a = _put_node_chain(
+                saver,
+                thread_id,
+                nodes,
+                "cp-sn-a",
+                parent_id=root_id,
+                namespace="subgraph:a",
+                first_step=1,
+            )
+            ids_b = _put_node_chain(
+                saver,
+                thread_id,
+                nodes,
+                "cp-sn-b",
+                parent_id=root_id,
+                namespace="subgraph:b",
+                first_step=1,
+            )
+
+            reports = saver.detect_loops(thread_id, threshold=2)
+
+        found = {(tuple(r.cycle_nodes), r.occurrence_count, r.checkpoint_id_range) for r in reports}
+        assert len(reports) == 2
+        assert found == {
+            (("draft", "review"), 2, (ids_a[0], ids_a[3])),
+            (("draft", "review"), 2, (ids_b[0], ids_b[3])),
+        }
+
+    def test_detect_loops_below_threshold_in_each_namespace_reports_nothing_ac_182(
+        self, temp_disk_db: str
+    ) -> None:
+        """AC-182: Verify one occurrence per namespace never adds up to a cross-namespace loop."""
+        thread_id = "thread-namespaces-below-threshold"
+        with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
+            (root_id,) = _put_node_chain(saver, thread_id, ["entry"], "cp-bt-root")
+            for name in ("a", "b", "c"):
+                _put_node_chain(
+                    saver,
+                    thread_id,
+                    ["draft", "review"],
+                    f"cp-bt-{name}",
+                    parent_id=root_id,
+                    namespace=f"subgraph:{name}",
+                    first_step=1,
+                )
+
+            assert saver.detect_loops(thread_id, threshold=2) == []
 
     def test_trace_root_cause_tool_call_antecedent(self, temp_disk_db: str) -> None:
         """Verify trace_root_cause pinpoints offending tool call linked via INVOKED edge."""
@@ -1499,6 +1637,78 @@ class TestFailureSummary:
                 # Unknown thread raises CheckpointNotFoundError for trace_root_cause
                 with pytest.raises(CheckpointNotFoundError):
                     forensics.trace_root_cause("nonexistent-thread-id")
+
+    def test_ac181_subgraph_namespace_lineage_reaches_parent_namespace(
+        self, temp_disk_db: str
+    ) -> None:
+        """AC-181: Lineage walks cross from a subgraph checkpoint to its parent namespace.
+
+        A subgraph checkpoint is linked to its parent-namespace checkpoint by FORKED_TO, so the
+        argument origin and root cause are found in the parent, while a checkpoint of another
+        thread in the same namespace is never walked.
+        """
+        thread_id = "thread-ac181-subgraph"
+        other_thread = "thread-ac181-subgraph-other"
+        with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
+            cid_root = "cp-ac181-ns-root"
+            cfg_root: RunnableConfig = {
+                "configurable": {"thread_id": thread_id, "checkpoint_id": cid_root}
+            }
+            cp_root: Any = dict(empty_checkpoint())
+            cp_root["id"] = cid_root
+            saver.put(cfg_root, cp_root, {"step": 0}, {})
+            saver.put_writes(cfg_root, [("target", "ns-secret-value")], task_id="task-ns-root")
+
+            cid_sub = "cp-ac181-ns-sub"
+            cfg_sub: RunnableConfig = {
+                "configurable": {
+                    "thread_id": thread_id,
+                    "checkpoint_ns": "subgraph:worker",
+                    "checkpoint_id": cid_sub,
+                }
+            }
+            cp_sub: Any = dict(empty_checkpoint())
+            cp_sub["id"] = cid_sub
+            cp_sub["parent_checkpoint_id"] = cid_root
+            saver.put(cfg_sub, cp_sub, {"step": 1}, {})
+            saver.put_writes(cfg_sub, [("__error__", "subgraph failed")], task_id="task-ns-err")
+
+            cid_other = "cp-ac181-ns-other"
+            cfg_other: RunnableConfig = {
+                "configurable": {
+                    "thread_id": other_thread,
+                    "checkpoint_ns": "subgraph:worker",
+                    "checkpoint_id": cid_other,
+                }
+            }
+            cp_other: Any = dict(empty_checkpoint())
+            cp_other["id"] = cid_other
+            saver.put(cfg_other, cp_other, {"step": 0}, {})
+            saver.put_writes(cfg_other, [("target", "other-secret")], task_id="task-ns-other")
+
+            edge = saver.proxy.execute_read(
+                "MATCH (p:Checkpoint {checkpoint_id: $p})-[r:FORKED_TO]->"
+                "(c:Checkpoint {checkpoint_id: $c}) RETURN count(r) AS count",
+                {"p": cid_root, "c": cid_sub},
+            )
+            assert edge[0]["count"] == 1
+
+            with RelateForensics(saver) as forensics:
+                origin = forensics.trace_argument_origin(
+                    thread_id, cid_sub, {"target": "ns-secret-value"}
+                )
+                assert origin is not None
+                assert origin.checkpoint_id == cid_root
+                assert origin.hops == 1
+
+                other_origin = forensics.trace_argument_origin(
+                    thread_id, cid_sub, {"target": "other-secret"}
+                )
+                assert other_origin is None
+
+                report = forensics.trace_root_cause(thread_id)
+                assert report.error_checkpoint_id == cid_sub
+                assert report.error_message == "subgraph failed"
 
 
 class TestPoisonDetection:

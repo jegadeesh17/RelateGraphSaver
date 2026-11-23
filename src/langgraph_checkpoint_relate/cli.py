@@ -124,15 +124,13 @@ def _parse_set_messages(raw_items: list[str]) -> dict[int, str]:
 
 def _print_wide(table: Table) -> None:
     """Print a table at its natural width so cell text such as ``error -> ok`` never wraps."""
-    # Write the private _width: the public width setter takes an int and cannot restore an unset (None) width.
-    original_width = console._width
     natural_width = console.measure(table, options=console.options.update_width(10_000)).maximum
-    available_width = console.width
-    console._width = max(natural_width, available_width)
-    try:
-        console.print(table)
-    finally:
-        console._width = original_width
+    wide_console = Console(
+        file=console.file,
+        width=max(natural_width, console.width),
+        force_terminal=console.is_terminal,
+    )
+    wide_console.print(table)
 
 
 def _argument_changes(change: ToolCallChange) -> str:

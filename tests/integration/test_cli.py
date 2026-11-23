@@ -516,11 +516,19 @@ class TestCliForensicsCommand:
         db_file, thread_id = seeded_loop_db
         result = runner.invoke(app, ["forensics", "loops", thread_id, "--db", db_file])
         assert result.exit_code == 0
-        assert "Detected Loops" in result.output
-        assert "ping_agent" in result.output
-        assert "pong_agent" in result.output
-        assert "Cycle Nodes" in result.output
-        assert "Occurrences" in result.output
+        lines = result.output.splitlines()
+        assert sum("Detected Loops" in line for line in lines) == 1
+        assert re.search(
+            r"│ Cycle Nodes\s+│ Occurrences │ First Checkpoint │ Last Checkpoint │", result.output
+        )
+        # Four alternating checkpoints hold exactly one ping/pong cycle seen twice, so the table
+        # has exactly one data row carrying the node sequence, count and checkpoint interval.
+        data_rows = [line for line in lines if "ping_agent" in line or "pong_agent" in line]
+        assert len(data_rows) == 1
+        assert re.fullmatch(
+            r"│ ping_agent -> pong_agent │\s+2 │ chk-loop-step-0\s+│ chk-loop-step-3\s+│",
+            data_rows[0],
+        )
 
     def test_forensics_loops_with_linear_thread(
         self, runner: CliRunner, seeded_db: tuple[str, str, list[str]]
@@ -1808,3 +1816,26 @@ def test_ac167_print_wide_preserves_console_width(
 
     assert test_console._width == initial_width
     assert "Wide Table" in fake_stream.getvalue()
+
+
+def test_print_wide_keeps_cell_wider_than_console_on_one_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_print_wide prints cell text wider than the console unwrapped and untruncated."""
+    fake_stream = io.StringIO()
+    test_console = Console(file=fake_stream, width=40)
+    monkeypatch.setattr(cli, "console", test_console)
+    wide_cell = "error -> " + "x" * 100
+
+    table = Table(title="Wide Table")
+    table.add_column("Change")
+    table.add_row(wide_cell)
+
+    cli._print_wide(table)
+
+    lines = fake_stream.getvalue().splitlines()
+    assert sum(wide_cell in line for line in lines) == 1
+    assert len([line for line in lines if "x" in line]) == 1
+    assert "…" not in fake_stream.getvalue()
+    assert max(len(line) for line in lines) > 40
+    assert test_console.width == 40
