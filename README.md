@@ -301,7 +301,7 @@ Always pass `--db`. Without it the script writes to `examples/data/demo-llm.rl`,
 
 ### Environment variables
 
-`RelateSaver` reads these variables when the matching constructor argument is not passed. The order is: constructor argument, then environment variable, then the default. An invalid value raises `ValueError` when the saver is created.
+`RelateSaver` reads these variables when the matching constructor argument is not passed. The order is: constructor argument, then environment variable, then the default. An invalid value raises `ValueError` when the saver is created, but only for a variable the saver uses, that is, one whose argument is not passed.
 
 | Variable | Default | Accepted values |
 | --- | --- | --- |
@@ -310,7 +310,7 @@ Always pass `--db`. Without it the script writes to `examples/data/demo-llm.rl`,
 | `RELATE_PROXY_TIMEOUT_SEC` | `30.0` | A positive number of seconds |
 | `RELATE_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (case-insensitive) |
 
-`relate-dag` commands take the store path from `--db` (default `checkpoints.rl`) and do not read `RELATE_DB_PATH`. `.env.example` lists these names without values; the library reads the process environment and never loads a `.env` file, so export them in your shell. `OPENROUTER_API_KEY` is separate: only `examples/openrouter_agent.py` reads it (see [Running the LLM agent](#running-the-llm-agent)).
+`relate-dag` commands take the store path from `--db` (default `checkpoints.rl`) and ignore `RELATE_DB_PATH`, but read the other three variables the same way the library does. `.env.example` lists these names without values; the library reads the process environment and never loads a `.env` file, so export them in your shell. `OPENROUTER_API_KEY` is separate: only `examples/openrouter_agent.py` reads it (see [Running the LLM agent](#running-the-llm-agent)).
 
 ## How we use Relate, and why
 

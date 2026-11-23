@@ -60,6 +60,53 @@ _FALSY_STRINGS = frozenset({"0", "false", "no", "off"})
 _VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 
 
+def _wal_from_env() -> bool:
+    """Return RELATE_WAL_ENABLED parsed as a bool, or True when it is not set (AC-194)."""
+    env_wal = os.environ.get("RELATE_WAL_ENABLED")
+    if env_wal is None:
+        return True
+    norm_wal = env_wal.strip().lower()
+    if norm_wal in _TRUTHY_STRINGS:
+        return True
+    if norm_wal in _FALSY_STRINGS:
+        return False
+    raise ValueError(
+        f"Invalid value for RELATE_WAL_ENABLED: {env_wal!r}. "
+        "Must be one of: '1', 'true', 'yes', 'on', '0', 'false', 'no', 'off'."
+    )
+
+
+def _timeout_from_env() -> float:
+    """Return RELATE_PROXY_TIMEOUT_SEC as a float, or 30.0 when it is not set (AC-194)."""
+    env_timeout_str = os.environ.get("RELATE_PROXY_TIMEOUT_SEC")
+    if env_timeout_str is None:
+        return 30.0
+    try:
+        parsed_val = float(env_timeout_str)
+        if parsed_val <= 0 or not math.isfinite(parsed_val):
+            raise ValueError()
+    except (ValueError, TypeError):
+        raise ValueError(
+            f"Invalid value for RELATE_PROXY_TIMEOUT_SEC: {env_timeout_str!r} "
+            "(must be a positive float)"
+        ) from None
+    return parsed_val
+
+
+def _log_level_from_env() -> str | None:
+    """Return RELATE_LOG_LEVEL normalized, or None when it is not set (AC-194)."""
+    env_log_level = os.environ.get("RELATE_LOG_LEVEL")
+    if env_log_level is None:
+        return None
+    norm_env_log_level = env_log_level.strip().upper()
+    if norm_env_log_level not in _VALID_LOG_LEVELS:
+        raise ValueError(
+            f"Invalid value for RELATE_LOG_LEVEL: {env_log_level!r}. "
+            "Must be one of: DEBUG, INFO, WARNING, ERROR, CRITICAL."
+        )
+    return norm_env_log_level
+
+
 def _utc_now_iso() -> str:
     """Return current UTC timestamp in ISO-8601 string format."""
     return datetime.now(UTC).isoformat()
@@ -101,11 +148,16 @@ class RelateSaver(BaseCheckpointSaver[str]):
         """Initialize RelateSaver checkpointer.
 
         Resolves configuration using a strict 3-tier hierarchy:
-        1. Explicit constructor argument
+        1. Explicit constructor argument (an argument passed as None counts as not passed)
         2. RELATE_* environment variable (RELATE_DB_PATH, RELATE_WAL_ENABLED,
            RELATE_PROXY_TIMEOUT_SEC, RELATE_LOG_LEVEL)
         3. Built-in defaults (db_path=":memory:", wal_enabled=True,
            default_timeout=30.0, log_level="INFO")
+
+        A RELATE_* variable is parsed only when its argument is not passed, so an invalid
+        value for a variable the saver does not use never raises (AC-194, ADR-0033). The
+        level of the package logger is set only when log_level or RELATE_LOG_LEVEL is
+        given; otherwise the logger is left unchanged and ``self.log_level`` reports "INFO".
 
         Args:
             db_path: Path to the embedded Relate database file (default: ":memory:").
@@ -120,110 +172,60 @@ class RelateSaver(BaseCheckpointSaver[str]):
                 RelateReadOnlyError. With a passed proxy, the saver takes its
                 read-only state from that proxy.
             default_timeout: Optional proxy operation timeout in seconds (default: 30.0).
+                None falls back to RELATE_PROXY_TIMEOUT_SEC, then 30.0; it does not
+                disable the timeout.
             log_level: Optional logging level name (default: "INFO").
 
         Raises:
             ValueError: If read_only is true with ":memory:" or with a writable proxy.
-            ValueError: If any RELATE_* environment variable contains an invalid value.
+            ValueError: If a RELATE_* environment variable the saver uses (its argument is
+                not passed) contains an invalid value.
         """
-        # Validate and parse environment variables (AC-178, ADR-0028)
-        env_wal = os.environ.get("RELATE_WAL_ENABLED")
-        if env_wal is not None:
-            norm_wal = env_wal.strip().lower()
-            if norm_wal in _TRUTHY_STRINGS:
-                parsed_env_wal: bool | None = True
-            elif norm_wal in _FALSY_STRINGS:
-                parsed_env_wal = False
-            else:
-                raise ValueError(
-                    f"Invalid value for RELATE_WAL_ENABLED: {env_wal!r}. "
-                    "Must be one of: '1', 'true', 'yes', 'on', '0', 'false', 'no', 'off'."
-                )
+        # Resolution: explicit argument (None counts as not passed) -> RELATE_* variable ->
+        # default. A variable is parsed only when its argument is not passed (AC-178,
+        # AC-194, ADR-0028, ADR-0033).
+        if db_path is _UNSET_DB_PATH or db_path is None:
+            resolved_db_path: Any = os.environ.get("RELATE_DB_PATH", ":memory:")
         else:
-            parsed_env_wal = None
+            resolved_db_path = db_path
 
-        env_timeout_str = os.environ.get("RELATE_PROXY_TIMEOUT_SEC")
-        parsed_env_timeout: float | None
-        if env_timeout_str is not None:
+        if wal_enabled is _UNSET_WAL or wal_enabled is None:
+            resolved_wal = _wal_from_env()
+        else:
+            resolved_wal = bool(wal_enabled)
+
+        resolved_timeout: float
+        if default_timeout is _UNSET_TIMEOUT or default_timeout is None:
+            resolved_timeout = _timeout_from_env()
+        else:
             try:
-                parsed_val = float(env_timeout_str)
-                if parsed_val <= 0 or not math.isfinite(parsed_val):
+                parsed_timeout = float(default_timeout)
+                if parsed_timeout <= 0 or not math.isfinite(parsed_timeout):
                     raise ValueError()
-                parsed_env_timeout = parsed_val
+                resolved_timeout = parsed_timeout
             except (ValueError, TypeError):
                 raise ValueError(
-                    f"Invalid value for RELATE_PROXY_TIMEOUT_SEC: {env_timeout_str!r} "
-                    "(must be a positive float)"
+                    f"Invalid default_timeout: {default_timeout!r} (must be a positive float)"
                 ) from None
-        else:
-            parsed_env_timeout = None
 
-        env_log_level = os.environ.get("RELATE_LOG_LEVEL")
-        if env_log_level is not None:
-            norm_env_log_level = env_log_level.strip().upper()
-            if norm_env_log_level not in _VALID_LOG_LEVELS:
-                raise ValueError(
-                    f"Invalid value for RELATE_LOG_LEVEL: {env_log_level!r}. "
-                    "Must be one of: DEBUG, INFO, WARNING, ERROR, CRITICAL."
-                )
-            parsed_env_log_level: str | None = norm_env_log_level
+        # The package logger level is set only when log_level or RELATE_LOG_LEVEL is given.
+        configured_log_level: str | None
+        if log_level is _UNSET_LOG_LEVEL or log_level is None:
+            configured_log_level = _log_level_from_env()
         else:
-            parsed_env_log_level = None
-
-        # Resolve db_path: explicit argument -> RELATE_DB_PATH -> ":memory:"
-        if db_path is not _UNSET_DB_PATH:
-            resolved_db_path = db_path
-        elif (env_db_path := os.environ.get("RELATE_DB_PATH")) is not None:
-            resolved_db_path = env_db_path
-        else:
-            resolved_db_path = ":memory:"
-
-        # Resolve wal_enabled: explicit argument -> RELATE_WAL_ENABLED -> True
-        if wal_enabled is not _UNSET_WAL:
-            resolved_wal = bool(wal_enabled)
-        elif parsed_env_wal is not None:
-            resolved_wal = parsed_env_wal
-        else:
-            resolved_wal = True
-
-        # Resolve timeout: explicit argument -> RELATE_PROXY_TIMEOUT_SEC -> 30.0
-        resolved_timeout: float | None
-        if default_timeout is not _UNSET_TIMEOUT:
-            if default_timeout is not None:
-                try:
-                    parsed_timeout = float(default_timeout)
-                    if parsed_timeout <= 0 or not math.isfinite(parsed_timeout):
-                        raise ValueError()
-                    resolved_timeout = parsed_timeout
-                except (ValueError, TypeError):
-                    raise ValueError(
-                        f"Invalid default_timeout: {default_timeout!r} (must be a positive float)"
-                    ) from None
-            else:
-                resolved_timeout = None
-        elif parsed_env_timeout is not None:
-            resolved_timeout = parsed_env_timeout
-        else:
-            resolved_timeout = 30.0
-
-        # Resolve log_level: explicit argument -> RELATE_LOG_LEVEL -> "INFO"
-        if log_level is not _UNSET_LOG_LEVEL and log_level is not None:
             norm_log = str(log_level).strip().upper()
             if norm_log not in _VALID_LOG_LEVELS:
                 raise ValueError(
                     f"Invalid log_level: {log_level!r}. "
                     "Must be one of: DEBUG, INFO, WARNING, ERROR, CRITICAL."
                 )
-            resolved_log_level = norm_log
-        elif parsed_env_log_level is not None:
-            resolved_log_level = parsed_env_log_level
-        else:
-            resolved_log_level = "INFO"
+            configured_log_level = norm_log
 
-        self.log_level = resolved_log_level
-        lvl = getattr(logging, resolved_log_level)
-        logger.setLevel(lvl)
-        logging.getLogger("langgraph_checkpoint_relate").setLevel(lvl)
+        self.log_level = configured_log_level or "INFO"
+        if configured_log_level is not None:
+            lvl = getattr(logging, configured_log_level)
+            logger.setLevel(lvl)
+            logging.getLogger("langgraph_checkpoint_relate").setLevel(lvl)
 
         if serde is None:
             resolved_serde = default_serializer

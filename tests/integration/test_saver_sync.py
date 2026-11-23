@@ -9,6 +9,8 @@ Verifies AC-173:
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import patch
@@ -442,6 +444,139 @@ def test_invalid_relate_log_level_raises_value_error_ac_178(
     monkeypatch.setenv("RELATE_LOG_LEVEL", "debug")
     with RelateSaver(db_path=":memory:") as saver:
         assert saver.log_level == "DEBUG"
+
+
+_PACKAGE_LOGGER = "langgraph_checkpoint_relate"
+
+
+@pytest.fixture
+def clean_relate_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Clear every RELATE_* variable and run in an empty working directory."""
+    for name in (
+        "RELATE_DB_PATH",
+        "RELATE_WAL_ENABLED",
+        "RELATE_PROXY_TIMEOUT_SEC",
+        "RELATE_LOG_LEVEL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.chdir(tmp_path)
+    return tmp_path
+
+
+@pytest.fixture
+def restore_package_logger() -> Iterator[logging.Logger]:
+    """Save the package logger and saver module logger levels and restore them after the test."""
+    package_logger = logging.getLogger(_PACKAGE_LOGGER)
+    saver_logger = logging.getLogger(f"{_PACKAGE_LOGGER}.saver")
+    saved = (package_logger.level, saver_logger.level)
+    yield package_logger
+    package_logger.setLevel(saved[0])
+    saver_logger.setLevel(saved[1])
+
+
+def test_ac194_db_path_none_uses_default_and_creates_no_file(clean_relate_env: Path) -> None:
+    """AC-194: db_path=None counts as not passed, so no file named None is created."""
+    with RelateSaver(db_path=None) as saver:
+        assert saver.db_path == ":memory:"
+    assert list(clean_relate_env.iterdir()) == []
+
+
+def test_ac194_db_path_none_uses_env_path(
+    clean_relate_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC-194: db_path=None falls back to RELATE_DB_PATH."""
+    env_path = str(clean_relate_env / "from_env.rl")
+    monkeypatch.setenv("RELATE_DB_PATH", env_path)
+    with RelateSaver(db_path=None) as saver:
+        assert saver.db_path == env_path
+    assert not (clean_relate_env / "None").exists()
+
+
+def test_ac194_default_timeout_none_uses_default_or_env(
+    clean_relate_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC-194: default_timeout=None gives 30.0, or RELATE_PROXY_TIMEOUT_SEC when it is set."""
+    with RelateSaver(db_path=":memory:", default_timeout=None) as saver:
+        assert saver.default_timeout == 30.0
+        assert saver.proxy.default_timeout == 30.0
+    monkeypatch.setenv("RELATE_PROXY_TIMEOUT_SEC", "5")
+    with RelateSaver(db_path=":memory:", default_timeout=None) as saver:
+        assert saver.default_timeout == 5.0
+        assert saver.proxy.default_timeout == 5.0
+
+
+def test_ac194_wal_enabled_none_follows_env(
+    clean_relate_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC-194: wal_enabled=None follows RELATE_WAL_ENABLED, then defaults to True."""
+    with RelateSaver(db_path=":memory:", wal_enabled=None) as saver:
+        assert saver.wal_enabled is True
+    monkeypatch.setenv("RELATE_WAL_ENABLED", "false")
+    with RelateSaver(db_path=":memory:", wal_enabled=None) as saver:
+        assert saver.wal_enabled is False
+
+
+def test_ac194_log_level_none_follows_env(
+    clean_relate_env: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    restore_package_logger: logging.Logger,
+) -> None:
+    """AC-194: log_level=None follows RELATE_LOG_LEVEL, then reports INFO."""
+    with RelateSaver(db_path=":memory:", log_level=None) as saver:
+        assert saver.log_level == "INFO"
+    monkeypatch.setenv("RELATE_LOG_LEVEL", "error")
+    with RelateSaver(db_path=":memory:", log_level=None) as saver:
+        assert saver.log_level == "ERROR"
+
+
+@pytest.mark.parametrize(
+    ("variable", "bad", "kwargs"),
+    [
+        ("RELATE_WAL_ENABLED", "maybe", {"wal_enabled": True}),
+        ("RELATE_PROXY_TIMEOUT_SEC", "abc", {"default_timeout": 7.0}),
+        ("RELATE_LOG_LEVEL", "verbose", {"log_level": "WARNING"}),
+    ],
+)
+def test_ac194_invalid_env_raises_only_when_its_argument_is_not_passed(
+    clean_relate_env: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    restore_package_logger: logging.Logger,
+    variable: str,
+    bad: str,
+    kwargs: dict[str, Any],
+) -> None:
+    """AC-194: an invalid RELATE_* value is parsed, and raises, only when its argument is unset."""
+    monkeypatch.setenv(variable, bad)
+    with RelateSaver(db_path=":memory:", **kwargs):
+        pass
+    with pytest.raises(ValueError, match=variable):
+        RelateSaver(db_path=":memory:")
+    for key in kwargs:
+        none_kwargs: dict[str, Any] = {key: None}
+        with pytest.raises(ValueError, match=variable):
+            RelateSaver(db_path=":memory:", **none_kwargs)
+
+
+def test_ac194_logger_level_untouched_unless_configured(
+    clean_relate_env: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    restore_package_logger: logging.Logger,
+) -> None:
+    """AC-194: the package logger level is set only by log_level or RELATE_LOG_LEVEL."""
+    package_logger = restore_package_logger
+    package_logger.setLevel(logging.DEBUG)
+
+    with RelateSaver(db_path=":memory:") as saver:
+        assert saver.log_level == "INFO"
+        assert package_logger.level == logging.DEBUG
+
+    with RelateSaver(db_path=":memory:", log_level="WARNING"):
+        assert package_logger.level == logging.WARNING
+
+    package_logger.setLevel(logging.DEBUG)
+    monkeypatch.setenv("RELATE_LOG_LEVEL", "ERROR")
+    with RelateSaver(db_path=":memory:"):
+        assert package_logger.level == logging.ERROR
 
 
 def test_put_writes_regular_channel_first_write_wins_ac_180() -> None:
