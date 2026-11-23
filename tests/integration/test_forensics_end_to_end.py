@@ -472,11 +472,11 @@ class TestForensicsEndToEnd:
         with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
             forensics = RelateForensics(saver)
 
-            # Invalid threshold boundary: threshold < 1
-            with pytest.raises(ValueError, match="threshold must be an integer >= 1"):
+            # Invalid threshold boundary: threshold < 2 (AC-188)
+            with pytest.raises(ValueError, match="threshold must be an integer >= 2"):
                 forensics.detect_loops("any-thread", threshold=0)
 
-            with pytest.raises(ValueError, match="threshold must be an integer >= 1"):
+            with pytest.raises(ValueError, match="threshold must be an integer >= 2"):
                 forensics.detect_loops("any-thread", threshold=-5)
 
             # Invalid thread_id: empty or whitespace

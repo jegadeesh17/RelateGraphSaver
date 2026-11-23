@@ -14,13 +14,14 @@ import shutil
 import threading
 from importlib.metadata import version
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import pytest
 import relate
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import empty_checkpoint
+from langgraph.graph import END, START, StateGraph
 
 from langgraph_checkpoint_relate import (
     RelateCheckpointError,
@@ -33,6 +34,10 @@ from langgraph_checkpoint_relate.proxy import BatchCommand, DbCommand, RelateThr
 
 THREAD_ID = "ro-thread"
 CONFIG: RunnableConfig = {"configurable": {"thread_id": THREAD_ID, "checkpoint_ns": ""}}
+
+
+class LoopState(TypedDict):
+    counter: int
 
 
 def _sha256(path: Path) -> str:
@@ -298,8 +303,8 @@ class TestReadOnlyParity:
         ):
             assert ro.get_tuple(CONFIG) == rw.get_tuple(CONFIG)
             assert list(ro.list(CONFIG)) == list(rw.list(CONFIG))
-            assert ro.detect_loops(THREAD_ID, threshold=1) == rw.detect_loops(
-                THREAD_ID, threshold=1
+            assert ro.detect_loops(THREAD_ID, threshold=2) == rw.detect_loops(
+                THREAD_ID, threshold=2
             )
             ro_cause = ro.trace_root_cause(THREAD_ID)
             rw_cause = rw.trace_root_cause(THREAD_ID)
@@ -315,6 +320,40 @@ class TestReadOnlyParity:
             finally:
                 ro_fork.close()
                 rw_fork.close()
+
+    def test_detect_loops_on_a_looping_thread_matches_a_writable_open_ac_83(
+        self, tmp_path: Path
+    ) -> None:
+        """AC-83, AC-188: a non-empty loop report is identical read-only and writable (threshold 2)."""
+
+        def bump(state: LoopState) -> dict[str, int]:
+            return {"counter": state["counter"] + 1}
+
+        def route(state: LoopState) -> str:
+            return "ping" if state["counter"] % 2 == 0 else "pong"
+
+        def done(state: LoopState) -> str:
+            return END if state["counter"] >= 6 else route(state)
+
+        workflow = StateGraph(LoopState)
+        workflow.add_node("ping", bump)
+        workflow.add_node("pong", bump)
+        workflow.add_edge(START, "ping")
+        workflow.add_conditional_edges("ping", done, {"ping": "ping", "pong": "pong", END: END})
+        workflow.add_conditional_edges("pong", done, {"ping": "ping", "pong": "pong", END: END})
+
+        db = tmp_path / "loop.rl"
+        thread = "ro-loop-thread"
+        config: RunnableConfig = {"configurable": {"thread_id": thread}}
+        with RelateSaver(str(db)) as saver:
+            workflow.compile(checkpointer=saver).invoke({"counter": 0}, config=config)
+
+        copy = tmp_path / "loop-copy.rl"
+        shutil.copy(db, copy)
+        with RelateSaver(str(db), read_only=True) as ro, RelateSaver(str(copy)) as rw:
+            ro_loops = ro.detect_loops(thread, threshold=2)
+            assert ro_loops
+            assert ro_loops == rw.detect_loops(thread, threshold=2)
 
     def test_forensics_and_visualizer_work_on_a_read_only_saver_ac_83(self, store: Path) -> None:
         """AC-83: DAGVisualizer and RelateForensics accept a read-only saver and do not close it."""

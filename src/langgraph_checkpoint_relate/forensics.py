@@ -283,7 +283,7 @@ class RelateForensics:
     ) -> list[LoopReport]:
         """Identify state oscillation or repeating cycle paths in the Cypher DAG.
 
-        Implements AC-25, AC-26, and AC-182 (ADR-0029) by traversing NEXT relationships
+        Implements AC-25, AC-26, AC-182 (ADR-0029), and AC-188 by traversing NEXT relationships
         per namespace from root to leaf, evaluating node execution transitions and
         state hashes along each path without cross-namespace step interleaving.
 
@@ -297,12 +297,12 @@ class RelateForensics:
 
         Raises:
             CheckpointNotFoundError: If thread_id does not exist or has no checkpoints.
-            ValueError: If threshold is less than 1.
+            ValueError: If threshold is not an integer or is less than 2 (AC-188).
         """
         if not isinstance(thread_id, str) or not thread_id.strip():
             raise CheckpointNotFoundError("thread_id must be a non-empty string.")
-        if not isinstance(threshold, int) or threshold < 1:
-            raise ValueError(f"threshold must be an integer >= 1, got {threshold!r}")
+        if not isinstance(threshold, int) or threshold < 2:
+            raise ValueError(f"threshold must be an integer >= 2, got {threshold!r}")
 
         # 1. Query all checkpoints for thread_id
         cypher = (

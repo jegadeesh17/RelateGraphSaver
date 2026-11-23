@@ -276,8 +276,30 @@ class TestRelateForensics:
                 saver.trace_root_cause("")
 
             # 3. Invalid threshold
-            with pytest.raises(ValueError, match="threshold must be an integer >= 1"):
+            with pytest.raises(ValueError, match="threshold must be an integer >= 2"):
                 saver.detect_loops("missing-thread-xyz", threshold=0)
+
+    @pytest.mark.parametrize("threshold", [1, 0, -1, -5])
+    def test_detect_loops_rejects_threshold_below_two_ac_188(self, threshold: int) -> None:
+        """AC-188: threshold < 2 raises ValueError naming the threshold, before any query.
+
+        The thread does not exist, so reaching the database would raise
+        CheckpointNotFoundError instead; ValueError proves validation runs first.
+        """
+        with RelateSaver(":memory:", wal_enabled=False) as saver:
+            with pytest.raises(ValueError, match="threshold must be an integer >= 2") as exc_info:
+                saver.detect_loops("missing-thread-xyz", threshold=threshold)
+            assert repr(threshold) in str(exc_info.value)
+
+            with RelateForensics(saver) as forensics:
+                with pytest.raises(ValueError, match="threshold must be an integer >= 2"):
+                    forensics.detect_loops("missing-thread-xyz", threshold=threshold)
+
+    def test_detect_loops_accepts_threshold_two_ac_188(self) -> None:
+        """AC-188: threshold=2 is the minimum valid value and reaches the thread lookup."""
+        with RelateSaver(":memory:", wal_enabled=False) as saver:
+            with pytest.raises(CheckpointNotFoundError):
+                saver.detect_loops("missing-thread-xyz", threshold=2)
 
     def test_relate_forensics_file_constructor_and_context_manager(self, temp_disk_db: str) -> None:
         """Verify RelateForensics supports direct path constructor and context management."""
