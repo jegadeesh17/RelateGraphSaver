@@ -313,13 +313,30 @@ def _readme_env_table() -> dict[str, str]:
 
 
 def test_env_example_lists_each_variable_with_a_comment_and_no_value_rc_10() -> None:
-    """RC-10: every variable is `NAME=` with no value, preceded by a comment."""
+    """RC-10: each RELATE_* variable is a commented `# NAME=` line, preceded by a comment.
+
+    Copying the file to `.env` must not set an empty RELATE_* value, which RelateSaver rejects.
+    """
     lines = ENV_EXAMPLE.read_text(encoding="utf-8").splitlines()
-    for name in (*RELATE_ENV_VARS, "OPENROUTER_API_KEY"):
-        assert f"{name}=" in lines, name
-        assert lines[lines.index(f"{name}=") - 1].startswith("#"), name
+    for name in RELATE_ENV_VARS:
+        assert f"# {name}=" in lines, name
+        assert lines[lines.index(f"# {name}=") - 1].startswith("#"), name
+    assert "OPENROUTER_API_KEY=" in lines
+    assert lines[lines.index("OPENROUTER_API_KEY=") - 1].startswith("#")
     assignments = [line for line in lines if line and not line.startswith("#")]
     assert all(line.endswith("=") and line.count("=") == 1 for line in assignments)
+
+
+def test_env_example_has_no_active_relate_assignment_rc_10(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RC-10: no RELATE_* line is active, so a copied `.env` leaves the saver defaults intact."""
+    lines = ENV_EXAMPLE.read_text(encoding="utf-8").splitlines()
+    assert [line for line in lines if line.startswith("RELATE_")] == []
+    # An active empty value is what the file used to ship; the saver rejects it.
+    monkeypatch.setenv("RELATE_WAL_ENABLED", "")
+    with pytest.raises(ValueError, match="RELATE_WAL_ENABLED"):
+        RelateSaver()
 
 
 def test_env_example_drops_unused_provider_keys_rc_10() -> None:

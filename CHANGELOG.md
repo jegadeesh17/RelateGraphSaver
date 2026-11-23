@@ -50,12 +50,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Variable-length ancestry queries start from the target checkpoint instead of scanning the whole chain.
 - Tool-call capture sends only new statements per saver (ADR-0011) and commits without its own flush; the store is flushed on close (ADR-0014).
 - `RelateForensics` and `DAGVisualizer` open a store file read-only unless `read_only=False` is passed; with no arguments they now raise `RelateConnectionError` when `checkpoints.rl` is missing instead of creating it (AC-187, ADR-0029).
-- `detect_loops` and `relate-dag forensics loops --threshold` require a threshold of at least 2 and raise `ValueError` below it (AC-188).
+- `detect_loops` requires a threshold of at least 2 and raises `ValueError` below it; `relate-dag forensics loops --threshold` rejects a lower value as a usage error (AC-188).
 - `relate-dag tree` renders a thread's checkpoints as a flat list of siblings, with forks nested under the checkpoint they branch from, so long runs no longer indent off screen (AC-185).
 - `relate-dag forensics --help` lists the reserved subcommand names and states that thread IDs starting with `-` are not accepted as positional thread IDs.
 - The combined `relate-dag forensics <thread>` panel shows the bad-argument origin line, as `trace-error` does.
 
 ### Fixed
+- `.env.example` lists the four `RELATE_*` variables as commented-out lines, so copying it to `.env` no longer sets empty values that `RelateSaver` rejects with `ValueError`.
 - `relate-dag forensics loops` and `forensics diagnose` reject `--threshold` below 2 as a usage error (exit code 2, naming the option and the minimum) before the store is opened, instead of reporting "Unexpected error" (AC-188).
 - `trace_root_cause()`, `failure_summary()` and `trace-error` report the same failure checkpoint on every run: the walk from the `[:INVOKED]` checkpoint follows `[:NEXT]` edges only, in `(distance, checkpoint_id)` order, so a retry on a `[:FORKED_TO]` branch can no longer be reported, and a result stored only on a branch falls back to the `[:INVOKED]` checkpoint (AC-189, ADR-0030). Each public call reads a thread's edges once instead of up to three times.
 - `put_writes()` and a later `put()` link a write to a checkpoint only when its `thread_id`, `checkpoint_ns` and `checkpoint_id` all match, the tool-call `[:INVOKED]` edge attaches only to a checkpoint of the saving thread and namespace, and `get_tuple()` returns as pending writes only linked writes of the checkpoint's own thread and namespace. A write whose config names another thread's checkpoint is stored unlinked instead of leaking into that thread's resume state (ADR-0031, AC-190, AC-191).
