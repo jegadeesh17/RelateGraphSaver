@@ -1084,9 +1084,9 @@ class RelateForensics:
                                 break
                     except Exception as exc:
                         logger.debug(
-                            "Skipping undeserializable metadata while locating the error "
-                            "checkpoint: %s",
-                            exc,
+                            "Skipping checkpoint %s metadata that could not be inspected (%s)",
+                            cp.get("checkpoint_id"),
+                            type(exc).__name__,
                         )
 
         # AC-28: No error detected in execution history
@@ -1131,7 +1131,11 @@ class RelateForensics:
                 else:
                     error_message = str(err_val)
             except Exception as exc:
-                logger.debug("Error payload could not be deserialized: %s", exc)
+                logger.debug(
+                    "Error payload of checkpoint %s could not be deserialized (%s)",
+                    err_rec.get("checkpoint_id"),
+                    type(exc).__name__,
+                )
                 error_message = "Error payload deserialization failure"
         elif "tool_error" in err_rec and err_rec["tool_error"]:
             error_message = str(err_rec["tool_error"])
@@ -1146,7 +1150,12 @@ class RelateForensics:
                         or "Workflow execution failed"
                     )
             except Exception as exc:
-                logger.debug("Skipping undeserializable metadata for the error message: %s", exc)
+                logger.debug(
+                    "Skipping checkpoint %s metadata that could not be inspected for the "
+                    "error message (%s)",
+                    err_rec.get("checkpoint_id"),
+                    type(exc).__name__,
+                )
 
         if error_message.endswith(_LANGGRAPH_ERROR_SUFFIX):
             error_message = error_message.removesuffix(_LANGGRAPH_ERROR_SUFFIX).rstrip()

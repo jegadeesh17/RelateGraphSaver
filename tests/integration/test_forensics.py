@@ -11,6 +11,7 @@ Validates:
 from __future__ import annotations
 
 import gc
+import logging
 import os
 import random
 import sys
@@ -817,6 +818,57 @@ class TestRelateForensics:
             report = saver.trace_root_cause("thread-sfx-keep")
 
         assert report.error_message == stored
+
+    def test_root_cause_debug_log_omits_payload_text_ac_47(
+        self, temp_disk_db: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """AC-47: debug logs name the exception class only, never text that may quote a payload.
+
+        Forces the metadata handler (no tool failure on the thread) and the error-message
+        metadata handler (error found in metadata, then re-read fails) to run with an exception
+        whose text carries a marker, and checks that no record carries the marker.
+        """
+        marker = "SECRET-PAYLOAD-MARKER"
+        meta: Any = {"step": 1, "source": "loop", "parents": {}}
+        with RelateSaver(db_path=temp_disk_db, wal_enabled=True) as saver:
+            cases: list[tuple[str, dict[str, Any]]] = [
+                ("thread-log-plain", {}),
+                ("thread-log-meta-err", {"error": "x"}),
+            ]
+            for thread_id, extra in cases:
+                cfg: RunnableConfig = {
+                    "configurable": {"thread_id": thread_id, "checkpoint_ns": ""}
+                }
+                cp: Any = dict(empty_checkpoint())
+                cp["id"] = f"cp-{thread_id}"
+                full_meta: Any = {**meta, **extra}
+                saver.put(cfg, cp, full_meta, {})
+
+            real_loads = saver.serde.loads
+            calls = {"n": 0}
+            saver_state = {"pass_first": False}
+
+            def failing_loads(data: Any) -> Any:
+                calls["n"] += 1
+                if calls["n"] == 1 and saver_state["pass_first"]:
+                    return real_loads(data)
+                raise ValueError(marker)
+
+            with (
+                patch.object(saver.serde, "loads", side_effect=failing_loads),
+                caplog.at_level(logging.DEBUG, logger="langgraph_checkpoint_relate"),
+            ):
+                saver.trace_root_cause("thread-log-plain")
+                saver_state["pass_first"] = True
+                calls["n"] = 0
+                saver.trace_root_cause("thread-log-meta-err")
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("could not be inspected (ValueError)" in m for m in messages)
+        assert any(
+            "could not be inspected for the error message (ValueError)" in m for m in messages
+        )
+        assert not any(marker in m for m in messages)
 
     def test_trace_root_cause_long_next_chain_is_fast_ac_27(self, temp_disk_db: str) -> None:
         """AC-27: root cause on a 300-checkpoint NEXT chain finds the first antecedent quickly."""
