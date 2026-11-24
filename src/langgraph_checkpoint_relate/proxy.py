@@ -286,6 +286,7 @@ class RelateThreadProxy:
         """Execute a single Cypher command."""
         if not cmd.future.set_running_or_notify_cancel():
             return
+        committed = False
         try:
             if cmd.is_write:
                 with self._writer_lock:
@@ -295,10 +296,13 @@ class RelateThreadProxy:
                         else self._conn.execute(cmd.cypher)
                     )
                     records = cur.fetchall() if hasattr(cur, "fetchall") else []
-                    if hasattr(self._conn, "commit") and not getattr(
-                        self._conn, "autocommit", True
-                    ):
+                    autocommit = getattr(self._conn, "autocommit", True)
+                    if hasattr(self._conn, "commit") and not autocommit:
                         self._conn.commit()
+                        committed = True
+                    elif autocommit:
+                        # AC-198: in autocommit mode execute() has already committed the statement.
+                        committed = True
                     if self.wal_enabled and hasattr(self._conn, "flush"):
                         self._conn.flush()
             else:
@@ -313,7 +317,8 @@ class RelateThreadProxy:
                 formatted = _format_records(records)
                 cmd.future.set_result(formatted)
         except Exception as exc:
-            if hasattr(self._conn, "rollback"):
+            # AC-198: after a successful commit a failing flush must not roll back.
+            if not committed and hasattr(self._conn, "rollback"):
                 try:
                     self._conn.rollback()
                 except Exception:
@@ -332,6 +337,7 @@ class RelateThreadProxy:
                     self._conn.autocommit = False
 
                 results: list[list[dict[str, Any]]] = []
+                committed = False
                 try:
                     for cypher, params in cmd.statements:
                         cur = (
@@ -344,10 +350,12 @@ class RelateThreadProxy:
 
                     if hasattr(self._conn, "commit"):
                         self._conn.commit()
+                        committed = True
                     if cmd.flush and self.wal_enabled and hasattr(self._conn, "flush"):
                         self._conn.flush()
                 except Exception:
-                    if hasattr(self._conn, "rollback"):
+                    # AC-198: after a successful commit a failing flush must not roll back.
+                    if not committed and hasattr(self._conn, "rollback"):
                         try:
                             self._conn.rollback()
                         except Exception:

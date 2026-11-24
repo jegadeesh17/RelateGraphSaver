@@ -57,7 +57,7 @@ class TimeTravelEngine:
 
         Raises:
             CheckpointNotFoundError: If checkpoint_id does not exist for thread_id.
-            RelateCheckpointError: If the tool call read fails or the fork-point checkpoint
+            RelateCheckpointError: If any source read fails, or the fork-point checkpoint
                 cannot be deserialized.
         """
         # Validate target checkpoint existence and fetch candidates ordered by step ASC
@@ -105,13 +105,10 @@ class TimeTravelEngine:
                     "       c.created_at AS created_at "
                     "LIMIT 1"
                 )
-                try:
-                    p_records = source_saver.proxy.execute_read(parent_query, {"cid": curr_id})
-                    if p_records:
-                        record = p_records[0]
-                        checkpoints_by_id[curr_id] = record
-                except RelateCheckpointError:
-                    record = None
+                p_records = source_saver.proxy.execute_read(parent_query, {"cid": curr_id})
+                if p_records:
+                    record = p_records[0]
+                    checkpoints_by_id[curr_id] = record
 
             if record is None:
                 break
@@ -182,10 +179,7 @@ class TimeTravelEngine:
             "WHERE p.checkpoint_id IN $ids AND c.checkpoint_id IN $ids "
             "RETURN p.checkpoint_id AS source_id, type(r) AS rel_type, c.checkpoint_id AS target_id"
         )
-        try:
-            edges_records = source_saver.proxy.execute_read(edges_query, {"ids": ancestor_ids})
-        except RelateCheckpointError:
-            edges_records = []
+        edges_records = source_saver.proxy.execute_read(edges_query, {"ids": ancestor_ids})
 
         if not edges_records:
             edges_records = []
@@ -206,10 +200,7 @@ class TimeTravelEngine:
             "RETURN t.thread_id AS thread_id, t.created_at AS created_at "
             "LIMIT 1"
         )
-        try:
-            thread_records = source_saver.proxy.execute_read(thread_query, {"thread_id": thread_id})
-        except RelateCheckpointError:
-            thread_records = []
+        thread_records = source_saver.proxy.execute_read(thread_query, {"thread_id": thread_id})
 
         thread_created_at = (
             thread_records[0]["created_at"]

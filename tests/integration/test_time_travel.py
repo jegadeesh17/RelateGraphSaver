@@ -850,6 +850,103 @@ class TestForkToolCalls:
             with pytest.raises(RelateCheckpointError, match="Simulated writes query read failure"):
                 source.fork_in_memory(thread_id, "cp-1")
 
+    def test_fork_in_memory_propagates_parent_lineage_read_error_ac_197(
+        self, temp_disk_db: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-197: Read error looking up a parent outside the thread's candidates propagates."""
+        parent_config: RunnableConfig = {
+            "configurable": {"thread_id": "tt-par-a", "checkpoint_ns": ""}
+        }
+        child_config: RunnableConfig = {
+            "configurable": {
+                "thread_id": "tt-par-b",
+                "checkpoint_ns": "",
+                "checkpoint_id": "cp-a",
+            }
+        }
+        with RelateSaver(db_path=temp_disk_db) as source:
+            source.put(parent_config, _make_checkpoint("cp-a", {"count": 1}), {"step": 1}, {})
+            source.put(child_config, _make_checkpoint("cp-b", {"count": 2}), {"step": 2}, {})
+
+            orig_read = source.proxy.execute_read
+            seen: list[str] = []
+
+            def spying_read(
+                cypher: str,
+                params: dict[str, Any] | None = None,
+                timeout: float | None = None,
+            ) -> list[dict[str, Any]]:
+                seen.append(cypher)
+                return orig_read(cypher, params, timeout)
+
+            monkeypatch.setattr(source.proxy, "execute_read", spying_read)
+            fork = source.fork_in_memory("tt-par-b", "cp-b")
+            fork.close()
+            assert any("{checkpoint_id: $cid}" in cypher for cypher in seen)
+
+            def failing_read(
+                cypher: str,
+                params: dict[str, Any] | None = None,
+                timeout: float | None = None,
+            ) -> list[dict[str, Any]]:
+                if "{checkpoint_id: $cid}" in cypher:
+                    raise RelateCheckpointError("Simulated parent lineage read failure")
+                return orig_read(cypher, params, timeout)
+
+            monkeypatch.setattr(source.proxy, "execute_read", failing_read)
+            with pytest.raises(
+                RelateCheckpointError, match="Simulated parent lineage read failure"
+            ):
+                source.fork_in_memory("tt-par-b", "cp-b")
+
+    def test_fork_in_memory_propagates_edges_read_error_ac_197(
+        self, temp_disk_db: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-197: Read error querying checkpoint edges propagates instead of being swallowed."""
+        thread_id = "tt-edges-read-err"
+        config: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+        with RelateSaver(db_path=temp_disk_db) as source:
+            source.put(config, _make_checkpoint("cp-1", {"count": 1}), {"step": 1}, {})
+
+            orig_read = source.proxy.execute_read
+
+            def failing_read(
+                cypher: str,
+                params: dict[str, Any] | None = None,
+                timeout: float | None = None,
+            ) -> list[dict[str, Any]]:
+                if "NEXT|FORKED_TO" in cypher:
+                    raise RelateCheckpointError("Simulated edges read failure")
+                return orig_read(cypher, params, timeout)
+
+            monkeypatch.setattr(source.proxy, "execute_read", failing_read)
+            with pytest.raises(RelateCheckpointError, match="Simulated edges read failure"):
+                source.fork_in_memory(thread_id, "cp-1")
+
+    def test_fork_in_memory_propagates_thread_read_error_ac_197(
+        self, temp_disk_db: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-197: Read error querying thread metadata propagates instead of being swallowed."""
+        thread_id = "tt-thread-read-err"
+        config: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+        with RelateSaver(db_path=temp_disk_db) as source:
+            source.put(config, _make_checkpoint("cp-1", {"count": 1}), {"step": 1}, {})
+
+            orig_read = source.proxy.execute_read
+
+            def failing_read(
+                cypher: str,
+                params: dict[str, Any] | None = None,
+                timeout: float | None = None,
+            ) -> list[dict[str, Any]]:
+                if "MATCH (t:Thread" in cypher:
+                    raise RelateCheckpointError("Simulated thread read failure")
+                return orig_read(cypher, params, timeout)
+
+            monkeypatch.setattr(source.proxy, "execute_read", failing_read)
+            with pytest.raises(RelateCheckpointError, match="Simulated thread read failure"):
+                source.fork_in_memory(thread_id, "cp-1")
+
     def test_fork_in_memory_closes_saver_on_population_failure_ac_19(
         self, temp_disk_db: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:

@@ -69,9 +69,11 @@ def _detect_sequence_cycles(
         best_match: tuple[int, int, list[str]] | None = None
         max_l = (n - i) // threshold
         for length in range(1, max_l + 1):
-            pattern = tokens[i : i + length]
-            if not _is_primitive(pattern):
+            # AC-196: a cycle needs tokens[i + length] to equal tokens[i]; skip the rest cheaply.
+            a, b = tokens[i], tokens[i + length]
+            if a is not b and a != b:
                 continue
+            pattern = tokens[i : i + length]
 
             k = 1
             while (
@@ -80,7 +82,7 @@ def _detect_sequence_cycles(
             ):
                 k += 1
 
-            if k >= threshold:
+            if k >= threshold and _is_primitive(pattern):
                 cycle_nodes = [str(items[idx]["node"]) for idx in range(i, i + length)]
                 if best_match is None or (k * length > best_match[0] * len(best_match[2])):
                     best_match = (k, length, cycle_nodes)
@@ -1080,8 +1082,12 @@ class RelateForensics:
                             ):
                                 error_records = [cp]
                                 break
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug(
+                            "Skipping checkpoint %s metadata that could not be inspected (%s)",
+                            cp.get("checkpoint_id"),
+                            type(exc).__name__,
+                        )
 
         # AC-28: No error detected in execution history
         if not error_records:
@@ -1124,7 +1130,12 @@ class RelateForensics:
                     )
                 else:
                     error_message = str(err_val)
-            except Exception:
+            except Exception as exc:
+                logger.debug(
+                    "Error payload of checkpoint %s could not be deserialized (%s)",
+                    err_rec.get("checkpoint_id"),
+                    type(exc).__name__,
+                )
                 error_message = "Error payload deserialization failure"
         elif "tool_error" in err_rec and err_rec["tool_error"]:
             error_message = str(err_rec["tool_error"])
@@ -1138,8 +1149,13 @@ class RelateForensics:
                         or md.get("message")
                         or "Workflow execution failed"
                     )
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug(
+                    "Skipping checkpoint %s metadata that could not be inspected for the "
+                    "error message (%s)",
+                    err_rec.get("checkpoint_id"),
+                    type(exc).__name__,
+                )
 
         if error_message.endswith(_LANGGRAPH_ERROR_SUFFIX):
             error_message = error_message.removesuffix(_LANGGRAPH_ERROR_SUFFIX).rstrip()
