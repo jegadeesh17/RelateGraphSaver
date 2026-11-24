@@ -333,6 +333,8 @@ Amended by: [ADR-0013](#adr-0013-clean-install-test-skips-only-when-the-package-
 - **Positive:** A clean `pip install` gives a working CLI, and a future undeclared import fails a fast test.
 - **Negative:** The full suite needs network access for the clean-install test, and that test takes tens of seconds.
 
+**Amendment (2026-11-24).** The Context above no longer matches the code: no module under `src/` imports `click` any more, and the CLI uses only `typer` and `typer.core.TyperGroup`. We still keep `click>=8.1.0` in `[project].dependencies` on purpose, because the `typer>=0.12.0` floor allows older Typer releases that need `click`, and the extra dependency does no harm. Keeping it also means AC-34 and the check in `tests/unit/test_packaging.py` continue to hold; removing it would require changing AC-34, which we chose not to do before release. The rest of this decision, declaring every directly imported runtime dependency and proving it with a clean install, stands unchanged.
+
 ---
 
 ## ADR-0010: In-Memory Forks Copy Tool Call Data
