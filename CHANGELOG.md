@@ -3,7 +3,7 @@
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.4.html).
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
@@ -39,6 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.4
 - Integration test suite validating end-to-end checkpointing, pagination, history retrieval, and multi-threaded execution.
 
 ### Changed
+- README documents the `:INVOKED` relationship in the feature list, the `RELATE_DB_PATH`, `RELATE_WAL_ENABLED`, `RELATE_PROXY_TIMEOUT_SEC` and `RELATE_LOG_LEVEL` variables with their defaults, and the `--auto-approve` flag of `examples/research_agent.py`. The Semantic Versioning link points to spec 2.0.0.
+- The example environment file lists the `RELATE_*` variables and no longer lists `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`, which no code reads.
 - Project URLs point to the public repository, and the `relate-db` requirement is now `>=1.1.0` after the full suite and the benchmark passed on 1.1.0 (ADR-0020).
 - README: a plain tagline, a "Why not X?" comparison with Neo4jSaver, SqliteSaver, built-in time travel and tracing tools, install from source, four explore commands with real output, and the benchmark rerun on relate-db 1.1.0.
 - `examples/data/demo.rl` holds a fourth thread, `demo-real-api`, recorded against pypi.org, with one failed lookup to trace; the builder leaves the existing store in place when pypi.org cannot be reached (ADR-0019).
@@ -47,8 +49,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.4
 - Replay message previews longer than 120 characters end with `...`; the marker is display-only and never affects the diff.
 - Variable-length ancestry queries start from the target checkpoint instead of scanning the whole chain.
 - Tool-call capture sends only new statements per saver (ADR-0011) and commits without its own flush; the store is flushed on close (ADR-0014).
+- `RelateForensics` and `DAGVisualizer` open a store file read-only unless `read_only=False` is passed; with no arguments they now raise `RelateConnectionError` when `checkpoints.rl` is missing instead of creating it (AC-187, ADR-0029).
+- `detect_loops` requires a threshold of at least 2 and raises `ValueError` below it; `relate-dag forensics loops --threshold` rejects a lower value as a usage error (AC-188).
+- `relate-dag tree` renders a thread's checkpoints as a flat list of siblings, with forks nested under the checkpoint they branch from, so long runs no longer indent off screen (AC-185).
+- `relate-dag forensics --help` lists the reserved subcommand names and states that thread IDs starting with `-` are not accepted as positional thread IDs.
+- The combined `relate-dag forensics <thread>` panel shows the bad-argument origin line, as `trace-error` does.
 
 ### Fixed
+- `RelateSaver` treats a `None` constructor argument as unset, parses each `RELATE_*` variable only when its argument is not given (a malformed variable for a setting passed explicitly no longer raises), and sets the `langgraph_checkpoint_relate` logger level only when `log_level` or `RELATE_LOG_LEVEL` is given, so the application's own logging configuration is kept (AC-194, ADR-0033).
+- A proxy command whose caller times out raises `RelateConcurrencyError` saying whether it was skipped (never executed, safe to retry) or had already started and may have committed, instead of always reporting it as skipped (AC-195, ADR-0033).
+- README and `docs/ARCHITECTURE.md` describe the forensics failure walk as it runs: one read of a thread's `[:NEXT]`/`[:FORKED_TO]` edges, a breadth-first walk in Python, then one `UNWIND $lineage` causal query, and name `fork_in_memory(branch_thread_id=...)` as the only source of `(:Checkpoint)-[:FORKED_TO]->(:Thread)` (ADR-0030).
+- `.env.example` lists the four `RELATE_*` variables as commented-out lines, so copying it to `.env` no longer sets empty values that `RelateSaver` rejects with `ValueError`.
+- `relate-dag forensics loops` and `forensics diagnose` reject `--threshold` below 2 as a usage error (exit code 2, naming the option and the minimum) before the store is opened, instead of reporting "Unexpected error" (AC-188).
+- `trace_root_cause()`, `failure_summary()` and `trace-error` report the same failure checkpoint on every run: the walk from the `[:INVOKED]` checkpoint follows `[:NEXT]` edges only, in `(distance, checkpoint_id)` order, so an unrelated retry on a `[:FORKED_TO]` branch can no longer be reported (AC-189, ADR-0030). When the `[:INVOKED]` checkpoint's own writes hold the requesting AIMessage, its `[:FORKED_TO]` children are also first-hop candidates, so a run resumed from history reports the same failure checkpoint whichever save placed the edge (AC-192, ADR-0032); otherwise a result stored only on a branch falls back to the `[:INVOKED]` checkpoint. The failure-checkpoint, causal and argument-origin lookups also match `thread_id`. Each public call reads a thread's edges once instead of up to three times.
+- `put_writes()` and a later `put()` link a write to a checkpoint only when its `thread_id`, `checkpoint_ns` and `checkpoint_id` all match, the tool-call `[:INVOKED]` edge attaches only to a checkpoint of the saving thread and namespace, and `get_tuple()` returns as pending writes only linked writes of the checkpoint's own thread and namespace. A write whose config names another thread's checkpoint is stored unlinked instead of leaking into that thread's resume state (ADR-0031, AC-190, AC-191).
+- `get_tuple()` defaults omitted `checkpoint_ns` to `""` matching SqliteSaver behavior, while `list()` remains unfiltered when no namespace is specified (AC-173).
+- `put()` resolves parent checkpoint IDs strictly from `config["configurable"]["checkpoint_id"]`, ignoring any misleading mappings in `metadata["parents"]` (AC-174).
+- Latest checkpoint resolution, `list()` pagination, and `before` boundaries sort reverse-chronologically by `checkpoint_id DESC` (UUIDv6) rather than step order, matching LangGraph runtime and fork semantics (AC-175, ADR-0026, amending AC-06).
+- `get_tuple()` and `list()` re-raise `RelateConnectionError` and `RelateConcurrencyError` rather than converting database or network failures to empty collections or `None` (AC-176).
+- Passing a custom `SerializerProtocol` to `RelateSaver` automatically wraps it in `RelateStateSerializer(inner_serializer=serde)` (AC-177).
+- Configuration parameters follow strict three-tier precedence: explicit constructor argument -> `RELATE_*` environment variables (`RELATE_DB_PATH`, `RELATE_WAL_ENABLED`, `RELATE_PROXY_TIMEOUT_SEC`, `RELATE_LOG_LEVEL`) -> default values (`:memory:`, `True`, `30.0`, `INFO`), raising `ValueError` on malformed inputs (AC-178, ADR-0028).
+- Calling proxy commands cancels the future on caller timeout and the actor worker skips cancelled commands without executing or committing them to the database (AC-179).
+- `put_writes()` implements first-write-wins (`ON CREATE SET`) for standard channels while preserving overwrite semantics for `WRITES_IDX_MAP` special channels, and orders writes deterministically by `w.task_id, w.idx` (AC-180).
+- `time_travel.py` propagates database read errors directly rather than converting them to `CheckpointNotFoundError` or empty writes, and closes the in-memory saver actor if batch population fails.
+- Actor proxy handles worker initialization timeouts by signalling shutdown and closing database handles, protecting lifecycle state transitions with a unified lock.
+- Concurrency and connection error classification in `proxy.py` uses word-boundary regular expressions, eliminating false-positive matches on substrings like "unlocked" or "block".
 - The replay diff compares non-message channel scalars by type and value (`0 != False`, `1 != 1.0`), preventing false matches across types, and normalizes `float('nan')` so identical NaN values produce an empty diff (AC-168, AC-169, ADR-0025).
 - `GraphFactory` is exported as a runtime type union (`Callable[..., Any] | StateGraph`) without subscripting `StateGraph` at runtime, enabling `GraphFactory | None` and `typing.get_type_hints()` without runtime errors while preserving strict type checker verification (AC-170, ADR-0025).
 - `update_state` exceptions are tagged with an internal attribute (`_relate_update_state_error`) instead of an exception note, eliminating framework clutter from user tracebacks while preserving accurate `--as-node` hint scoping (AC-172, ADR-0025).
@@ -85,3 +110,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.4
 - Aligned research demo pipeline default database path to `checkpoints.rl` for zero-configuration CLI visualization.
 - Propagated startup file-lock concurrency errors and added automatic transaction rollback on failure in `RelateThreadProxy`.
 - Added flag syntax `--checkpoint / -c` support in `relate-dag replay` CLI and guarded metadata dictionary access.
+- Forensics lineage walks stay inside one thread while following forks within it (AC-181), and loop detection runs per namespace and per fork branch, so subgraphs and sibling branches are never merged (AC-182).
+- Loop detection no longer reports a single pass through the graph as a loop, resolves node names from task paths, and orders candidates deterministically (AC-25, AC-182).
+- Root-cause tracing matches poison checks on channel names only instead of value text (AC-183), prefers a tool call on the `__error__` path only at distance <= 1, and orders ties deterministically (AC-184).
+- Argument provenance narrows the origin to named nodes before falling back to `versions_seen` (ADR-0025, AC-172).
+- Replay stops the recorded leaf before the next invoke's input checkpoint (AC-186).
+- Database errors raised by tree queries reach the CLI error handler instead of being swallowed.
+- `trace_root_cause` no longer toggles the process-wide garbage collector, and long threads trace in linear time: about 1.1 s at 4,000 checkpoints, down from 6.6 s (AC-27).
+- Wide CLI tables print through a local Rich `Console` instead of mutating the shared console's private width (AC-167).

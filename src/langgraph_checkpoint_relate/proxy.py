@@ -6,6 +6,7 @@ import concurrent.futures
 import logging
 import os
 import queue
+import re
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -67,26 +68,31 @@ def _format_records(records: Any) -> list[dict[str, Any]]:
     return [_format_record(r) for r in records]
 
 
+_CONCURRENCY_RE = re.compile(
+    r"\b(lock(ed)?|busy|contention|deadlock|collision|timeout|timed out)\b",
+    re.IGNORECASE,
+)
+_CONNECTION_RE = re.compile(r"\b(closed|connection)\b", re.IGNORECASE)
+
+
 def _wrap_exception(exc: Exception) -> RelateCheckpointError:
     """Map database, driver, or runtime exceptions to appropriate RelateCheckpointError."""
     if isinstance(exc, RelateCheckpointError):
         return exc
 
     msg = str(exc)
-    lower_msg = msg.lower()
 
     err: RelateCheckpointError
-    if isinstance(exc, (TimeoutError, concurrent.futures.TimeoutError)) or any(
-        k in lower_msg for k in ("lock", "busy", "contention", "deadlock", "collision", "timeout")
+    if isinstance(exc, (TimeoutError, concurrent.futures.TimeoutError)) or _CONCURRENCY_RE.search(
+        msg
     ):
         err = RelateConcurrencyError(f"Concurrency or lock failure: {msg}")
         err.__cause__ = exc
         return err
 
-    if (
-        "closed" in lower_msg
-        or "connection" in lower_msg
-        or exc.__class__.__name__ in ("InterfaceError", "RelateConnectionError")
+    if _CONNECTION_RE.search(msg) or exc.__class__.__name__ in (
+        "InterfaceError",
+        "RelateConnectionError",
     ):
         err = RelateConnectionError(f"Database connection error: {msg}")
         err.__cause__ = exc
@@ -123,6 +129,7 @@ class RelateThreadProxy:
 
         self._queue: queue.Queue[Any] = queue.Queue()
         self._writer_lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
         self._is_closed = False
         self._conn: Any = None
         self._worker_thread: threading.Thread | None = None
@@ -136,6 +143,11 @@ class RelateThreadProxy:
         """Exclusive writer lock protecting mutating database operations."""
         return self._writer_lock
 
+    @property
+    def lifecycle_lock(self) -> threading.Lock:
+        """Lifecycle lock protecting state transitions, active checks, and enqueuing."""
+        return self._lifecycle_lock
+
     def _start_worker(self) -> None:
         """Spawn the dedicated background worker thread and wait for initialization."""
         self._worker_thread = threading.Thread(
@@ -148,6 +160,9 @@ class RelateThreadProxy:
         ready = self._ready_event.wait(timeout=self.default_timeout)
         if not ready:
             self._is_closed = True
+            self._queue.put(_ShutdownSentinel())
+            if self._worker_thread is not None and self._worker_thread.is_alive():
+                self._worker_thread.join(timeout=2.0)
             raise RelateConnectionError(
                 f"RelateThreadProxy worker failed to initialize within {self.default_timeout} seconds"
             )
@@ -177,12 +192,16 @@ class RelateThreadProxy:
         """Worker thread loop executing commands strictly on this thread."""
         try:
             self._conn = self._open_connection()
+            if self._is_closed:
+                self._cleanup_connection()
+                return
             if self.auto_init_schema and not self.read_only:
                 initialize_schema(self._conn)
             self._ready_event.set()
         except Exception as exc:
             self._startup_error = exc
             self._ready_event.set()
+            self._cleanup_connection()
             return
 
         while True:
@@ -209,12 +228,12 @@ class RelateThreadProxy:
             return
         if isinstance(item, DbCommand):
             if item.is_write and self.read_only:
-                item.future.set_exception(self._read_only_error())
+                self._fail_future(item.future, self._read_only_error())
                 return
             self._handle_db_command(item)
         elif isinstance(item, BatchCommand):
             if self.read_only:
-                item.future.set_exception(self._read_only_error())
+                self._fail_future(item.future, self._read_only_error())
                 return
             self._handle_batch_command(item)
         elif isinstance(item, tuple) and len(item) == 4:
@@ -232,6 +251,26 @@ class RelateThreadProxy:
         return RelateReadOnlyError("RelateThreadProxy is read-only; writes are not allowed")
 
     @staticmethod
+    def _fail_future(future: concurrent.futures.Future[Any], err: Exception) -> None:
+        """Fail a queued command's future unless its caller already cancelled it (AC-195)."""
+        if future.set_running_or_notify_cancel():
+            future.set_exception(err)
+
+    @staticmethod
+    def _timeout_error(
+        fut: concurrent.futures.Future[Any], queued_message: str, running_message: str
+    ) -> RelateConcurrencyError:
+        """Build the error for an expired caller timeout (AC-195, ADR-0033).
+
+        ``cancel()`` succeeds only while the worker has not started the command, and then
+        the worker skips it. Once the worker has started it, ``cancel()`` fails, the
+        command runs to completion, and the caller is told it may have committed.
+        """
+        if fut.cancel():
+            return RelateConcurrencyError(f"{queued_message}; not executed")
+        return RelateConcurrencyError(f"{running_message}; it may have committed")
+
+    @staticmethod
     def _fail_tuple_command(item: tuple[Any, Any, Any, Any], err: RelateCheckpointError) -> None:
         """Fail a (query, params, event, result_holder) item without touching the driver."""
         _, _, event, holder = item
@@ -245,6 +284,8 @@ class RelateThreadProxy:
 
     def _handle_db_command(self, cmd: DbCommand) -> None:
         """Execute a single Cypher command."""
+        if not cmd.future.set_running_or_notify_cancel():
+            return
         try:
             if cmd.is_write:
                 with self._writer_lock:
@@ -268,18 +309,22 @@ class RelateThreadProxy:
                 )
                 records = cur.fetchall() if hasattr(cur, "fetchall") else []
 
-            formatted = _format_records(records)
-            cmd.future.set_result(formatted)
+            if not cmd.future.cancelled():
+                formatted = _format_records(records)
+                cmd.future.set_result(formatted)
         except Exception as exc:
             if hasattr(self._conn, "rollback"):
                 try:
                     self._conn.rollback()
                 except Exception:
                     pass
-            cmd.future.set_exception(_wrap_exception(exc))
+            if not cmd.future.cancelled():
+                cmd.future.set_exception(_wrap_exception(exc))
 
     def _handle_batch_command(self, cmd: BatchCommand) -> None:
         """Execute a batch of Cypher commands atomically."""
+        if not cmd.future.set_running_or_notify_cancel():
+            return
         try:
             with self._writer_lock:
                 prev_autocommit = getattr(self._conn, "autocommit", True)
@@ -312,9 +357,11 @@ class RelateThreadProxy:
                     if hasattr(self._conn, "autocommit"):
                         self._conn.autocommit = prev_autocommit
 
-            cmd.future.set_result(results)
+            if not cmd.future.cancelled():
+                cmd.future.set_result(results)
         except Exception as exc:
-            cmd.future.set_exception(_wrap_exception(exc))
+            if not cmd.future.cancelled():
+                cmd.future.set_exception(_wrap_exception(exc))
 
     def _handle_tuple_command(self, item: tuple[Any, Any, Any, Any]) -> None:
         """Handle legacy/internal (query, params, event, result_holder) protocol."""
@@ -363,7 +410,7 @@ class RelateThreadProxy:
                 future=future or concurrent.futures.Future(),
             )
             if db_cmd.is_write and self.read_only:
-                db_cmd.future.set_exception(self._read_only_error())
+                self._fail_future(db_cmd.future, self._read_only_error())
                 return
             self._handle_db_command(db_cmd)
             return
@@ -371,7 +418,7 @@ class RelateThreadProxy:
         if msg_type == "transaction":
             if self.read_only:
                 if future is not None:
-                    future.set_exception(self._read_only_error())
+                    self._fail_future(future, self._read_only_error())
                 return
             batch_cmd = BatchCommand(
                 statements=msg["statements"],
@@ -442,10 +489,11 @@ class RelateThreadProxy:
 
     def ping(self, timeout: float | None = 5.0) -> bool:
         """Ping the worker thread through the actor queue to verify responsiveness."""
-        if not self.is_alive():
-            return False
         fut: concurrent.futures.Future[bool] = concurrent.futures.Future()
-        self._queue.put({"type": "is_alive", "future": fut})
+        with self._lifecycle_lock:
+            if not self.is_alive():
+                return False
+            self._queue.put({"type": "is_alive", "future": fut})
         try:
             return fut.result(timeout=timeout or self.default_timeout)
         except Exception:
@@ -488,8 +536,6 @@ class RelateThreadProxy:
         timeout: float | None,
     ) -> list[dict[str, Any]]:
         """Validate input, build command, and await completion."""
-        self._check_active()
-
         if not isinstance(cypher, str) or not cypher.strip():
             raise RelateCheckpointError("Cypher statement must be a non-empty string")
 
@@ -499,15 +545,22 @@ class RelateThreadProxy:
         bound_params = dict(params) if params is not None else {}
         fut: concurrent.futures.Future[list[dict[str, Any]]] = concurrent.futures.Future()
         cmd = DbCommand(cypher=cypher, params=bound_params, is_write=is_write, future=fut)
-        self._queue.put(cmd)
+
+        with self._lifecycle_lock:
+            self._check_active()
+            self._queue.put(cmd)
 
         effective_timeout = timeout if timeout is not None else self.default_timeout
         try:
             return fut.result(timeout=effective_timeout)
         except (TimeoutError, concurrent.futures.TimeoutError) as to_exc:
-            raise RelateConcurrencyError(
-                f"Query timed out after {effective_timeout}s: {cypher[:60]}"
+            raise self._timeout_error(
+                fut,
+                f"Query timed out after {effective_timeout}s: {cypher[:60]}",
+                f"Query timed out after {effective_timeout}s while running",
             ) from to_exc
+
+    _execute_internal = _dispatch_execute
 
     def execute_batch(
         self,
@@ -523,13 +576,9 @@ class RelateThreadProxy:
         or by ``close()``.
         """
         self._check_writable()
-        self._check_active()
 
         if isinstance(statements, (str, bytes)) or not isinstance(statements, Sequence):
             raise RelateCheckpointError("Statements must be a sequence of (query, params) tuples")
-
-        if not statements:
-            return []
 
         validated_statements: list[tuple[str, dict[str, Any]]] = []
         for idx, item in enumerate(statements):
@@ -550,14 +599,23 @@ class RelateThreadProxy:
 
         fut: concurrent.futures.Future[list[list[dict[str, Any]]]] = concurrent.futures.Future()
         cmd = BatchCommand(statements=validated_statements, future=fut, flush=flush)
-        self._queue.put(cmd)
+
+        with self._lifecycle_lock:
+            self._check_active()
+            if not statements:
+                return []
+            self._queue.put(cmd)
 
         effective_timeout = timeout if timeout is not None else self.default_timeout
         try:
             return fut.result(timeout=effective_timeout)
         except (TimeoutError, concurrent.futures.TimeoutError) as to_exc:
-            raise RelateConcurrencyError(
-                f"Batch transaction timed out after {effective_timeout}s ({len(statements)} statements)"
+            raise self._timeout_error(
+                fut,
+                f"Batch transaction timed out after {effective_timeout}s "
+                f"({len(statements)} statements)",
+                f"Batch transaction timed out after {effective_timeout}s while running "
+                f"({len(statements)} statements)",
             ) from to_exc
 
     def transaction(
@@ -582,32 +640,43 @@ class RelateThreadProxy:
 
     def flush(self, timeout: float | None = None) -> None:
         """Explicitly flush pending changes to disk WAL (a no-op when read-only)."""
-        self._check_active()
-        if self.read_only:
-            return
         fut: concurrent.futures.Future[None] = concurrent.futures.Future()
 
         def do_flush() -> None:
+            if not fut.set_running_or_notify_cancel():
+                return
             try:
                 with self._writer_lock:
                     if self._conn is not None and hasattr(self._conn, "flush"):
                         self._conn.flush()
-                fut.set_result(None)
+                if not fut.cancelled():
+                    fut.set_result(None)
             except Exception as exc:
-                fut.set_exception(_wrap_exception(exc))
+                if not fut.cancelled():
+                    fut.set_exception(_wrap_exception(exc))
 
-        self._queue.put(do_flush)
+        with self._lifecycle_lock:
+            self._check_active()
+            if self.read_only:
+                return
+            self._queue.put(do_flush)
+
         effective_timeout = timeout if timeout is not None else self.default_timeout
         try:
             fut.result(timeout=effective_timeout)
         except (TimeoutError, concurrent.futures.TimeoutError) as to_exc:
-            raise RelateConcurrencyError(f"Flush timed out after {effective_timeout}s") from to_exc
+            raise self._timeout_error(
+                fut,
+                f"Flush timed out after {effective_timeout}s",
+                f"Flush timed out after {effective_timeout}s while running",
+            ) from to_exc
 
     def abort(self, timeout: float | None = 2.0) -> None:
         """Abruptly terminate the proxy and connection without graceful flush."""
-        if self._is_closed:
-            return
-        self._is_closed = True
+        with self._lifecycle_lock:
+            if self._is_closed:
+                return
+            self._is_closed = True
 
         def do_abort() -> None:
             if self._conn is not None:
@@ -633,12 +702,13 @@ class RelateThreadProxy:
 
     def close(self, timeout: float | None = 5.0) -> None:
         """Cleanly shut down worker actor thread and close Relate connection."""
-        if self._is_closed:
-            return
-        self._is_closed = True
+        with self._lifecycle_lock:
+            if self._is_closed:
+                return
+            self._is_closed = True
+            self._queue.put(_ShutdownSentinel())
 
         if self._worker_thread is not None and self._worker_thread.is_alive():
-            self._queue.put(_ShutdownSentinel())
             effective_timeout = timeout if timeout is not None else 5.0
             self._worker_thread.join(timeout=effective_timeout)
 

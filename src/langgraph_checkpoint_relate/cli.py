@@ -124,15 +124,13 @@ def _parse_set_messages(raw_items: list[str]) -> dict[int, str]:
 
 def _print_wide(table: Table) -> None:
     """Print a table at its natural width so cell text such as ``error -> ok`` never wraps."""
-    # Write the private _width: the public width setter takes an int and cannot restore an unset (None) width.
-    original_width = console._width
     natural_width = console.measure(table, options=console.options.update_width(10_000)).maximum
-    available_width = console.width
-    console._width = max(natural_width, available_width)
-    try:
-        console.print(table)
-    finally:
-        console._width = original_width
+    wide_console = Console(
+        file=console.file,
+        width=max(natural_width, console.width),
+        force_terminal=console.is_terminal,
+    )
+    wide_console.print(table)
 
 
 def _argument_changes(change: ToolCallChange) -> str:
@@ -484,10 +482,17 @@ class ForensicsGroup(TyperGroup):
         return super().parse_args(ctx, args)
 
 
+# The help text names the subcommands ForensicsGroup treats as reserved (RC-04).
 forensics_app = typer.Typer(
     cls=ForensicsGroup,
     name="forensics",
-    help="Detect cycles, infinite loops, and trace root causes of failures.",
+    help=(
+        "Detect cycles, infinite loops, and trace root causes of failures. "
+        "A bare thread ID runs a full diagnosis. "
+        "Reserved subcommand names (loops, trace-error, trace, failures, diagnose) "
+        "cannot be used as a positional thread ID. "
+        "Thread IDs beginning with '-' are not accepted as positional thread IDs."
+    ),
     no_args_is_help=True,
 )
 app.add_typer(forensics_app)
@@ -506,7 +511,8 @@ def forensics_loops(
         2,
         "--threshold",
         "-t",
-        help="Minimum consecutive cycle occurrence threshold.",
+        min=2,
+        help="Minimum consecutive cycle occurrence threshold (at least 2).",
     ),
     db: str = typer.Option(
         "checkpoints.rl",
@@ -695,7 +701,8 @@ def forensics_diagnose(
         2,
         "--threshold",
         "-t",
-        help="Minimum consecutive cycle occurrence threshold.",
+        min=2,
+        help="Minimum consecutive cycle occurrence threshold (at least 2).",
     ),
     db: str = typer.Option(
         "checkpoints.rl",
@@ -759,6 +766,7 @@ def forensics_diagnose(
                     f"[bold red]Error Message:[/bold red]       {escape(root_cause.error_message)}\n"
                     f"[bold yellow]Root Tool Call ID:[/bold yellow]   {escape(root_cause.root_tool_call_id or 'None')}\n"
                     f"[bold yellow]Root Tool Name:[/bold yellow]      {escape(root_cause.root_tool_name or 'None')}\n"
+                    f"{_origin_line(root_cause)}"
                     f"[bold yellow]Root Channel Write:[/bold yellow]  {escape(root_cause.root_channel_write or 'None')}\n"
                     f"[bold green]Causal Path Length:[/bold green]  {root_cause.causal_path_length} {_PATH_LENGTH_NOTE}\n"
                     f"[bold white]Diagnostic Summary:[/bold white]  {escape(root_cause.diagnostic_summary)}"

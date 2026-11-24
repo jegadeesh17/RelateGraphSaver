@@ -950,34 +950,48 @@ class TestRelateSaverNamespaces:
             assert list_empty == []
 
     def test_parent_resolution_across_namespaces_ac_17_ac_18(self) -> None:
-        """AC-17, AC-18: Resolves parent_checkpoint_id from metadata['parents'] per namespace and creates [:NEXT] in that namespace."""
+        """AC-17, AC-18: Resolves parent_checkpoint_id from configurable['checkpoint_id'] and creates [:NEXT] in that namespace."""
         with RelateSaver(db_path=":memory:") as saver:
             thread_id = "thread-ns-parents"
 
             # Step 1: Root namespace checkpoint 1
-            cfg_root: RunnableConfig = {
+            cfg_root1: RunnableConfig = {
                 "configurable": {"thread_id": thread_id, "checkpoint_ns": ""}
             }
             meta_root1: CheckpointMetadata = {"step": 1, "parents": {}}
-            saver.put(cfg_root, _make_checkpoint("cp-root-1", {"val": "root1"}), meta_root1, {})
+            saver.put(cfg_root1, _make_checkpoint("cp-root-1", {"val": "root1"}), meta_root1, {})
 
-            # Step 2: Root namespace checkpoint 2 (parent is root-1)
+            # Step 2: Root namespace checkpoint 2 (parent is root-1 via configurable['checkpoint_id'])
+            cfg_root2: RunnableConfig = {
+                "configurable": {
+                    "thread_id": thread_id,
+                    "checkpoint_ns": "",
+                    "checkpoint_id": "cp-root-1",
+                }
+            }
             meta_root2: CheckpointMetadata = {"step": 2, "parents": {"": "cp-root-1"}}
-            saver.put(cfg_root, _make_checkpoint("cp-root-2", {"val": "root2"}), meta_root2, {})
+            saver.put(cfg_root2, _make_checkpoint("cp-root-2", {"val": "root2"}), meta_root2, {})
 
-            # Step 3: Subgraph A checkpoint 1 (invoked from root-2, but subgraph itself has no prior parent)
-            cfg_sub: RunnableConfig = {
+            # Step 3: Subgraph A checkpoint 1 (invoked from root-2, but subgraph itself has no prior parent in its namespace)
+            cfg_sub1: RunnableConfig = {
                 "configurable": {"thread_id": thread_id, "checkpoint_ns": "subgraph_a"}
             }
             meta_sub1: CheckpointMetadata = {"step": 1, "parents": {"": "cp-root-2"}}
-            saver.put(cfg_sub, _make_checkpoint("cp-suba-1", {"val": "sub1"}), meta_sub1, {})
+            saver.put(cfg_sub1, _make_checkpoint("cp-suba-1", {"val": "sub1"}), meta_sub1, {})
 
-            # Step 4: Subgraph A checkpoint 2 (has root parent and subgraph_a parent)
+            # Step 4: Subgraph A checkpoint 2 (parent is suba-1 via configurable['checkpoint_id'])
+            cfg_sub2: RunnableConfig = {
+                "configurable": {
+                    "thread_id": thread_id,
+                    "checkpoint_ns": "subgraph_a",
+                    "checkpoint_id": "cp-suba-1",
+                }
+            }
             meta_sub2: CheckpointMetadata = {
                 "step": 2,
                 "parents": {"": "cp-root-2", "subgraph_a": "cp-suba-1"},
             }
-            saver.put(cfg_sub, _make_checkpoint("cp-suba-2", {"val": "sub2"}), meta_sub2, {})
+            saver.put(cfg_sub2, _make_checkpoint("cp-suba-2", {"val": "sub2"}), meta_sub2, {})
 
             # Verify causal NEXT edges in Relate graph
             edges = saver.proxy.execute_read(
@@ -998,6 +1012,95 @@ class TestRelateSaverNamespaces:
             # Verify no NEXT edge connects cross-namespace
             assert ("cp-root-2", "cp-suba-2") not in edge_pairs
             assert ("cp-root-2", "cp-suba-1") not in edge_pairs
+
+    def test_ac_174_put_ignores_metadata_parents_and_uses_config_checkpoint_id(self) -> None:
+        """AC-174: Parent checkpoint ID is resolved strictly from config['configurable']['checkpoint_id'] and any metadata['parents'] field is ignored."""
+        with RelateSaver(db_path=":memory:") as saver:
+            thread_id = "thread-ac-174"
+
+            # 1. Base checkpoint cp-init
+            cfg_init: RunnableConfig = {
+                "configurable": {"thread_id": thread_id, "checkpoint_ns": ""}
+            }
+            saver.put(cfg_init, _make_checkpoint("cp-init", {"v": 1}), {"step": 1}, {})
+
+            # 2. Config specifies parent as "cp-init", but metadata["parents"] specifies "cp-bogus"
+            cfg_step2: RunnableConfig = {
+                "configurable": {
+                    "thread_id": thread_id,
+                    "checkpoint_ns": "",
+                    "checkpoint_id": "cp-init",
+                }
+            }
+            meta_step2: CheckpointMetadata = {
+                "step": 2,
+                "parents": {"": "cp-bogus", "other_ns": "cp-other"},
+            }
+            saver.put(cfg_step2, _make_checkpoint("cp-step2", {"v": 2}), meta_step2, {})
+
+            # Verify that cp-step2 has cp-init as parent, not cp-bogus
+            tuple_step2 = saver.get_tuple(
+                {"configurable": {"thread_id": thread_id, "checkpoint_id": "cp-step2"}}
+            )
+            assert tuple_step2 is not None
+            assert tuple_step2.parent_config is not None
+            assert tuple_step2.parent_config["configurable"]["checkpoint_id"] == "cp-init"
+
+            # Verify NEXT relationship links cp-init -> cp-step2 in graph
+            edges = saver.proxy.execute_read(
+                "MATCH (p:Checkpoint)-[:NEXT]->(c:Checkpoint) "
+                "WHERE p.thread_id = $tid AND c.checkpoint_id = 'cp-step2' "
+                "RETURN p.checkpoint_id AS parent",
+                {"tid": thread_id},
+            )
+            assert len(edges) == 1
+            assert edges[0]["parent"] == "cp-init"
+
+            # 3. Config specifies NO parent (or checkpoint_id equals own id), but metadata["parents"] has entries
+            cfg_step3: RunnableConfig = {
+                "configurable": {"thread_id": thread_id, "checkpoint_ns": ""}
+            }
+            meta_step3: Any = {
+                "step": 3,
+                "parents": {"": "cp-step2", "invalid": 12345},
+            }
+            saver.put(cfg_step3, _make_checkpoint("cp-step3", {"v": 3}), meta_step3, {})
+
+            # Verify cp-step3 has NO parent despite metadata["parents"]
+            tuple_step3 = saver.get_tuple(
+                {"configurable": {"thread_id": thread_id, "checkpoint_id": "cp-step3"}}
+            )
+            assert tuple_step3 is not None
+            assert tuple_step3.parent_config is None
+
+            # Verify no NEXT relationship incoming to cp-step3
+            incoming_edges = saver.proxy.execute_read(
+                "MATCH (p:Checkpoint)-[:NEXT]->(c:Checkpoint {checkpoint_id: 'cp-step3'}) "
+                "WHERE c.thread_id = $tid "
+                "RETURN p.checkpoint_id AS parent",
+                {"tid": thread_id},
+            )
+            assert len(incoming_edges) == 0
+
+            # 4. metadata["parents"] with non-dict or arbitrary values is completely ignored without error
+            cfg_step4: RunnableConfig = {
+                "configurable": {
+                    "thread_id": thread_id,
+                    "checkpoint_ns": "",
+                    "checkpoint_id": "cp-step2",
+                }
+            }
+            meta_step4: Any = {
+                "step": 4,
+                "parents": "malformed_string_not_even_a_dict",
+            }
+            saver.put(cfg_step4, _make_checkpoint("cp-step4", {"v": 4}), meta_step4, {})
+            tuple_step4 = saver.get_tuple(
+                {"configurable": {"thread_id": thread_id, "checkpoint_id": "cp-step4"}}
+            )
+            assert tuple_step4 is not None
+            assert tuple_step4.parent_config is not None
+            assert tuple_step4.parent_config["configurable"]["checkpoint_id"] == "cp-step2"
 
     def test_invalid_namespace_handling(self) -> None:
         """AC-17: Invalid or missing namespace parameters are handled robustly without crashing."""

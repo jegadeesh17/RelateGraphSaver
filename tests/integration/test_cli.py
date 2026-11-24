@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Annotated, Any, TypedDict, cast
 
 import pytest
+import relate
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
@@ -318,6 +319,18 @@ class TestCliRootAndHelp:
         assert "loops" in output
         assert "trace-error" in output
 
+    def test_cli_forensics_help_documents_reserved_names(self, runner: CliRunner) -> None:
+        """RC-04: group help lists the reserved subcommand names and the leading '-' rule."""
+        result = runner.invoke(app, ["forensics", "--help"], env={"COLUMNS": "300"})
+        assert result.exit_code == 0
+        text = " ".join(result.output.split())
+        assert "Reserved subcommand names" in text
+        reserved = text.split("Reserved subcommand names", 1)[1]
+        for name in ("loops", "trace-error", "trace", "failures", "diagnose"):
+            assert name in reserved
+        assert "cannot be used as a positional thread ID" in text
+        assert "Thread IDs beginning with '-' are not accepted as positional thread IDs" in text
+
     def test_cli_forensics_loops_subcommand_help(self, runner: CliRunner) -> None:
         """Verify relate-dag forensics loops --help displays options and exits with code 0."""
         result = runner.invoke(app, ["forensics", "loops", "--help"])
@@ -504,11 +517,19 @@ class TestCliForensicsCommand:
         db_file, thread_id = seeded_loop_db
         result = runner.invoke(app, ["forensics", "loops", thread_id, "--db", db_file])
         assert result.exit_code == 0
-        assert "Detected Loops" in result.output
-        assert "ping_agent" in result.output
-        assert "pong_agent" in result.output
-        assert "Cycle Nodes" in result.output
-        assert "Occurrences" in result.output
+        lines = result.output.splitlines()
+        assert sum("Detected Loops" in line for line in lines) == 1
+        assert re.search(
+            r"│ Cycle Nodes\s+│ Occurrences │ First Checkpoint │ Last Checkpoint │", result.output
+        )
+        # Four alternating checkpoints hold exactly one ping/pong cycle seen twice, so the table
+        # has exactly one data row carrying the node sequence, count and checkpoint interval.
+        data_rows = [line for line in lines if "ping_agent" in line or "pong_agent" in line]
+        assert len(data_rows) == 1
+        assert re.fullmatch(
+            r"│ ping_agent -> pong_agent │\s+2 │ chk-loop-step-0\s+│ chk-loop-step-3\s+│",
+            data_rows[0],
+        )
 
     def test_forensics_loops_with_linear_thread(
         self, runner: CliRunner, seeded_db: tuple[str, str, list[str]]
@@ -768,16 +789,27 @@ def _run_cli_cp1252(args: list[str], cwd: Path | None = None) -> subprocess.Comp
     return subprocess.run(command, capture_output=True, env=env, timeout=120, check=False, cwd=cwd)
 
 
+def _assert_cp1252_cases(cases: list[tuple[list[str], str]]) -> None:
+    """Run each command on a cp1252 pipe: exit 0, no UnicodeEncodeError, expected text shown."""
+    for args, expected in cases:
+        proc = _run_cli_cp1252(args)
+        stdout = proc.stdout.decode("cp1252")
+        stderr = proc.stderr.decode("cp1252")
+        assert proc.returncode == 0, f"{args}: {stderr}"
+        assert "UnicodeEncodeError" not in stderr, args
+        assert expected in stdout, f"{args}: {stdout}"
+
+
 class TestCliCp1252Output:
     """Every relate-dag command prints only text a cp1252 stdout can encode (AC-59..AC-61)."""
 
-    def test_all_commands_exit_zero_on_cp1252_stdout_ac_59_ac_60(
+    def test_each_command_exits_zero_on_cp1252_stdout_ac_59_ac_60(
         self,
         seeded_db: tuple[str, str, list[str]],
         seeded_loop_db: tuple[str, str],
         seeded_tool_error_db: tuple[str, str],
     ) -> None:
-        """AC-59, AC-60: each command exits 0 with its expected text on a cp1252 pipe."""
+        """AC-59, AC-60: one case per command exits 0 with its expected text on a cp1252 pipe."""
         clean_db, clean_thread, clean_ids = seeded_db
         loop_db, loop_thread = seeded_loop_db
         tool_db, tool_thread = seeded_tool_error_db
@@ -785,22 +817,30 @@ class TestCliCp1252Output:
         cases: list[tuple[list[str], str]] = [
             (["--help"], "RelateGraphSaver CLI"),
             (["tree", clean_thread, "--db", clean_db], clean_thread),
-            (["tree", clean_thread, "--db", clean_db], clean_ids[0]),
             (["replay", clean_thread, clean_ids[1], "--db", clean_db], clean_ids[1]),
-            (["forensics", clean_thread, "--db", clean_db], "Total Checkpoints: 3"),
             (["forensics", tool_thread, "--db", tool_db], "fetch_source"),
             (["forensics", "loops", loop_thread, "--db", loop_db], "Detected Loops"),
-            (["forensics", "loops", clean_thread, "--db", clean_db], "No loops"),
             (["forensics", "trace-error", tool_thread, "--db", tool_db], "fetch_source"),
+        ]
+        _assert_cp1252_cases(cases)
+
+    @pytest.mark.slow
+    def test_remaining_command_variants_exit_zero_on_cp1252_stdout_ac_59_ac_60(
+        self,
+        seeded_db: tuple[str, str, list[str]],
+        seeded_loop_db: tuple[str, str],
+        seeded_tool_error_db: tuple[str, str],
+    ) -> None:
+        """AC-59, AC-60: the repeated tree id, summary and no-finding variants on a cp1252 pipe."""
+        clean_db, clean_thread, clean_ids = seeded_db
+
+        cases: list[tuple[list[str], str]] = [
+            (["tree", clean_thread, "--db", clean_db], clean_ids[0]),
+            (["forensics", clean_thread, "--db", clean_db], "Total Checkpoints: 3"),
+            (["forensics", "loops", clean_thread, "--db", clean_db], "No loops"),
             (["forensics", "trace-error", clean_thread, "--db", clean_db], "No error detected"),
         ]
-        for args, expected in cases:
-            proc = _run_cli_cp1252(args)
-            stdout = proc.stdout.decode("cp1252")
-            stderr = proc.stderr.decode("cp1252")
-            assert proc.returncode == 0, f"{args}: {stderr}"
-            assert "UnicodeEncodeError" not in stderr, args
-            assert expected in stdout, f"{args}: {stdout}"
+        _assert_cp1252_cases(cases)
 
     def test_no_finding_messages_are_ascii_ac_60(
         self,
@@ -1410,6 +1450,36 @@ def test_trace_error_omits_origin_line_without_origin_ac_122(
     assert "Bad argument origin" not in result.output
 
 
+def test_combined_forensics_prints_bad_argument_origin_ac_122(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """AC-122: the combined forensics summary shows the same origin line as trace-error."""
+    db_file = str(tmp_path / "origin.rl")
+    _run_origin_graph(db_file, "origin-fail", "pkg-alpha-9000")
+
+    result = runner.invoke(app, ["forensics", "origin-fail", "--db", db_file])
+
+    flat = _flatten(result.output)
+    assert result.exit_code == 0
+    assert "Bad argument origin: url came from node planner (step 0, 2 hops before failure)" in flat
+    assert "hops: checkpoint steps from the write where the argument first appeared" in flat
+    assert "Status: ERROR DETECTED" in flat
+
+
+def test_combined_forensics_omits_origin_line_without_origin_ac_122(
+    runner: CliRunner, seeded_error_db: tuple[str, str, str]
+) -> None:
+    """AC-122: with no traceable argument the combined summary has no origin line or blank gap."""
+    db_file, thread_id, _ = seeded_error_db
+
+    result = runner.invoke(app, ["forensics", thread_id, "--db", db_file])
+
+    assert result.exit_code == 0
+    assert "Root Tool Name:" in result.output
+    assert "Bad argument origin" not in result.output
+    assert not re.search(r"Root Tool Name:.*\n[│|\s]*\n", result.output)
+
+
 def test_trace_error_demo_tool_fail_still_names_the_tool_rc_05(runner: CliRunner) -> None:
     """RC-05: the committed demo store still reports fetch_source and its call id."""
     result = runner.invoke(app, ["forensics", "trace-error", DEMO_THREAD, "--db", str(DEMO_STORE)])
@@ -1751,12 +1821,13 @@ def test_ac164_cli_forensics_failures_displays_fanout_origin_nodes(
 def test_ac167_print_wide_preserves_console_width(
     monkeypatch: pytest.MonkeyPatch, initial_width: int | None
 ) -> None:
-    """AC-167: _print_wide preserves and restores console._width to pre-call value (None or fixed width)."""
+    """AC-167: _print_wide prints through a local Console and leaves the shared console unchanged."""
     fake_stream = io.StringIO()
     test_console = Console(file=fake_stream, width=initial_width)
     monkeypatch.setattr(cli, "console", test_console)
 
     assert test_console._width == initial_width
+    width_before = test_console.width
 
     table = Table(title="Wide Table")
     table.add_column("Column 1")
@@ -1765,4 +1836,265 @@ def test_ac167_print_wide_preserves_console_width(
     cli._print_wide(table)
 
     assert test_console._width == initial_width
+    assert test_console.width == width_before
     assert "Wide Table" in fake_stream.getvalue()
+    assert "Value 1" in fake_stream.getvalue()
+
+
+def test_print_wide_keeps_cell_wider_than_console_on_one_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_print_wide prints cell text wider than the console unwrapped and untruncated."""
+    fake_stream = io.StringIO()
+    test_console = Console(file=fake_stream, width=40)
+    monkeypatch.setattr(cli, "console", test_console)
+    wide_cell = "error -> " + "x" * 100
+
+    table = Table(title="Wide Table")
+    table.add_column("Change")
+    table.add_row(wide_cell)
+
+    cli._print_wide(table)
+
+    lines = fake_stream.getvalue().splitlines()
+    assert sum(wide_cell in line for line in lines) == 1
+    assert len([line for line in lines if "x" in line]) == 1
+    assert "…" not in fake_stream.getvalue()
+    assert max(len(line) for line in lines) > 40
+    assert test_console.width == 40
+
+
+class _FaultyDriverConnection:
+    """Forward to a real relate-db connection, failing any statement that contains a fragment.
+
+    Stands in for a driver fault on one query; every other statement reaches the real driver.
+    """
+
+    def __init__(self, inner: Any, failing_fragment: str) -> None:
+        self._inner = inner
+        self._failing_fragment = failing_fragment
+
+    def execute(self, query: str, params: Any = None) -> Any:
+        if self._failing_fragment in query:
+            raise RuntimeError("simulated driver fault: page read failed")
+        if params is None:
+            return self._inner.execute(query)
+        return self._inner.execute(query, params)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+def test_tree_reports_database_error_and_exits_one(
+    runner: CliRunner, seeded_db: tuple[str, str, list[str]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A database error raised by the tree query reaches the CLI as 'Database error', exit 1."""
+    db_file, thread_id, _ = seeded_db
+    real_connect = relate.connect
+    tree_query = (
+        "MATCH (c:Checkpoint {thread_id: $thread_id}) RETURN c.checkpoint_id AS checkpoint_id"
+    )
+
+    def faulty_connect(*args: Any, **kwargs: Any) -> _FaultyDriverConnection:
+        return _FaultyDriverConnection(real_connect(*args, **kwargs), tree_query)
+
+    monkeypatch.setattr(relate, "connect", faulty_connect)
+    result = runner.invoke(app, ["tree", thread_id, "--db", db_file])
+
+    assert result.exit_code == 1
+    assert "Database error" in result.output
+    assert "simulated driver fault" in result.output
+    assert "Unexpected error" not in result.output
+
+
+def _flatten_usage_error(text: str) -> str:
+    """Join a boxed, wrapped usage error into one line so its wording can be matched."""
+    return " ".join(text.replace("|", " ").replace("│", " ").split())
+
+
+@pytest.mark.parametrize("command", ["loops", "diagnose"])
+@pytest.mark.parametrize("threshold", ["1", "0"])
+def test_threshold_below_two_is_a_usage_error_before_the_store_opens(
+    runner: CliRunner, seeded_loop_db: tuple[str, str], command: str, threshold: str
+) -> None:
+    """AC-193: --threshold below 2 is a usage error (exit 2) naming the option and the minimum,
+    not an unexpected error, and the store file is left byte-identical."""
+    db_file, thread_id = seeded_loop_db
+    before = _file_state(db_file)
+
+    result = runner.invoke(
+        app, ["forensics", command, thread_id, "--threshold", threshold, "--db", db_file]
+    )
+
+    assert result.exit_code == 2
+    assert "--threshold" in result.stderr
+    assert "greater than or equal to 2" in _flatten_usage_error(result.stderr)
+    assert "Unexpected error" not in result.output
+    assert "Unexpected error" not in result.stderr
+    assert "Detected Loops" not in result.output
+    assert _file_state(db_file) == before
+
+
+def test_threshold_below_two_fails_before_a_missing_store_is_checked(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """AC-193: validation runs before the store is looked up, so a bad threshold wins over a
+    missing database file, and no store file is created at that path."""
+    missing = str(tmp_path / "absent.rl")
+
+    result = runner.invoke(app, ["forensics", "loops", "t", "--threshold", "1", "--db", missing])
+
+    assert result.exit_code == 2
+    assert "--threshold" in result.stderr
+    assert "not found" not in result.output
+    assert not Path(missing).exists()
+
+
+@pytest.mark.parametrize("command", ["loops", "diagnose"])
+def test_threshold_two_is_accepted(
+    runner: CliRunner, seeded_loop_db: tuple[str, str], command: str
+) -> None:
+    """AC-193: --threshold 2, the minimum, still runs the command."""
+    db_file, thread_id = seeded_loop_db
+
+    result = runner.invoke(
+        app, ["forensics", command, thread_id, "--threshold", "2", "--db", db_file]
+    )
+
+    assert result.exit_code == 0
+    assert "Unexpected error" not in result.output
+
+
+@pytest.fixture(scope="module")
+def origin_db(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """Module-scoped store with one run whose failing tool call carries a traceable argument."""
+    db_file = str(tmp_path_factory.mktemp("origin_store") / "origin.rl")
+    _run_origin_graph(db_file, "origin-fail", "pkg-alpha-9000")
+    return db_file
+
+
+def test_combined_forensics_by_path_shows_origin_and_leaves_store_unchanged(
+    runner: CliRunner, origin_db: str
+) -> None:
+    """AC-122, AC-84: the combined summary of a store opened by path shows the origin line
+    and leaves the store file and its directory unchanged."""
+    before = _file_state(origin_db)
+
+    result = runner.invoke(app, ["forensics", "origin-fail", "--db", origin_db])
+
+    assert result.exit_code == 0, result.output
+    assert (
+        "Bad argument origin: url came from node planner (step 0, 2 hops before failure)"
+        in _flatten(result.output)
+    )
+    assert _file_state(origin_db) == before
+
+
+def test_combined_forensics_unknown_thread_leaves_store_unchanged(
+    runner: CliRunner, origin_db: str
+) -> None:
+    """AC-84: a thread with no checkpoints exits 1 and does not modify the store."""
+    before = _file_state(origin_db)
+
+    result = runner.invoke(app, ["forensics", "no-such-thread", "--db", origin_db])
+
+    assert result.exit_code == 1
+    assert "no-such-thread" in result.output
+    assert _file_state(origin_db) == before
+
+
+@pytest.mark.parametrize("command", [["tree"], ["forensics"]], ids=["tree", "forensics"])
+def test_committed_demo_store_tree_and_forensics_leave_it_untouched(
+    runner: CliRunner, command: list[str]
+) -> None:
+    """AC-84, ADR-0015: tree and combined forensics leave the committed demo store unchanged."""
+    before = _file_state(str(DEMO_STORE))
+
+    result = runner.invoke(app, [*command, DEMO_THREAD, "--db", str(DEMO_STORE)])
+
+    assert result.exit_code == 0, result.output
+    assert _file_state(str(DEMO_STORE)) == before
+
+
+_WALK_CLI_ROOT = "cp-cli-walk-root"
+_WALK_CLI_NEXT = "cp-cli-walk-next"
+_WALK_CLI_FORK = "cp-cli-walk-fork"
+
+
+def _build_walk_failure_store(db_file: str, thread_id: str, call_id: str) -> None:
+    """Store a thread whose failed call's result sits on a [:NEXT] child and on a fork.
+
+    Both children hold the ``ToolMessage`` in their pending writes, and the next child also
+    holds it in its channel values, as a LangGraph checkpoint does after its tool node ran.
+    """
+    result = ToolMessage(content="failed", tool_call_id=call_id, status="error")
+    request = AIMessage(
+        content="", tool_calls=[{"id": call_id, "name": "fetch", "args": {"q": "x"}}]
+    )
+
+    def config(checkpoint_id: str) -> RunnableConfig:
+        return {"configurable": {"thread_id": thread_id, "checkpoint_id": checkpoint_id}}
+
+    def checkpoint(checkpoint_id: str, parent: str | None, values: list[Any]) -> Any:
+        cp: Any = dict(empty_checkpoint())
+        cp["id"] = checkpoint_id
+        cp["channel_values"] = {"messages": values}
+        if parent:
+            cp["parent_checkpoint_id"] = parent
+        return cp
+
+    with RelateSaver(db_path=db_file) as saver:
+        saver.put(config(_WALK_CLI_ROOT), checkpoint(_WALK_CLI_ROOT, None, [request]), {}, {})
+        saver.put(
+            config(_WALK_CLI_NEXT),
+            checkpoint(_WALK_CLI_NEXT, _WALK_CLI_ROOT, [result]),
+            {"step": 1},
+            {},
+        )
+        saver.put(
+            config(_WALK_CLI_FORK), checkpoint(_WALK_CLI_FORK, _WALK_CLI_ROOT, []), {"step": 1}, {}
+        )
+        saver.put_writes(config(_WALK_CLI_NEXT), [("messages", [result])], "task-next")
+        saver.put_writes(config(_WALK_CLI_FORK), [("messages", [result])], "task-fork")
+
+
+def test_ac189_trace_error_names_the_next_child_on_every_run(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """AC-189: with the result on the [:NEXT] child and on a [:FORKED_TO] branch, trace-error
+    names the [:NEXT] child, prints the same report on every run, and leaves the store
+    byte-identical (ADR-0015)."""
+    db_file = str(tmp_path / "walk.rl")
+    thread_id = "thread-cli-walk"
+    _build_walk_failure_store(db_file, thread_id, "call-cli-walk")
+    before = _file_state(db_file)
+
+    reports: list[str] = []
+    for _ in range(3):
+        result = runner.invoke(app, ["forensics", "trace-error", thread_id, "--db", db_file])
+        assert result.exit_code == 0, result.output
+        reports.append(_flatten_usage_error(result.output))
+
+    assert all(report == reports[0] for report in reports)
+    match = re.search(r"Error Checkpoint ID: (\S+)", reports[0])
+    assert match is not None, reports[0]
+    assert match.group(1) == _WALK_CLI_NEXT
+    assert _WALK_CLI_FORK not in reports[0]
+    assert _file_state(db_file) == before
+
+
+def test_ac189_trace_error_unknown_thread_on_the_walk_store_exits_one(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """AC-189: a thread id absent from the store is reported as not found, with no error
+    checkpoint named, and the store is left unchanged."""
+    db_file = str(tmp_path / "walk-unknown.rl")
+    _build_walk_failure_store(db_file, "thread-cli-walk", "call-cli-walk-unknown")
+    before = _file_state(db_file)
+
+    result = runner.invoke(app, ["forensics", "trace-error", "thread-missing", "--db", db_file])
+
+    assert result.exit_code == 1
+    assert "Error Checkpoint ID" not in result.output
+    assert "Unexpected error" not in result.output
+    assert _file_state(db_file) == before

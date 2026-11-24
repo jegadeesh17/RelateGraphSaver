@@ -1,5 +1,7 @@
 """Unit tests for Relate checkpoint exception taxonomy (AC-01)."""
 
+import concurrent.futures
+
 import pytest
 
 from langgraph_checkpoint_relate.errors import (
@@ -11,6 +13,7 @@ from langgraph_checkpoint_relate.errors import (
     RelateConnectionError,
     RelateSerializationError,
 )
+from langgraph_checkpoint_relate.proxy import _wrap_exception
 
 SUBCLASS_TYPES = [
     RelateConnectionError,
@@ -106,3 +109,78 @@ def test_polymorphic_catch_ac_01() -> None:
             raise exc_cls("Dispatched error")
         assert isinstance(exc_info.value, RelateCheckpointError)
         assert exc_info.value.message == "Dispatched error"
+
+
+def test_wrap_exception_word_boundary_avoids_false_positive_concurrency_ac_01() -> None:
+    """AC-01: Substring matches like 'unlocked', 'clock', 'block', or 'timeout_ms' do not trigger concurrency errors."""
+    false_match_messages = [
+        "node state is unlocked",
+        "system clock drift detected",
+        "failed to parse block statement",
+        "invalid parameter timeout_ms provided",
+    ]
+    for msg in false_match_messages:
+        exc = RuntimeError(msg)
+        wrapped = _wrap_exception(exc)
+        assert isinstance(wrapped, RelateCheckpointError)
+        assert not isinstance(wrapped, RelateConcurrencyError)
+        assert not isinstance(wrapped, RelateConnectionError)
+        assert wrapped.__cause__ is exc
+        assert msg in str(wrapped)
+
+
+def test_wrap_exception_accurate_concurrency_classification_ac_01() -> None:
+    """AC-01: Accurate classification of concurrency and lock errors using word-boundary regex."""
+    concurrency_messages = [
+        "database is locked",
+        "write lock contention",
+        "query timed out",
+        "resource deadlock detected",
+        "driver busy with another query",
+        "hash collision detected in worker",
+    ]
+    for msg in concurrency_messages:
+        exc = RuntimeError(msg)
+        wrapped = _wrap_exception(exc)
+        assert isinstance(wrapped, RelateConcurrencyError)
+        assert wrapped.__cause__ is exc
+        assert msg in str(wrapped)
+
+    std_timeout = TimeoutError("socket timeout")
+    wrapped_std = _wrap_exception(std_timeout)
+    assert isinstance(wrapped_std, RelateConcurrencyError)
+    assert wrapped_std.__cause__ is std_timeout
+
+    fut_timeout = concurrent.futures.TimeoutError()
+    wrapped_fut = _wrap_exception(fut_timeout)
+    assert isinstance(wrapped_fut, RelateConcurrencyError)
+    assert wrapped_fut.__cause__ is fut_timeout
+
+
+def test_wrap_exception_accurate_connection_classification_ac_01() -> None:
+    """AC-01: Accurate classification of connection errors using word-boundary regex and class names."""
+    connection_messages = [
+        "connection closed",
+        "active connection reset by peer",
+        "relate database connection terminated",
+    ]
+    for msg in connection_messages:
+        exc = RuntimeError(msg)
+        wrapped = _wrap_exception(exc)
+        assert isinstance(wrapped, RelateConnectionError)
+        assert wrapped.__cause__ is exc
+        assert msg in str(wrapped)
+
+    class InterfaceError(Exception):
+        pass
+
+    iface_err = InterfaceError("Underlying driver interface error")
+    wrapped_iface = _wrap_exception(iface_err)
+    assert isinstance(wrapped_iface, RelateConnectionError)
+    assert wrapped_iface.__cause__ is iface_err
+
+    # Substrings like 'unclosed' or 'interconnection' must not trigger connection error
+    for non_conn_msg in ["unclosed file descriptor", "interconnection routing"]:
+        exc = RuntimeError(non_conn_msg)
+        wrapped_non_conn = _wrap_exception(exc)
+        assert not isinstance(wrapped_non_conn, RelateConnectionError)

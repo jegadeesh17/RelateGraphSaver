@@ -25,7 +25,8 @@ _INVOCATION_CYPHER = (
     "ON CREATE SET tc.tool_name = $tool_name, tc.args_blob = $args_blob, "
     "tc.created_at = $created_at\n"
     "WITH tc\n"
-    "OPTIONAL MATCH (c:Checkpoint {checkpoint_id: $checkpoint_id})\n"
+    "OPTIONAL MATCH (c:Checkpoint {checkpoint_id: $checkpoint_id})"
+    " WHERE c.thread_id = $thread_id AND c.checkpoint_ns = $checkpoint_ns\n"
     "OPTIONAL MATCH (linked:Checkpoint {thread_id: $thread_id})-[:INVOKED]->(tc)\n"
     "WITH tc, c, count(linked) AS linked_count\n"
     "FOREACH (_ IN CASE WHEN c IS NOT NULL AND linked_count = 0 THEN [1] ELSE [] END |\n"
@@ -202,6 +203,7 @@ def build_tool_call_statements(
     events: ToolEvents,
     *,
     thread_id: str,
+    checkpoint_ns: str,
     checkpoint_id: str,
     serde: BlobSerializer,
     created_at: str,
@@ -226,6 +228,7 @@ def build_tool_call_statements(
                     "args_blob": args_blob,
                     "created_at": created_at,
                     "thread_id": thread_id,
+                    "checkpoint_ns": checkpoint_ns,
                     "checkpoint_id": checkpoint_id,
                 },
             )

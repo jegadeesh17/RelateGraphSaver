@@ -74,11 +74,7 @@ class TimeTravelEngine:
             "       c.created_at AS created_at "
             "ORDER BY c.step ASC, c.created_at ASC"
         )
-        try:
-            records = source_saver.proxy.execute_read(candidates_query, {"thread_id": thread_id})
-        except RelateCheckpointError as exc:
-            logger.error("Failed to query checkpoints for thread %s: %s", thread_id, exc)
-            records = []
+        records = source_saver.proxy.execute_read(candidates_query, {"thread_id": thread_id})
 
         candidate_ids = [str(r["checkpoint_id"]) for r in records]
         if checkpoint_id not in candidate_ids:
@@ -146,10 +142,7 @@ class TimeTravelEngine:
             "       w.created_at AS created_at "
             "ORDER BY w.idx ASC"
         )
-        try:
-            writes_records = source_saver.proxy.execute_read(writes_query, {"ids": ancestor_ids})
-        except RelateCheckpointError:
-            writes_records = []
+        writes_records = source_saver.proxy.execute_read(writes_query, {"ids": ancestor_ids})
 
         # Query tool calls invoked from lineage checkpoints. A failure propagates: a fork
         # without its tool calls would make forensics on it differ silently from the source.
@@ -373,7 +366,11 @@ class TimeTravelEngine:
             statements.append((branch_stmt, branch_params))
 
         # Execute atomic batch population
-        in_memory_saver.proxy.execute_batch(statements)
+        try:
+            in_memory_saver.proxy.execute_batch(statements)
+        except Exception:
+            in_memory_saver.close()
+            raise
 
         return in_memory_saver
 

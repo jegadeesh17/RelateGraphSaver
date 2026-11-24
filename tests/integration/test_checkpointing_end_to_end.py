@@ -14,6 +14,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import uuid
 from collections.abc import Generator
 from datetime import UTC, datetime
@@ -31,11 +32,17 @@ _PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+_SRC_DIR = str(Path(__file__).resolve().parents[2] / "src")
+if _SRC_DIR not in sys.path:
+    sys.path.insert(0, _SRC_DIR)
+
 import relate
 
 from langgraph_checkpoint_relate.errors import (
     CheckpointSerializationError,
     RelateCheckpointError,
+    RelateConcurrencyError,
+    RelateConnectionError,
     RelateSerializationError,
 )
 from langgraph_checkpoint_relate.saver import RelateSaver
@@ -195,11 +202,14 @@ class TestRelateSaverEndToEnd:
             assert latest_tuple.parent_config is not None
             assert "checkpoint_id" in latest_tuple.parent_config["configurable"]
 
-            # AC-06: list yields CheckpointTuple records ordered reverse-chronologically by step
+            # AC-06, AC-175, ADR-0026: list yields CheckpointTuple records ordered reverse-chronologically by checkpoint_id
             history = list(saver.list(run_config))
             assert (
                 len(history) >= 4
             )  # __start__, enrich (step 1), process (step 2), format (step 3)
+
+            history_cids = [h.checkpoint["id"] for h in history]
+            assert history_cids == sorted(history_cids, reverse=True)
 
             steps: list[Any] = [h.metadata.get("step") for h in history if "step" in h.metadata]
             assert steps == sorted(steps, reverse=True)
@@ -236,7 +246,7 @@ class TestRelateSaverEndToEnd:
                     "source": "loop",
                     "step": i,
                     "writes": {},
-                    "parents": {parent_id: "parent"} if parent_id else {},
+                    "parents": {},
                 }
                 cfg: Any = {"configurable": {"thread_id": thread_id, "checkpoint_id": parent_id}}
                 saver.put(cfg, chk, meta, {})
@@ -635,3 +645,323 @@ class TestRelateSaverEndToEnd:
             tuple_res = saver.get_tuple(cfg)
             assert tuple_res is not None
             assert tuple_res.checkpoint["channel_values"]["seam"] == "passed"
+
+    def test_compiled_graph_with_subgraph_node_ac_173_ac_174(self, temp_disk_path: str) -> None:
+        """Verifies compiled StateGraph with embedded subgraph node, namespace resolution, and parent chains.
+
+        Validates AC-173: get_state() without namespace resolves the root namespace state ("").
+        Validates AC-174: Checkpoint parent IDs along graph and subgraph execution branches form
+        proper parent chains, with config["configurable"]["checkpoint_id"] strictly taking priority
+        over metadata["parents"].
+        """
+
+        class ChildState(TypedDict):
+            counter: int
+            sub_step: str
+
+        class ParentWorkflowState(TypedDict):
+            counter: int
+            sub_step: str
+            parent_note: str
+
+        child_builder = StateGraph(ChildState)
+
+        def c_node_a(state: ChildState) -> dict[str, Any]:
+            return {"counter": state["counter"] + 5, "sub_step": "child_a"}
+
+        def c_node_b(state: ChildState) -> dict[str, Any]:
+            return {"counter": state["counter"] + 15, "sub_step": "child_b"}
+
+        child_builder.add_node("child_a", c_node_a)
+        child_builder.add_node("child_b", c_node_b)
+        child_builder.add_edge(START, "child_a")
+        child_builder.add_edge("child_a", "child_b")
+        child_builder.add_edge("child_b", END)
+        child_subgraph = child_builder.compile()
+
+        parent_builder = StateGraph(ParentWorkflowState)
+
+        def p_start(state: ParentWorkflowState) -> dict[str, Any]:
+            return {"counter": state["counter"] + 1, "parent_note": "started"}
+
+        def p_end(state: ParentWorkflowState) -> dict[str, Any]:
+            return {"counter": state["counter"] + 2, "parent_note": "finished"}
+
+        parent_builder.add_node("parent_start", p_start)
+        parent_builder.add_node("subgraph_node", child_subgraph)
+        parent_builder.add_node("parent_end", p_end)
+        parent_builder.add_edge(START, "parent_start")
+        parent_builder.add_edge("parent_start", "subgraph_node")
+        parent_builder.add_edge("subgraph_node", "parent_end")
+        parent_builder.add_edge("parent_end", END)
+
+        thread_id = f"thread-subgraph-{uuid.uuid4().hex[:8]}"
+        config: Any = {"configurable": {"thread_id": thread_id}}
+
+        with RelateSaver(db_path=temp_disk_path) as saver:
+            graph = parent_builder.compile(checkpointer=saver)
+
+            init_input: ParentWorkflowState = {
+                "counter": 10,
+                "sub_step": "init",
+                "parent_note": "none",
+            }
+            res: Any = graph.invoke(init_input, config=config)
+
+            # Verification of final output: 10 + 1 (start) + 5 (child_a) + 15 (child_b) + 2 (end) = 33
+            assert res["counter"] == 33
+            assert res["sub_step"] == "child_b"
+            assert res["parent_note"] == "finished"
+
+            # AC-173: get_state without namespace resolves root namespace state ("")
+            root_state = graph.get_state(config)
+            assert root_state.values["counter"] == 33
+            assert root_state.values["parent_note"] == "finished"
+            assert root_state.config.get("configurable", {}).get("checkpoint_ns") == ""
+
+            # AC-174: Checkpoint parents form proper parent chains across graph and subgraph
+            all_checkpoints = list(saver.list(config))
+            assert len(all_checkpoints) > 0
+
+            # Partition by namespace
+            root_checkpoints = [
+                c
+                for c in all_checkpoints
+                if not c.config.get("configurable", {}).get("checkpoint_ns")
+            ]
+            subgraph_checkpoints = [
+                c
+                for c in all_checkpoints
+                if str(c.config.get("configurable", {}).get("checkpoint_ns", "")).startswith(
+                    "subgraph_node"
+                )
+            ]
+
+            assert len(root_checkpoints) >= 3
+            assert len(subgraph_checkpoints) >= 2
+
+            # Root chain links: reverse chronological order, each points to prior
+            root_chronological = list(reversed(root_checkpoints))
+            assert root_chronological[0].parent_config is None
+            for i in range(1, len(root_chronological)):
+                expected_parent_id = root_chronological[i - 1].config["configurable"][
+                    "checkpoint_id"
+                ]
+                actual_parent_cfg = root_chronological[i].parent_config
+                assert actual_parent_cfg is not None
+                assert actual_parent_cfg["configurable"]["checkpoint_id"] == expected_parent_id
+
+            # Subgraph chain links: each non-initial child checkpoint points to prior child checkpoint
+            subgraph_chronological = list(reversed(subgraph_checkpoints))
+            assert subgraph_chronological[0].parent_config is None
+            for i in range(1, len(subgraph_chronological)):
+                expected_sub_parent_id = subgraph_chronological[i - 1].config["configurable"][
+                    "checkpoint_id"
+                ]
+                actual_sub_parent_cfg = subgraph_chronological[i].parent_config
+                assert actual_sub_parent_cfg is not None
+                assert (
+                    actual_sub_parent_cfg["configurable"]["checkpoint_id"] == expected_sub_parent_id
+                )
+
+            # AC-174 explicit check: metadata["parents"] is strictly ignored in put()
+            explicit_cfg: Any = {
+                "configurable": {"thread_id": thread_id, "checkpoint_id": "explicit_parent"}
+            }
+            chk: Any = {
+                "v": 1,
+                "id": "explicit_child",
+                "ts": datetime.now(UTC).isoformat(),
+                "channel_values": {"counter": 999},
+                "channel_versions": {"counter": 1},
+                "versions_seen": {},
+            }
+            saver.put(
+                explicit_cfg,
+                chk,
+                {"step": 99, "parents": {"": "bogus_metadata_parent"}},
+                {},
+            )
+            tuple_explicit = saver.get_tuple(
+                {"configurable": {"thread_id": thread_id, "checkpoint_id": "explicit_child"}}
+            )
+            assert tuple_explicit is not None
+            assert tuple_explicit.parent_config is not None
+            assert (
+                tuple_explicit.parent_config["configurable"]["checkpoint_id"] == "explicit_parent"
+            )
+
+    def test_update_state_fork_and_invoke_time_travel_ac_175(self, temp_disk_path: str) -> None:
+        """Verifies time-travel branching via update_state followed by invoke resuming from edited step.
+
+        Validates AC-175: Checkpoint ordering and filtering use checkpoint_id DESC so get_state resolves
+        the new branch head (highest checkpoint_id) rather than the old branch's later step.
+        """
+
+        class ForkState(TypedDict):
+            counter: int
+            trace: list[str]
+
+        builder = StateGraph(ForkState)
+
+        def f_step1(state: ForkState) -> dict[str, Any]:
+            return {"counter": state["counter"] + 1, "trace": state["trace"] + ["step1"]}
+
+        def f_step2(state: ForkState) -> dict[str, Any]:
+            return {"counter": state["counter"] + 10, "trace": state["trace"] + ["step2"]}
+
+        def f_step3(state: ForkState) -> dict[str, Any]:
+            return {"counter": state["counter"] + 100, "trace": state["trace"] + ["step3"]}
+
+        builder.add_node("step1", f_step1)
+        builder.add_node("step2", f_step2)
+        builder.add_node("step3", f_step3)
+        builder.add_edge(START, "step1")
+        builder.add_edge("step1", "step2")
+        builder.add_edge("step2", "step3")
+        builder.add_edge("step3", END)
+
+        thread_id = f"thread-fork-{uuid.uuid4().hex[:8]}"
+        base_config: Any = {"configurable": {"thread_id": thread_id}}
+
+        with RelateSaver(db_path=temp_disk_path) as saver:
+            graph = builder.compile(checkpointer=saver)
+
+            # 1. Run multi-step graph to completion (0 + 1 + 10 + 100 = 111)
+            init_fork: ForkState = {"counter": 0, "trace": ["start"]}
+            initial_res: Any = graph.invoke(init_fork, config=base_config)
+            assert initial_res["counter"] == 111
+            assert initial_res["trace"] == ["start", "step1", "step2", "step3"]
+
+            # 2. Grab checkpoint_id of step 1
+            history = list(saver.list(base_config))
+            step1_ckpts = [c for c in history if c.metadata.get("step") == 1]
+            assert len(step1_ckpts) == 1
+            step1_id = step1_ckpts[0].config["configurable"]["checkpoint_id"]
+            assert step1_ckpts[0].checkpoint["channel_values"]["counter"] == 1
+
+            # 3. Call update_state on step 1 with edited counter: 99
+            edit_config: Any = {"configurable": {"thread_id": thread_id, "checkpoint_id": step1_id}}
+            update_result: Any = graph.update_state(edit_config, {"counter": 99})
+            updated_id = update_result["configurable"]["checkpoint_id"]
+            assert updated_id != step1_id
+
+            # 4. Invoke from updated checkpoint to resume execution along the fork
+            resume_config: Any = {
+                "configurable": {"thread_id": thread_id, "checkpoint_id": updated_id}
+            }
+            fork_res: Any = graph.invoke(None, config=resume_config)
+
+            # Execution resumes from edited state: 99 + 10 (step2) + 100 (step3) = 209
+            assert fork_res["counter"] == 209
+            assert fork_res["trace"] == ["start", "step1", "step2", "step3"]
+
+            # 5. Verify get_state resolves new branch head (highest checkpoint_id) per AC-175
+            current_state = graph.get_state(base_config)
+            assert current_state.values["counter"] == 209
+            assert current_state.config["configurable"]["checkpoint_id"] > step1_id
+
+            # Verify saver.list() preserves reverse-chronological order by checkpoint_id DESC (AC-175)
+            all_fork_ckpts = list(saver.list(base_config))
+            ckpt_ids = [c.config["configurable"]["checkpoint_id"] for c in all_fork_ckpts]
+            assert ckpt_ids == sorted(ckpt_ids, reverse=True)
+
+    def test_timed_out_write_does_not_commit_ac_179(self, temp_disk_path: str) -> None:
+        """Verifies that a write expiring caller timeout is cancelled and never committed.
+
+        Validates AC-179: When caller timeout expires, future is cancelled and worker thread
+        skips execution/commit, leaving database unmutated for subsequent reads.
+        """
+        thread_id = f"thread-timeout-{uuid.uuid4().hex[:8]}"
+        marker_id = f"marker-{uuid.uuid4().hex[:8]}"
+
+        with RelateSaver(db_path=temp_disk_path) as saver:
+            # Enqueue a brief delay on worker thread to guarantee the write times out in queue
+            saver.proxy._queue.put(lambda: time.sleep(0.12))
+
+            # Attempt a write with a tight timeout (0.01s)
+            cypher = (
+                "MERGE (t:Thread {thread_id: $thread_id}) "
+                "CREATE (c:Checkpoint {checkpoint_id: $cid, thread_id: $thread_id, marker: $marker})"
+            )
+            with pytest.raises(RelateConcurrencyError) as exc_info:
+                saver.proxy.execute_write(
+                    cypher,
+                    {"thread_id": thread_id, "cid": marker_id, "marker": "timed_out_write"},
+                    timeout=0.01,
+                )
+
+            assert "timed out" in str(exc_info.value).lower()
+
+            # Wait for the delay task and cancellation processing to finish
+            time.sleep(0.18)
+
+            # Subsequent read must not observe the timed-out write
+            records = saver.proxy.execute_read(
+                "MATCH (c:Checkpoint {checkpoint_id: $cid}) RETURN c",
+                {"cid": marker_id},
+            )
+            assert len(records) == 0
+
+            # Verify checkpointer level put with tight timeout also aborts cleanly
+            saver.proxy._queue.put(lambda: time.sleep(0.12))
+            chk: Any = {
+                "v": 1,
+                "id": f"chk-{uuid.uuid4().hex[:8]}",
+                "ts": datetime.now(UTC).isoformat(),
+                "channel_values": {"key": "val"},
+                "channel_versions": {"key": 1},
+                "versions_seen": {},
+            }
+            original_timeout = saver.proxy.default_timeout
+            saver.proxy.default_timeout = 0.01
+            try:
+                with pytest.raises(RelateConcurrencyError):
+                    saver.put(
+                        {"configurable": {"thread_id": thread_id}},
+                        chk,
+                        {"step": 0},
+                        {},
+                    )
+            finally:
+                saver.proxy.default_timeout = original_timeout
+
+            time.sleep(0.18)
+            tuple_check = saver.get_tuple(
+                {"configurable": {"thread_id": thread_id, "checkpoint_id": chk["id"]}}
+            )
+            assert tuple_check is None
+
+    def test_closed_proxy_read_raises_connection_error_ac_176(self, temp_disk_path: str) -> None:
+        """Verifies closed proxy propagates RelateConnectionError on get_tuple and list.
+
+        Validates AC-176: Underlying RelateConnectionError is re-raised rather than returning
+        None or an empty collection.
+        """
+        thread_id = f"thread-closed-{uuid.uuid4().hex[:8]}"
+        cfg: Any = {"configurable": {"thread_id": thread_id}}
+
+        saver = RelateSaver(db_path=temp_disk_path)
+        chk: Any = {
+            "v": 1,
+            "id": f"chk-pre-close-{uuid.uuid4().hex[:8]}",
+            "ts": datetime.now(UTC).isoformat(),
+            "channel_values": {"status": "active"},
+            "channel_versions": {"status": 1},
+            "versions_seen": {},
+        }
+        res_cfg = saver.put(cfg, chk, {"step": 1}, {})
+        assert saver.get_tuple(res_cfg) is not None
+
+        # Explicitly close the proxy / saver
+        saver.proxy.close()
+
+        # get_tuple must raise RelateConnectionError (not return None)
+        with pytest.raises(RelateConnectionError) as exc_get:
+            saver.get_tuple(res_cfg)
+        assert "closed" in str(exc_get.value).lower()
+
+        # list must raise RelateConnectionError (not return empty iterator)
+        with pytest.raises(RelateConnectionError) as exc_list:
+            list(saver.list(res_cfg))
+        assert "closed" in str(exc_list.value).lower()

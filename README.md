@@ -6,7 +6,7 @@ RelateGraphSaver is a LangGraph checkpointer built on Relate by Neo4j, an embedd
 
 ## Use case
 
-An agent fails in the middle of a run, and you need to know which step or tool call caused it. A plain message log shows what the agent said, not how its state moved from one step to the next. RelateGraphSaver stores every LangGraph checkpoint as a node in a graph, so the question becomes a path query.
+An agent fails in the middle of a run, and you need to know which step or tool call caused it. A plain message log shows what the agent said, not how its state moved from one step to the next. RelateGraphSaver stores every LangGraph checkpoint as a node in a graph, so the question becomes a walk over graph edges.
 
 It is for engineers building LangGraph agents who want durable checkpoints, a readable execution history and a way to replay a past step without touching the real run. The relationships that matter:
 
@@ -18,7 +18,7 @@ It is for engineers building LangGraph agents who want durable checkpoints, a re
 ## Features
 
 - **Embedded Single-File WAL Persistence:** Persists checkpoints, intermediate channel updates, and execution metadata into a zero-configuration `.rl` database file with atomic Write-Ahead Logging.
-- **Native Cypher DAG Modeling:** Represents agent execution state as a property graph with `:Thread`, `:Checkpoint`, `:Write`, and `:ToolCall` nodes linked by causal `:NEXT`, `:FORKED_TO`, and `:HAS_WRITE` relationships.
+- **Native Cypher DAG Modeling:** Represents agent execution state as a property graph with `:Thread`, `:Checkpoint`, `:Write`, and `:ToolCall` nodes linked by causal `:NEXT`, `:FORKED_TO`, `:HAS_WRITE`, and `:INVOKED` relationships (`:INVOKED` runs from a checkpoint to the tool calls recorded there).
 - **Sandboxed In-Memory Time Travel:** Clones historical execution subgraphs up to any targeted checkpoint into an isolated `:memory:` database with `fork_in_memory()`, allowing speculative replays without altering production files.
 - **Terminal Execution Trees:** Inspect multi-agent branching structures, pending writes, and error states directly in the terminal using `relate-dag tree`.
 - **Cypher Forensic Diagnostics:** Detect cyclical state oscillations (`relate-dag forensics loops`) and trace backward causal paths from failures to offending antecedent writes or tool calls (`relate-dag forensics trace-error`).
@@ -77,19 +77,24 @@ relate-dag forensics failures --db examples/data/demo.rl
 relate-dag replay demo-tool-fail 1f1e3dcc-9e79-6ab8-8000-7d30cc461d0e --graph examples/tool_agent.py:create_tool_agent_graph --set-message 0=https://example.org/report --db examples/data/demo.rl
 ```
 
-`tree` prints one thread as a tree (excerpt; each checkpoint line carries its id and step, and the tree continues to the last step):
+`tree` prints one thread as a tree (excerpt; each checkpoint line carries its id and step, successive steps sit at the same depth, only forked branches are indented, and the tree continues to the last step):
 
 ```text
 Thread: demo-real-api
-`-- [OK] Step -1: source: input (id: 1f1e3dcc-a6d6-6162-bfff-4124dcf80f96) - 
-    2026-11-19T05:48:05.367692+00:00
-    +-- write: channel='messages', 
-    |   task_id='ea4ddc7a-fa40-7938-a4e1-0bb9d5c4f9c6'
-    +-- write: channel='branch:to:intake', 
-    |   task_id='ea4ddc7a-fa40-7938-a4e1-0bb9d5c4f9c6'
-    `-- [OK] Step 0: source: loop (id: 1f1e3dcc-a6d9-674a-8000-f4e0be68ceae) - 
-        2026-11-19T05:48:05.401817+00:00
-        ...
++-- [OK] Step -1: source: input (id: 1f1e3dcc-a6d6-6162-bfff-4124dcf80f96) - 
+|   2026-11-19T05:48:05.367692+00:00
+|   +-- write: channel='messages', 
+|   |   task_id='ea4ddc7a-fa40-7938-a4e1-0bb9d5c4f9c6'
+|   `-- write: channel='branch:to:intake', 
+|       task_id='ea4ddc7a-fa40-7938-a4e1-0bb9d5c4f9c6'
++-- [OK] Step 0: source: loop (id: 1f1e3dcc-a6d9-674a-8000-f4e0be68ceae) - 
+|   2026-11-19T05:48:05.401817+00:00
+|   +-- write: channel='project', 
+|   |   task_id='f6e38094-3af4-4df9-46a4-a8906e3c9c74'
+|   `-- write: channel='branch:to:planner', 
+|       task_id='f6e38094-3af4-4df9-46a4-a8906e3c9c74'
++-- [OK] Step 1: source: loop (id: 1f1e3dcc-a6dd-62fa-8001-77bdfaae9575) - 
+...
 ```
 
 `trace-error` on `demo-real-api` names the tool call that failed and the node that wrote its bad argument (excerpt):
@@ -141,6 +146,17 @@ Replay result
 ```
 
 To find the id of a checkpoint on any thread, run `relate-dag tree <thread> --db examples/data/demo.rl`. The step -1 checkpoint holds no messages yet, so use step 0 or later with `--set-message`.
+
+### Explore the recorded LLM run
+
+`examples/data/demo-llm.rl` is a second committed store, separate from `demo.rl`. It holds one thread, `demo-llm`: a real model, called through OpenRouter, runs the same `lookup_pypi_package` tool as the dependency audit. `build_demo_store.py` never reads or writes this file (AC-141), and you do not need an API key to inspect it. These commands only read it:
+
+```bash
+relate-dag tree demo-llm --db examples/data/demo-llm.rl
+relate-dag forensics trace-error demo-llm --db examples/data/demo-llm.rl
+```
+
+You do not have to know a thread id up front. `relate-dag forensics failures --db <file>` lists every thread that holds a failed tool call, and `relate-dag tree <thread> --db <file>` prints that thread's checkpoints. For `demo-llm.rl` the failures table names `demo-llm`, the one failed `lookup_pypi_package` call, and the node that wrote its bad argument.
 
 ## Usage
 
@@ -197,6 +213,30 @@ relate-dag forensics loops session-42 --threshold 2 --db checkpoints.rl
 
 # Trace root cause of an execution failure
 relate-dag forensics trace-error session-42 --db checkpoints.rl
+
+# Summarize failing tool calls across every thread in the store (no thread id)
+relate-dag forensics failures --db checkpoints.rl
+```
+
+`--db` (also `--file`, short `-d` or `-f`) defaults to `checkpoints.rl` on every command. `forensics loops` also takes `--threshold` (short `-t`, default `2`), the minimum number of consecutive repeats that counts as a loop. `forensics trace` is an alias for `trace-error`. `forensics failures` takes only `--db`: it reports failing tool calls for the whole store, not one thread.
+
+`replay` without `--graph` forks the checkpoint into an in-memory sandbox and stops. With `--graph` it also re-runs your graph from that checkpoint, still in memory, and prints what changed against the recorded run. The durable file is never modified. Options:
+
+- `--graph`, `-g`: the graph to re-run, as `path/to/file.py:factory` or `module:factory`.
+- `--set-message INDEX=TEXT`: replace message number `INDEX` with `TEXT` before re-running; repeatable. Needs `--graph`.
+- `--update JSON`: a JSON object of channel values to write before re-running. Needs `--graph`.
+- `--as-node NAME`: the node to treat as the writer of the edit. Needs `--graph` and an edit (`--update` or `--set-message`).
+- `--checkpoint`, `-c`: the checkpoint id as a flag instead of the second positional argument.
+- `--branch`, `-b`: a new branch thread id for the fork. Cannot be combined with `--graph`.
+
+For example, to re-run a failed run from a chosen checkpoint with a corrected first message, and then with a state update written as a given node:
+
+```bash
+# Replace message 0, then re-run the graph from that checkpoint
+relate-dag replay session-42 <checkpoint_id> --graph path/to/agent.py:create_graph --set-message 0="corrected input" --db checkpoints.rl
+
+# Write a channel value as the "planner" node, then re-run
+relate-dag replay session-42 <checkpoint_id> --graph path/to/agent.py:create_graph --update '{"topic": "retry"}' --as-node planner --db checkpoints.rl
 ```
 
 ### Running the multi-agent demo
@@ -205,6 +245,12 @@ Run the complete multi-agent research demo (Planner, Researcher, Human Review in
 
 ```bash
 python examples/research_agent.py --topic "Autonomous Agent Architecture"
+```
+
+The demo pauses at the human review step and asks for feedback. Pass `--auto-approve` to supply the default reviewer feedback without prompting, which is what a non-interactive run needs:
+
+```bash
+python examples/research_agent.py --topic "Autonomous Agent Architecture" --auto-approve
 ```
 
 ### Running the tool-calling demo
@@ -221,9 +267,50 @@ relate-dag forensics trace-error demo-1 --db tool_agent.rl
 
 Pass `--no-fail` to let the tool succeed.
 
+### Running the dependency audit
+
+`examples/dependency_agent.py` needs no API key. It audits this project's runtime dependencies against the real PyPI JSON API, so it needs network access to `pypi.org`. One lookup fails with an HTTP 404, and the run prints a root-cause analysis:
+
+```bash
+python examples/dependency_agent.py --db dependency_agent.rl --thread-id audit-1
+
+# Inspect it again later, from the file only
+relate-dag forensics trace-error audit-1 --db dependency_agent.rl
+```
+
+Without `--thread-id` the agent generates one and prints it. Without `--db` it writes `dependency_agent.rl` in the current directory, which is not committed.
+
+### Running the LLM agent
+
+`examples/openrouter_agent.py` is optional. It runs a real model through OpenRouter and records the run, so it needs the `llm` extra, an OpenRouter account and network access (AC-139):
+
+```bash
+pip install -e ".[dev,llm]"
+export OPENROUTER_API_KEY=<your key>     # Windows PowerShell: $env:OPENROUTER_API_KEY = "<your key>"
+python examples/openrouter_agent.py --model <openrouter-model-id> --db llm_agent.rl --thread-id llm-1
+relate-dag tree llm-1 --db llm_agent.rl
+```
+
+The script reads the key only from the `OPENROUTER_API_KEY` environment variable of the running process. It never reads a `.env` file, so set the variable in your shell and do not commit a key. `.env.example` lists the name, without a value. With the variable unset, the script prints an `Error:` line and exits with code 1 before any network call (AC-140).
+
+Always pass `--db`. Without it the script writes to `examples/data/demo-llm.rl`, the committed recorded run.
+
 ### Async usage
 
 `RelateSaver` implements the async checkpointer methods (`aget_tuple`, `alist`, `aput`, `aput_writes`), so compiled graphs work with `ainvoke` and `astream`. The synchronous methods run on worker threads, off the event loop, and writes still go through the single writer thread (ADR-0006).
+
+### Environment variables
+
+`RelateSaver` reads these variables when the matching constructor argument is not passed. The order is: constructor argument, then environment variable, then the default. An invalid value raises `ValueError` when the saver is created, but only for a variable the saver uses, that is, one whose argument is not passed.
+
+| Variable | Default | Accepted values |
+| --- | --- | --- |
+| `RELATE_DB_PATH` | `:memory:` (no file) | A file path, or `:memory:` |
+| `RELATE_WAL_ENABLED` | `true` | `1`, `true`, `yes`, `on`, `0`, `false`, `no`, `off` (case-insensitive) |
+| `RELATE_PROXY_TIMEOUT_SEC` | `30.0` | A positive number of seconds |
+| `RELATE_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (case-insensitive) |
+
+`relate-dag` commands take the store path from `--db` (default `checkpoints.rl`) and ignore `RELATE_DB_PATH`, but read the other three variables the same way the library does. `.env.example` lists these names without values; the library reads the process environment and never loads a `.env` file, so export them in your shell. `OPENROUTER_API_KEY` is separate: only `examples/openrouter_agent.py` reads it (see [Running the LLM agent](#running-the-llm-agent)).
 
 ## How we use Relate, and why
 
@@ -240,7 +327,7 @@ Relate is an embedded graph database from Neo4j. We use these capabilities, and 
 
 - **Embedded single-file database.** Each saver opens one `.rl` file in-process. Checkpoints need no server, container or credentials, and the whole execution history of an agent is one file you can copy, attach to a bug report or delete (ADR-0001).
 - **Write-ahead logging (WAL).** Every checkpoint and every writes save is committed through the WAL and flushed, so a committed checkpoint survives a process restart and an interrupted write is rolled back on reopen. An agent that resumes a thread after a crash needs exactly that guarantee. Tool-call records are committed without their own flush and become durable with the next flushed save or when `close()` is called; they are best effort, and a lost record does not affect the checkpoint (ADR-0014).
-- **Native Cypher queries.** Agent execution is a graph, so we query it as one. `relate-dag forensics trace-error` walks `[:NEXT*0..]` backwards from a failed checkpoint across `[:HAS_WRITE]` and `[:INVOKED]` edges to the write or tool call that caused it. This is a single path query, where a relational schema needs a recursive join (ADR-0003).
+- **Native Cypher queries.** Agent execution is a graph, so we query it as one. `relate-dag forensics trace-error` reads the thread's `[:NEXT|FORKED_TO]` edges in one Cypher query and walks them back from the failed checkpoint. One `UNWIND` query then joins each antecedent's `[:HAS_WRITE]` writes and `[:INVOKED]` tool calls to find the write or tool call that caused the failure. The walk runs in Python because a variable-length Cypher pattern enumerates every path and is quadratic on long chains (ADR-0030). In a graph, writes and tool calls hang off checkpoints as edges, so that join needs no recursive self-join as a relational schema does (ADR-0003).
 - **Connected schema.** `:Thread`, `:Checkpoint`, `:Write` and `:ToolCall` nodes are linked by `NEXT` (the causal order), `FORKED_TO` (a branch created by replay or a fork), `HAS_WRITE` (pending and channel writes) and `INVOKED` (a tool call made at a checkpoint). Forks and tool calls are edges in the data, so the terminal tree and the forensics reports read them directly instead of reconstructing them.
 - **Uniqueness constraints and indexes.** Constraints on thread, checkpoint, write and tool-call identifiers make writes idempotent and reject duplicates; indexes on thread, namespace, step and state hash keep lookups by thread and by checkpoint from scanning the graph.
 - **`:memory:` databases.** `fork_in_memory()` copies the history up to a chosen checkpoint into a throwaway `:memory:` database, so you can replay and experiment without touching the production file and without cleanup afterwards (ADR-0004).
@@ -304,7 +391,7 @@ What the numbers say:
 - `wal_enabled=False` skips the per-write flush and keeps put latency flat, but its file is larger, and we have not verified that it survives power loss without the flush. It is not recommended for data you cannot lose.
 - Absolute numbers will differ on your machine. Run the command above to get your own.
 
-We choose Relate for what the connected graph lets you ask and do, not for speed. Forks, tool calls and causal order are edges, so `relate-dag` can trace a failure to the write or tool call behind it with one path query; `fork_in_memory()` gives you a sandboxed copy of the history to replay without touching the production file; and the whole history stays in a single file with no server. If write throughput or multi-process access matters more than those, use SqliteSaver or PostgresSaver.
+We choose Relate for what the connected graph lets you ask and do, not for speed. Forks, tool calls and causal order are edges, so `relate-dag` can trace a failure to the write or tool call behind it by walking the checkpoint edges back to it; `fork_in_memory()` gives you a sandboxed copy of the history to replay without touching the production file; and the whole history stays in a single file with no server. If write throughput or multi-process access matters more than those, use SqliteSaver or PostgresSaver.
 
 ## Running tests
 

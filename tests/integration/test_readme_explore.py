@@ -7,6 +7,7 @@ AC-147 and AC-148, plus invalid input to the same commands.
 """
 
 import hashlib
+import re
 import shutil
 import subprocess
 import sys
@@ -29,8 +30,10 @@ def _console_script() -> str:
 
 def _readme_explore_commands() -> list[list[str]]:
     text = README.read_text(encoding="utf-8")
-    block = text[text.index("### Explore the demo store") :]
-    block = block[: block.index("\n## ")]
+    heading = "### Explore the demo store"
+    block = text[text.index(heading) + len(heading) :]
+    end = re.search(r"^#{2,3} ", block, flags=re.MULTILINE)
+    block = block[: end.start()] if end else block
     commands = [line.split()[1:] for line in block.splitlines() if line.startswith("relate-dag ")]
     assert len(commands) == 4, f"expected four explore commands, found {commands}"
     return commands

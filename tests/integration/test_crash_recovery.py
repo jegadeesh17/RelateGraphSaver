@@ -291,6 +291,7 @@ def _worker_concurrent_threads_and_crash(
 class TestCrashRecovery:
     """Integration test suite verifying Write-Ahead Log durability and crash recovery."""
 
+    @pytest.mark.slow
     def test_multistep_workflow_crash_recovery_ac_10_ac_11(self, temp_disk_db: str) -> None:
         """AC-10, AC-11: Abrupt process termination mid-workflow recovers state and lineage.
 
@@ -575,6 +576,7 @@ class TestCrashRecovery:
             assert tup.checkpoint["id"] == "chk-inproc-000"
             assert tup.checkpoint["channel_values"]["data"] == "step0"
 
+    @pytest.mark.slow
     def test_concurrent_multithreaded_crash_recovery_ac_10_ac_11(self, temp_disk_db: str) -> None:
         """AC-10, AC-11: Multi-threaded concurrent writers recover all committed state after crash."""
         num_threads = 6

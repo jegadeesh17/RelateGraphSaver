@@ -37,6 +37,14 @@ Reference documents:
 | [ADR-0023](#adr-0023-replay-diff-compares-full-message-content) | Replay Diff Compares Full Message Content | Accepted | 2026-11-20 |
 | [ADR-0024](#adr-0024-replay-diff-compares-channel-values-not-repr) | Replay Diff Compares Channel Values, Not Repr | Accepted | 2026-11-20 |
 | [ADR-0025](#adr-0025-typed-channel-keys-write-level-origin-nodes-and-an-attribute-tag-for-update_state-errors) | Typed Channel Keys, Write-Level Origin Nodes and an Attribute Tag for update_state Errors | Accepted | 2026-11-21 |
+| [ADR-0026](#adr-0026-latest-and-before-follow-checkpoint_id-order) | Latest and `before` Follow `checkpoint_id` Order | Accepted | 2026-11-22 |
+| [ADR-0027](#adr-0027-flat-tree-layout-with-fork-indentation) | Flat Tree Layout with Fork Indentation | Accepted | 2026-11-22 |
+| [ADR-0028](#adr-0028-relate_-environment-variable-configuration) | `RELATE_*` Environment Variable Configuration | Accepted | 2026-11-22 |
+| [ADR-0029](#adr-0029-forensics-lineage-namespace-loop-detection-and-root-cause-priority) | Forensics Lineage, Namespace Loop Detection, and Root-Cause Priority | Accepted | 2026-11-22 |
+| [ADR-0030](#adr-0030-the-failure-checkpoint-walk-follows-next-edges-only) | The Failure-Checkpoint Walk Follows `[:NEXT]` Edges Only | Accepted | 2026-11-23 |
+| [ADR-0031](#adr-0031-writes-and-tool-calls-attach-only-to-a-checkpoint-of-their-own-thread) | Writes and Tool Calls Attach Only to a Checkpoint of Their Own Thread | Accepted | 2026-11-23 |
+| [ADR-0032](#adr-0032-the-failure-checkpoint-walk-may-cross-one-forked_to-edge-after-a-put_writes-link) | The Failure-Checkpoint Walk May Cross One `[:FORKED_TO]` Edge After a `put_writes()` Link | Accepted | 2026-11-23 |
+| [ADR-0033](#adr-0033-relate_-variables-are-parsed-only-when-used-none-means-unset-and-a-timeout-reports-whether-the-command-started) | RELATE_* variables are parsed only when used, None means unset, and a timeout reports whether the command started | Accepted | 2026-11-23 |
 
 ---
 
@@ -238,7 +246,8 @@ Each async method runs its synchronous counterpart with `asyncio.to_thread`, so 
 ## ADR-0007: Static Quality Gates Pass Through Configuration and Behavior-Neutral Fixes
 
 Date: 2026-11-17  
-Status: Accepted
+Status: Accepted  
+Amended by: [ADR-0026](#adr-0026-latest-and-before-follow-checkpoint_id-order)
 
 ### Context
 
@@ -882,3 +891,301 @@ This amends ADR-0018 and ADR-0024:
 - **Positive:** Argument provenance narrows down to the specific node that wrote the argument in concurrent fan-out steps (AC-172).
 - **Positive:** `InvalidUpdateError` carries no added note in tracebacks while preserving CLI hint detection (AC-172).
 - **Negative:** `_channel_key` produces slightly larger tuples in memory during replay diffing.
+
+---
+
+## ADR-0026: Latest and `before` Follow `checkpoint_id` Order
+
+Date: 2026-11-22  
+Status: Accepted  
+Supersedes: Step-based ordering in [ADR-0007](#adr-0007-static-quality-gates-pass-through-configuration-and-behavior-neutral-fixes) and AC-06
+
+### Context
+
+`RelateSaver.get_tuple` (when retrieving the latest checkpoint for a thread without an explicit `checkpoint_id`) and `RelateSaver.list` (and pagination with `before`) originally sorted checkpoints by integer step number descending (`ORDER BY c.step DESC`).
+
+LangGraph's reference checkpointer implementation (`SqliteSaver`) and the LangGraph runtime assume that checkpoint sorting and reverse-chronological listing use time-ordered UUIDv6 `checkpoint_id` strings (`ORDER BY c.checkpoint_id DESC`, `c.checkpoint_id < $before`). When workflows branch or when `update_state` is invoked on an earlier historical checkpoint, the forked state writes a new checkpoint that may share or have a lower `step` number than existing checkpoints on the main branch. Ordering by `step` causes `get_tuple()` to return a stale checkpoint from a different branch rather than the latest write, and causes `before` pagination to skip or mishandle forked checkpoints.
+
+### Decision
+
+We update checkpoint sorting and filtering across `saver.py` (`get_tuple`, `list`, and `before` filter) to order strictly by `c.checkpoint_id DESC` and filter with `c.checkpoint_id < $before`.
+
+Checkpoint IDs emitted by LangGraph use UUIDv6 (`id.uuid6()`), which embeds a 60-bit timestamp in big-endian byte order, guaranteeing that lexicographical string comparison sorts in chronological creation order. This supersedes the previous step-based ordering in AC-06. Synthetic or hand-crafted checkpoint IDs in test suites that do not use UUIDv6 must sort chronologically in ASCII string order.
+
+### Alternatives considered
+
+1. **Composite ordering by `(step DESC, created_at DESC)`:** Rejected; `step` numbers diverge or collide across branches and forks, and ISO-8601 string timestamps can collide during high-frequency execution in tight loops.
+2. **Retain step-based ordering with branch tracking:** Rejected; diverges from standard LangGraph `SqliteSaver` semantics and adds unnecessary query complexity when UUIDv6 already provides native chronological ordering.
+3. **Cypher graph traversal following `NEXT` backwards:** Rejected; cannot resolve unlinked forks or disjoint branch heads without traversing multiple paths.
+
+### Consequences
+
+- **Positive:** Full parity with LangGraph runtime expectations and `SqliteSaver` semantics (AC-06, AC-175).
+- **Positive:** Correctly resolves latest checkpoints and pagination for `update_state` forks and branching workflows.
+- **Negative:** Hand-crafted synthetic test IDs in legacy unit tests must sort chronologically in ASCII order.
+
+---
+
+## ADR-0027: Flat Tree Layout with Fork Indentation
+
+Date: 2026-11-22  
+Status: Accepted
+
+### Context
+
+`DAGVisualizer.render_tree` and `relate-dag tree` originally traversed execution DAGs using recursive depth-first tree traversal, rendering each subsequent `[:NEXT]` child checkpoint at an increased indentation level.
+
+In long-running agent workflows or benchmarking runs exceeding 1,000 to 1,500 checkpoints, recursive rendering encounters Python's default call stack recursion limit (`sys.getrecursionlimit()`), raising `RecursionError` and preventing trace visualization. Furthermore, linear execution steps connected by `[:NEXT]` do not represent hierarchical parent-child relationships; indenting each step produces severe rightward terminal drift and broken line wraps. Only branch points—specifically `[:FORKED_TO]` edges created during time travel or branching—represent true conceptual sub-trees.
+
+### Decision
+
+We re-architect `DAGVisualizer` to use an iterative sibling rendering layout:
+1. Linear `[:NEXT]` children are rendered sequentially as siblings at the same depth and indentation level, constructed iteratively with explicit loops and no call-stack recursion.
+2. Only `[:FORKED_TO]` relationships nest child branches into indented sub-trees.
+3. README sample outputs and visualizer expectations (`tests/unit/test_readme.py`) are updated to reflect the flat, non-drifting tree layout.
+
+### Alternatives considered
+
+1. **Increase recursion limit via `sys.setrecursionlimit(10000)`:** Rejected; fragile workaround that risks hard segmentation faults / stack overflows in the C runtime and fails to resolve terminal line-wrapping from rightward drift.
+2. **Paginate or truncate tree output at N steps:** Rejected; developers inspecting agent traces require full lineage visibility without arbitrary truncation.
+3. **Graphviz or Mermaid export only:** Rejected; the terminal-native tree CLI (`relate-dag tree`) is a core feature for instant local developer inspection.
+
+### Consequences
+
+- **Positive:** Eliminates recursion limits, allowing `relate-dag tree` to render 1,500+ checkpoint runs without `RecursionError` (AC-185).
+- **Positive:** Terminal output remains readable and clean without rightward drift for linear step sequences.
+- **Negative:** Visualizer tests and README example outputs must match the updated sibling layout format.
+
+---
+
+## ADR-0028: `RELATE_*` Environment Variable Configuration
+
+Date: 2026-11-22  
+Status: Accepted
+
+### Context
+
+Configuration values for `RelateSaver` (such as the database path, WAL flush behavior, proxy timeout, and log level) were previously documented inconsistently (e.g., `"checkpoints.rl"` was mentioned as the default path in some documentation while code used `":memory:"`). In 12-factor application architectures, serverless workflows, and CLI environments, configuring checkpointer settings via standardized environment variables is essential.
+
+Additionally, configuration priority must be explicit: constructor arguments must always take precedence over environment variables, and environment variables must take precedence over defaults. When an invalid environment variable value is supplied, silently falling back to a default can mask critical configuration defects.
+
+### Decision
+
+We define a strict three-tier configuration resolution order:
+1. **Explicit constructor argument:** Used whenever provided (not `None` or sentinel).
+2. **`RELATE_*` environment variable:**
+   - `RELATE_DB_PATH` (str): target database file path or `":memory:"`.
+   - `RELATE_WAL_ENABLED` (bool): parsed from `"1"`, `"true"`, `"yes"`, `"on"` / `"0"`, `"false"`, `"no"`, `"off"` (case-insensitive).
+   - `RELATE_PROXY_TIMEOUT_SEC` (float): positive float numeric string.
+   - `RELATE_LOG_LEVEL` (str): `"DEBUG"`, `"INFO"`, `"WARNING"`, `"ERROR"`, `"CRITICAL"`.
+3. **Default value:** `db_path=":memory:"`, `wal_enabled=True`, `default_timeout=30.0`, `log_level="INFO"`.
+
+If an environment variable contains an unparseable or invalid value, initialization raises `ValueError` explicitly naming the offending variable (e.g. `ValueError("Invalid value for RELATE_PROXY_TIMEOUT_SEC: ...")`). All documentation and signatures are corrected to declare `":memory:"` as the default `db_path`.
+
+### Alternatives considered
+
+1. **Default `db_path` to `"checkpoints.rl"`:** Rejected; writing files to disk by default causes unexpected disk side-effects during testing and ephemeral runs; `":memory:"` is safe and zero-side-effect by default.
+2. **Silent fallback on invalid environment variables:** Rejected; masking configuration errors leads to silent misbehavior in production (e.g., disabling WAL or misconfiguring timeouts).
+3. **Adopting `pydantic-settings`:** Rejected; adds an unnecessary heavyweight external runtime dependency for four environment variables.
+
+### Consequences
+
+- **Positive:** Deterministic configuration resolution with transparent priority (AC-178).
+- **Positive:** Fast, clear failure when environment variables contain typos or invalid values.
+- **Positive:** Code and documentation agree that `":memory:"` is the default database path.
+
+---
+
+## ADR-0029: Forensics Lineage, Namespace Loop Detection, and Root-Cause Priority
+
+Date: 2026-11-22  
+Status: Accepted
+
+### Context
+
+Forensic analysis in `RelateForensics` (`trace_root_cause`, `detect_loops`, and argument provenance) presented subtle edge cases in complex multi-agent graphs:
+1. Lineage traversals across checkpoints could bleed into sibling threads or cross-thread forks when relationship patterns were unconstrained by thread identity.
+2. `detect_loops` constructed checkpoint sequences by sorting all thread checkpoints by `step` across all namespaces, interleaving subgraph steps and obscuring the actual chronological path.
+3. Poison pill detection in `trace_root_cause` inspected serialized state payloads for substring matches of `"poison"` and `"fault"`. Legitimate user messages or prompts containing these words were falsely flagged as poisoned state failures.
+4. On the `__error__` path (when a graph step writes an error to the `__error__` channel), antecedent tool calls far back in history could be blamed as root cause even when the failure was completely unrelated to the tool.
+
+### Decision
+
+We establish five forensic traversal and attribution rules:
+1. **Thread-constrained lineage traversal:** Lineage walks follow `[:NEXT|FORKED_TO*0..]` strictly restricted to checkpoints within the specified `thread_id` (AC-181).
+2. **Namespace-isolated root-to-leaf loop detection:** `detect_loops` constructs execution sequences by walking `[:NEXT]` edges from root to leaf separately per `checkpoint_ns`, sorting candidate node names and preserving true path order. A `threshold < 2` raises `ValueError` (AC-182, AC-188).
+3. **Channel-name only poison detection:** Poison analysis matches exclusively against the channel name (e.g., channel named `poison`); substring matching for `"poison"` or `"fault"` within serialized value text is removed (AC-183).
+4. **Root-cause priority on `__error__` path:** When execution terminates along an `__error__` path, an antecedent tool-call error is accepted as root cause only when `distance_to_error <= 1`. Causal queries break ties with `ORDER BY distance_to_error, c.checkpoint_id, tool_call_id`, and tree writes order by `w.task_id, w.idx`.
+5. **Read-only by default:** `RelateForensics` and `DAGVisualizer` open database stores with `read_only=True` by default (AC-187).
+
+### Alternatives considered
+
+1. **Global step sorting for cycle detection:** Rejected; subgraph and concurrent fan-out executions interleave step indices, producing spurious cycle warnings or missing repeating loops.
+2. **Retain regex heuristics on serialized state text:** Rejected; parsing serialized binary blobs for English words causes false-positive failure diagnoses on benign user payloads.
+3. **Unbounded tool error attribution:** Rejected; attributing a crash to a tool that failed 10 steps earlier obscures the immediate error cause on the `__error__` path.
+
+### Consequences
+
+- **Positive:** Accurate loop and cycle detection across nested subgraphs and branched threads.
+- **Positive:** Eliminates false-positive poison reports on legitimate conversational content.
+- **Positive:** Deterministic, localized root-cause attribution prioritizing proximate tool failures (`distance_to_error <= 1`).
+- **Positive:** Diagnostic tools preserve database file immutability by defaulting to `read_only=True`.
+
+---
+
+## ADR-0030: The Failure-Checkpoint Walk Follows `[:NEXT]` Edges Only
+
+Date: 2026-11-23  
+Status: Accepted  
+Amended by: [ADR-0032](#adr-0032-the-failure-checkpoint-walk-may-cross-one-forked_to-edge-after-a-put_writes-link)
+
+### Context
+
+When a tool call fails, `trace_root_cause()` reports the *failure checkpoint*: the first checkpoint, from the one linked to the call by `[:INVOKED]` onward, whose writes hold the tool's result message ([ADR-0021](#adr-0021-tool-call-root-cause-anchors-on-the-failure-checkpoint)). ADR-0021 and AC-129 define that walk along `[:NEXT]` edges, the main line of the run. The implementation reused the lineage walk from [ADR-0029](#adr-0029-forensics-lineage-namespace-loop-detection-and-root-cause-priority), which also follows `[:FORKED_TO]` edges. When someone resumes a thread from an earlier checkpoint, the tool runs again on the branch with the same call id, so the main line and the branch can both hold a result for that call at the same distance. The walk then picked whichever row the database returned first, because it ordered only by distance. The same stored data could give a different `error_checkpoint_id` and `origin_hops` from one run of the command to the next, and could name a checkpoint on a branch that did not produce the recorded outcome.
+
+### Decision
+
+- The failure-checkpoint walk starts at the `[:INVOKED]` checkpoint (distance 0) and follows outgoing `[:NEXT]` edges between checkpoints of the same thread only. It never follows `[:FORKED_TO]`.
+- Checkpoints are visited in `(distance, checkpoint_id)` order. The first one whose writes (skipping channels that start with `__` and empty blobs) hold a `ToolMessage` for the call is the failure checkpoint. If none does, or the `[:INVOKED]` checkpoint is not in the thread, the `[:INVOKED]` checkpoint is used, as ADR-0021 already says.
+- AC-181's rule (follow `[:NEXT]` and `[:FORKED_TO]`, stay in the thread) applies to walks toward ancestors: the causal query and argument provenance. It does not apply to this forward walk.
+- The thread's edges are read once per public call, with each edge's type, and shared by the ancestor walks and this forward walk. Nothing is cached between calls.
+- For the record, the causal query's tie-break that ADR-0029 calls `tool_call_id` is the pair `direct_call_id, linked_call_id`: the call reached through the checkpoint's own `[:INVOKED]` edge, then one reached through a write.
+
+### Alternatives considered
+
+1. **Keep following `[:FORKED_TO]` and only add a tie-break on `checkpoint_id`:** Rejected; the answer would be repeatable but could still name a branch checkpoint, which contradicts ADR-0021 and AC-129.
+2. **Walk the main line first and fall back to branches when it holds no result:** Rejected for now; it adds a second ordering rule for an uncommon case, and the existing fallback to the `[:INVOKED]` checkpoint already gives a stable answer.
+3. **Record the behavior as a known limitation:** Rejected; it is a determinism defect in a public report, and the fix restores the documented contract without changing stored data.
+
+### Consequences
+
+- **Positive:** `trace_root_cause()`, `failure_summary()` and the `trace-error` command give the same answer on every run for the same file.
+- **Positive:** Threads without branches, including every thread of the committed demo store, report exactly what they reported before.
+- **Positive:** Reading edges once per call removes two of the three edge reads on long threads.
+- **Negative:** When a tool's only result was recorded on a branch, the failure checkpoint is the `[:INVOKED]` checkpoint, so `origin_hops` counts from there rather than from the branch checkpoint where the tool ran.
+
+---
+
+## ADR-0031: Writes and Tool Calls Attach Only to a Checkpoint of Their Own Thread
+
+Date: 2026-11-23  
+Status: Accepted
+
+### Context
+
+`put_writes()` stores each write with the `thread_id`, `checkpoint_ns` and `checkpoint_id` from its config, then links it to a checkpoint with `[:HAS_WRITE]`, finding that checkpoint by `checkpoint_id` alone. A later `put()` links any earlier write that has the new checkpoint's id, again by id alone. Tool-call capture in `put_writes()` finds the checkpoint for the `[:INVOKED]` edge the same way.
+
+Checkpoint ids are unique across the whole file, and that is exactly why this goes wrong: there is only one checkpoint with that id, and the id-only match finds it whichever thread owns it. LangGraph's own run loop always pairs a thread with that thread's checkpoint, so normal runs are not affected. But `put_writes()` and `aput_writes()` are public methods, and a script, test helper or migration tool that calls them with thread B in the config and a checkpoint id from thread A attaches the write, and any tool call in it, to thread A. `get_tuple()` for thread A then returns thread B's write as a pending write, so resuming thread A would apply data from another conversation, and forensics on thread A would count it. LangGraph's SQLite saver keys writes by thread, namespace and checkpoint id together, so such a write is simply never seen by thread A.
+
+### Decision
+
+- `put_writes()` creates `[:HAS_WRITE]` only to a checkpoint whose `thread_id`, `checkpoint_ns` and `checkpoint_id` all equal the write's: `OPTIONAL MATCH (c:Checkpoint {checkpoint_id: $checkpoint_id}) WHERE c.thread_id = $thread_id AND c.checkpoint_ns = $checkpoint_ns`. The id stays in the node map so the lookup uses the unique constraint.
+- `put()` links earlier writes only when they belong to the same thread and namespace: `OPTIONAL MATCH (w:Write {checkpoint_id: $checkpoint_id}) WHERE w.thread_id = $thread_id AND w.checkpoint_ns = $checkpoint_ns`. Writes that legitimately arrive before their checkpoint are still linked.
+- The tool-call invocation statement matches its checkpoint with `WHERE c.thread_id = $thread_id AND c.checkpoint_ns = $checkpoint_ns`, taking both values from the config passed to `put()` or `put_writes()`. A mismatched call is then treated like any call whose checkpoint is not stored yet: it is not linked and is sent again by the next save that names a stored checkpoint of its own thread and namespace.
+- Note: the namespace guard applies to `[:INVOKED]` as well as `[:HAS_WRITE]`, as AC-190 requires; the rule of one `[:INVOKED]` edge per thread and call is unchanged and stays per thread.
+- `get_tuple()` returns as pending writes only linked writes whose `thread_id` and `checkpoint_ns` equal the checkpoint's, so files that already contain such a cross-thread link stop leaking it into a resume.
+- A mismatched write is stored, not rejected. Writes may arrive before their checkpoint is stored, so the saver cannot tell a mistake from a race without an extra read on every save, and the other LangGraph savers do not reject it either.
+
+### Alternatives considered
+
+1. **Leave it, because checkpoint ids are unique:** Rejected; uniqueness is what makes the id-only match find the other thread's checkpoint. It does not make the match safe.
+2. **Raise an error when the named checkpoint belongs to another thread:** Rejected; it needs an extra read on every `put_writes()`, and no other LangGraph saver raises here.
+3. **Migrate existing files to remove cross-thread links:** Rejected; such links come only from mismatched direct calls, and the `get_tuple()` filter already stops them from affecting a resume.
+
+### Consequences
+
+- **Positive:** One thread's resume state can no longer contain another thread's writes, matching the other LangGraph savers.
+- **Positive:** No change for writes and tool calls saved by LangGraph's own run loop, so stored runs and the demo store report the same results.
+- **Negative:** A cross-thread link already stored in an older file is still visible to forensics and is still copied into in-memory forks; only `get_tuple()` filters it.
+- **Negative:** A mismatched write is kept in the file with no link, where nothing reads it.
+
+---
+
+## ADR-0032: The Failure-Checkpoint Walk May Cross One `[:FORKED_TO]` Edge After a `put_writes()` Link
+
+Date: 2026-11-23  
+Status: Accepted
+
+### Context
+
+[ADR-0021](#adr-0021-tool-call-root-cause-anchors-on-the-failure-checkpoint) requires that forensics report the same failure checkpoint whichever save linked the tool call: `put_writes()` puts the `[:INVOKED]` edge on the checkpoint P that the requesting step ran from, and `put()` puts it on the next checkpoint Y. LangGraph runs these two saves on different threads, so either can win. [ADR-0030](#adr-0030-the-failure-checkpoint-walk-follows-next-edges-only) then limited the forward walk to `[:NEXT]` edges so that the same file always gives the same answer.
+
+That left one case where the answer still depends on the race. When someone resumes a thread from an earlier checkpoint P that already has a `[:NEXT]` child, `put()` links the new checkpoint as `P -[:FORKED_TO]-> Y`, and the tool's result is written on Y. If `put()` won, the edge is on Y and the walk reports Y. If `put_writes()` won, the edge is on P, the `[:NEXT]`-only walk goes down the old main line, finds no result for this call and falls back to P. We reproduced both layouts by calling the saver directly in each order. Two recordings of the same run then report a different `error_checkpoint_id` and `origin_hops` (AC-119).
+
+Which save placed the edge can be read from data the walk already loads. `put_writes()` stores a step's writes on the checkpoint the step ran from and links the call to that same checkpoint, so when it placed the edge, the `[:INVOKED]` checkpoint's own writes hold the `AIMessage` that requested the call. `put()` links the call to the checkpoint it creates. That checkpoint's channel values hold the `AIMessage`, but its writes come from the step that runs next (the tool and its `ToolMessage`), so they do not hold it.
+
+### Options Considered
+
+1. **Allow one `[:FORKED_TO]` hop as the first step, only when `put_writes()` placed the edge.** The branch the run actually created becomes reachable in exactly the layout that hid it. The other layout is unchanged.
+2. **Walk the main line first and fall back to branches when it holds no result** (alternative 2 in ADR-0030). This reopens a decision already made. When `put()` placed the edge it can name a branch that a later, unrelated resume created, and it adds a second ordering rule.
+3. **Record a known limitation.** No code change, but forensics stays race-dependent in exactly the resume (time-travel) case that the inspection tools are meant for.
+
+How to tell that `put_writes()` placed the edge:
+
+- a. **Look for the requesting `AIMessage` in the `[:INVOKED]` checkpoint's own writes.** The walk already reads and deserializes these rows at distance 0.
+- b. **Check that the `[:INVOKED]` checkpoint's channel values do not hold the `AIMessage`.** This needs an extra read of `checkpoint_blob` and deserializing the whole state.
+- c. **Store which save placed the edge as a property on `[:INVOKED]`.** This changes the write path and stored data (a tool call recording rule, see "Expensive to change" in the architecture), and it does nothing for files already written.
+
+### User's Chosen Architecture
+
+On 2026-11-23 the project owner chose option 1 with check (a). The owner's reasoning: it keeps the same-file determinism of ADR-0030, and it is the only option that restores race independence across recordings (ADR-0021).
+
+- **Start.** The walk starts at the `[:INVOKED]` checkpoint S at distance 0. If S is not a checkpoint of the thread, S is the answer, as before.
+- **Gate: "`put_writes()` placed the edge".** The gate is true when one of S's own writes (skipping channels that start with `__`, and empty or undeserializable blobs) is an `AIMessage`, or a list or tuple holding one, whose `tool_calls` has an entry with `id` equal to the failing call's `call_id`. These are the same message shapes that tool-call capture reads from written values (ADR-0005). Only S's writes are checked. S's `checkpoint_blob` is never read for this.
+- **Candidates.** The `[:NEXT]` chain from S, with distances as in ADR-0030. When the gate is true, every `[:FORKED_TO]` child F of S whose two ends are both checkpoints of the thread is also a candidate at distance 1, followed by the `[:NEXT]` chain from F at distance 1 plus its `[:NEXT]` hops. No other `[:FORKED_TO]` edge is ever followed. When S has several `[:FORKED_TO]` children, all of them sit at distance 1 alongside S's `[:NEXT]` child. A checkpoint reachable by more than one route keeps its smallest distance. Today every checkpoint has one parent, so this cannot happen.
+- **Selection** stays as in ADR-0030. Candidates are visited in `(distance, checkpoint_id)` order. The first whose writes hold a `ToolMessage` for the call is the failure checkpoint. If none does, the answer is S.
+- **Gate false** covers an edge placed by `put()`, or a call attached to a later checkpoint because its named checkpoint was not stored yet (ADR-0011). The walk is then exactly the ADR-0030 walk.
+- **Reads.** The thread's edges, with their types, are still read once per public call and shared by every walk in that call, and nothing is cached between calls. The branch candidates are computed in Python from those same edges. One writes read covers the `[:NEXT]` candidates and the branch candidates together. Distance-0 rows sort first, so the gate is settled before any distance-1 row is considered. Branch rows are skipped when the gate is false.
+- **Defense in depth.** The failure-checkpoint writes read, the causal query and the argument-origin writes read now also match the checkpoint's thread. The id stays in the node map, so the lookup uses the unique constraint, and the thread is checked in a `WHERE` clause (`... {checkpoint_id: pr.id}) WHERE c.thread_id = $thread_id`) rather than in the node map, which would probe the thread index on every row. Checkpoint ids are unique across the file today, and [ADR-0031](#adr-0031-writes-and-tool-calls-attach-only-to-a-checkpoint-of-their-own-thread) relies on that, so results do not change. The filter stops a lineage row from ever matching another thread's checkpoint if that uniqueness is ever lost, for example after a hand-edited or merged file.
+- **AC-189** still describes the walk when the gate is false. When the gate is true and both S's `[:NEXT]` child and a branch hold the result, the lower `checkpoint_id` wins. When only a branch holds it, that branch is reported instead of S.
+
+### Explicit Trade-offs Accepted
+
+- **Positive:** The resume case reports Y under both layouts. If `put()` won, Y is found at distance 0. If `put_writes()` won, the gate is true and Y is found at distance 1. `error_checkpoint_id` and `origin_hops` therefore no longer depend on the race (ADR-0021, AC-119).
+- **Positive:** One file still gives one answer on every run, because the ordering is unchanged.
+- **Positive:** Threads whose `[:INVOKED]` checkpoint has no `[:FORKED_TO]` child, including every thread of the committed demo store, report exactly what they reported before.
+- **Negative:** If the same call id holds a result on both the main line and a branch at distance 1 (a deterministic model, or a resume that re-runs the same call), the lower `checkpoint_id` wins, not necessarily the branch the recorded run produced. LangGraph checkpoint ids are time-ordered, so in practice the older main-line child wins.
+- **Negative:** The gate trusts message content. A node that writes back an `AIMessage` it did not produce, for example by returning the whole message history, makes the gate true for an edge that `put()` placed. This matters only when S's own writes hold no `ToolMessage` for the call and S has a branch.
+- **Negative:** When S has branches and the gate is false, the branch writes are still read in the single writes read and then discarded.
+- **Negative:** The thread filter applies to checkpoints, not writes. A cross-thread `[:HAS_WRITE]` link already stored in an older file (ADR-0031) is still read.
+- **Negative:** ADR-0030's remaining gap gets narrower but does not close. When the gate is false and the only result is on a branch, S is still reported.
+
+---
+
+## ADR-0033: RELATE_* variables are parsed only when used, None means unset, and a timeout reports whether the command started
+
+Date: 2026-11-23
+Status: Accepted
+
+This amends [ADR-0028](#adr-0028-relate_-environment-variable-configuration), AC-178 (configuration) and AC-179 (proxy timeout).
+
+### Context
+
+Four defects came out of a review of how `RelateSaver` and `RelateThreadProxy` handle configuration and timeouts:
+
+- The README says a `RELATE_*` variable is read only when it is used. The saver parsed all four on every construction, so an invalid `RELATE_LOG_LEVEL` broke a saver whose caller had passed `log_level` explicitly.
+- `RelateSaver(db_path=None)` created a database file named `None` instead of using `RELATE_DB_PATH` or the default.
+- Every `RelateSaver` set the level of the `langgraph_checkpoint_relate` logger, even when nothing was configured, which overwrote the level the application had chosen for that logger.
+- AC-179 cancelled the future when the caller's timeout expired. Cancelling cannot stop a command the worker has already started, so that command ran and committed while the caller was told it had failed.
+
+### Decision
+
+- **`None` means unset.** For `db_path`, `wal_enabled`, `default_timeout` and `log_level`, an argument that is `None` counts as not passed, and resolution continues with the `RELATE_*` variable and then the default (AC-194).
+- **Parse when used.** A `RELATE_*` variable is parsed only when its argument is not passed. An invalid value raises `ValueError` naming the variable only in that case (AC-194). The message texts are unchanged.
+- **Logger level only when configured.** The package logger's level is set only when `log_level` or `RELATE_LOG_LEVEL` is given. Otherwise it is left unchanged. `RELATE_LOG_LEVEL` accepts `DEBUG`, `INFO`, `WARNING`, `ERROR` and `CRITICAL`.
+- **A timeout reports whether the command started.** When a caller's timeout expires for a single execute, a batch or a flush, the proxy tries to cancel the command's future. If that succeeds, the worker has not started the command and never will, and `RelateConcurrencyError` says it was not executed. If it fails, the worker has started the command and it runs to completion, and `RelateConcurrencyError` says the operation timed out while running and may have committed (AC-195).
+
+### Options Considered
+
+1. **Keep eager parsing.** Rejected: it contradicts the README environment-variables section.
+2. **Keep `default_timeout=None` meaning "no timeout".** Rejected: nothing in `src`, tests, examples or benchmarks uses it, and the architecture already says `None` falls back to the environment variable or default.
+3. **Abort a running write on timeout.** Rejected: the single writer thread cannot interrupt `conn.execute` safely.
+
+### Explicit Trade-offs Accepted
+
+- **Positive:** An explicit argument fully replaces its environment variable, so an unrelated bad variable cannot break a caller that did not need it.
+- **Positive:** The application's own level for the package logger survives creating a saver.
+- **Positive:** A caller that sees "not executed" can retry safely. "May have committed" tells it to check the store before retrying.
+- **Negative:** `default_timeout=None` now means the environment or default timeout (30.0 s), not no timeout. Code that passed `None` to wait forever now times out.
+- **Negative:** An invalid `RELATE_*` variable that the caller's arguments cover is no longer reported at all.
+- **Negative:** After a timeout on a running command, the caller cannot tell whether it committed without reading the store.

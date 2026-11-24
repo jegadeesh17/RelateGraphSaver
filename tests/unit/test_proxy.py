@@ -426,3 +426,166 @@ class TestProxyFlushControl:
         assert any(
             r.levelno == logging.WARNING and "disk full" in r.getMessage() for r in caplog.records
         )
+
+
+class _GateConnection(_SpyConnection):
+    """Spy connection that blocks a marked statement, or flush, until a test releases it."""
+
+    MARK = "AC195"
+
+    def __init__(self, inner: Any, events: list[str]) -> None:
+        super().__init__(inner, events)
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.block_flush = False
+        self.executed: list[str] = []
+
+    def execute(self, cypher: str, *args: Any) -> Any:
+        if self.MARK in cypher:
+            self.executed.append(cypher)
+            self.started.set()
+            assert self.release.wait(timeout=10.0), "test never released the gated statement"
+        return self._inner.execute(cypher, *args)
+
+    def flush(self) -> None:
+        if self.block_flush:
+            self.started.set()
+            assert self.release.wait(timeout=10.0), "test never released the gated flush"
+        super().flush()
+
+
+_GATED_CREATE = "CREATE (:Gated {tag: 'AC195'})"
+_GATED_COUNT = "MATCH (g:Gated) RETURN count(g) AS n"
+
+
+def _gate_proxy(wal_enabled: bool = False) -> tuple[RelateThreadProxy, _GateConnection]:
+    conns: list[_GateConnection] = []
+
+    def factory(db_path: str) -> _GateConnection:
+        conn = _GateConnection(relate.connect(database=db_path), [])
+        conns.append(conn)
+        return conn
+
+    proxy = RelateThreadProxy(
+        db_path=":memory:", wal_enabled=wal_enabled, connection_factory=factory
+    )
+    return proxy, conns[0]
+
+
+class TestProxyTimeoutReportsStartedCommand:
+    """AC-195, ADR-0033: a timeout says whether the command started and may have committed."""
+
+    def test_ac195_running_execute_may_have_committed(self) -> None:
+        """AC-195: a started single write runs to completion and the error says so."""
+        proxy, conn = _gate_proxy()
+        try:
+            with pytest.raises(RelateConcurrencyError) as exc_info:
+                proxy.execute_write(_GATED_CREATE, timeout=0.3)
+            assert conn.started.is_set()
+            assert "may have committed" in str(exc_info.value)
+            assert "not executed" not in str(exc_info.value)
+
+            conn.release.set()
+            assert proxy.execute_read(_GATED_COUNT, timeout=10.0) == [{"n": 1}]
+        finally:
+            conn.release.set()
+            proxy.abort()
+
+    def test_ac195_running_batch_may_have_committed(self) -> None:
+        """AC-195: a started batch commits after the timeout and the error says it may have."""
+        proxy, conn = _gate_proxy()
+        try:
+            with pytest.raises(RelateConcurrencyError) as exc_info:
+                proxy.execute_batch([(_GATED_CREATE, {}), (_GATED_CREATE, {})], timeout=0.3)
+            assert conn.started.is_set()
+            assert "may have committed" in str(exc_info.value)
+            assert "2 statements" in str(exc_info.value)
+
+            conn.release.set()
+            assert proxy.execute_read(_GATED_COUNT, timeout=10.0) == [{"n": 2}]
+            assert "commit" in conn._events
+        finally:
+            conn.release.set()
+            proxy.abort()
+
+    def test_ac195_running_flush_may_have_committed(self) -> None:
+        """AC-195: a started flush runs to completion and the error says it may have committed."""
+        proxy, conn = _gate_proxy(wal_enabled=True)
+        try:
+            conn._events.clear()
+            conn.block_flush = True
+            with pytest.raises(RelateConcurrencyError) as exc_info:
+                proxy.flush(timeout=0.3)
+            assert conn.started.is_set()
+            assert "may have committed" in str(exc_info.value)
+
+            conn.block_flush = False
+            conn.release.set()
+            proxy.execute_read("RETURN 1 AS one", timeout=10.0)
+            assert conn._events == ["flush"]
+        finally:
+            conn.release.set()
+            proxy.abort()
+
+    def test_ac195_queued_execute_is_not_executed(self) -> None:
+        """AC-195: a command still queued is cancelled, never runs, and the error says so."""
+        proxy, conn = _gate_proxy()
+        try:
+            stall = threading.Event()
+            proxy._queue.put(lambda: stall.wait(timeout=10.0))
+            with pytest.raises(RelateConcurrencyError) as exc_info:
+                proxy.execute_write(_GATED_CREATE, timeout=0.05)
+            assert "not executed" in str(exc_info.value)
+            assert "may have committed" not in str(exc_info.value)
+
+            stall.set()
+            conn.release.set()
+            assert proxy.execute_read(_GATED_COUNT, timeout=10.0) == [{"n": 0}]
+            assert conn.executed == []
+        finally:
+            conn.release.set()
+            proxy.abort()
+
+    def test_ac195_queued_batch_is_not_executed(self) -> None:
+        """AC-195: a batch still queued is cancelled and never runs."""
+        proxy, conn = _gate_proxy()
+        try:
+            stall = threading.Event()
+            proxy._queue.put(lambda: stall.wait(timeout=10.0))
+            with pytest.raises(RelateConcurrencyError) as exc_info:
+                proxy.execute_batch([(_GATED_CREATE, {})], timeout=0.05)
+            assert "not executed" in str(exc_info.value)
+
+            stall.set()
+            conn.release.set()
+            assert proxy.execute_read(_GATED_COUNT, timeout=10.0) == [{"n": 0}]
+            assert conn.executed == []
+        finally:
+            conn.release.set()
+            proxy.abort()
+
+    def test_ac195_queued_flush_is_not_executed(self) -> None:
+        """AC-195: a flush still queued is cancelled and never runs."""
+        proxy, conn = _gate_proxy(wal_enabled=True)
+        try:
+            conn._events.clear()
+            stall = threading.Event()
+            proxy._queue.put(lambda: stall.wait(timeout=10.0))
+            with pytest.raises(RelateConcurrencyError) as exc_info:
+                proxy.flush(timeout=0.05)
+            assert "not executed" in str(exc_info.value)
+
+            stall.set()
+            proxy.execute_read("RETURN 1 AS one", timeout=10.0)
+            assert conn._events == []
+        finally:
+            proxy.abort()
+
+    def test_ac195_invalid_statement_still_rejected_before_queueing(self) -> None:
+        """AC-195: invalid input is rejected with the validation error, not a timeout error."""
+        proxy, _conn = _gate_proxy()
+        try:
+            with pytest.raises(RelateCheckpointError, match="non-empty string"):
+                proxy.execute("   ", timeout=0.05)
+        finally:
+            proxy.abort()

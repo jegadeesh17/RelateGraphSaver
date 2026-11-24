@@ -673,3 +673,46 @@ def test_adr14_tool_call_data_survives_close_and_reopen(tmp_path: Path) -> None:
         assert _edges(reader) == sorted([("chk-r1", first), ("chk-r2", second)])
     finally:
         reader.close()
+
+
+def test_ac190_tool_call_naming_another_threads_checkpoint_attaches_to_its_own_later(
+    saver: RelateSaver,
+) -> None:
+    """AC-190: a mismatched call adds no edge to the other thread, then attaches in its own."""
+    call_id = _call_id()
+    _put(saver, "thread-a", "chk-190-a", {})
+    message = _ai((call_id, "search", {"q": "x"}))
+
+    saver.put_writes(_config("thread-b", "chk-190-a"), [("messages", [message])], "task-1")
+
+    assert set(_tool_nodes(saver)) == {call_id}
+    assert _edges(saver) == []
+
+    _put(saver, "thread-b", "chk-190-b", {"messages": [message]}, step=1)
+
+    assert _edges(saver) == [("chk-190-b", call_id)]
+
+
+def test_ac190_tool_call_naming_another_namespace_attaches_in_a_matching_put(
+    saver: RelateSaver,
+) -> None:
+    """AC-190: a call naming a same-thread checkpoint of another namespace adds no edge."""
+    call_id = _call_id()
+    _put(saver, "thread-ns", "chk-190-root", {})
+    message = _ai((call_id, "search", {"q": "x"}))
+    sub_config: RunnableConfig = {
+        "configurable": {
+            "thread_id": "thread-ns",
+            "checkpoint_ns": "sub",
+            "checkpoint_id": "chk-190-root",
+        }
+    }
+
+    saver.put_writes(sub_config, [("messages", [message])], "task-1")
+
+    assert set(_tool_nodes(saver)) == {call_id}
+    assert _edges(saver) == []
+
+    _put(saver, "thread-ns", "chk-190-next", {"messages": [message]}, step=1)
+
+    assert _edges(saver) == [("chk-190-next", call_id)]

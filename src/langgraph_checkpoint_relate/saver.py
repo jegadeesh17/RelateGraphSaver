@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import builtins
 import logging
+import math
+import os
 import random
 import uuid
 from collections.abc import AsyncIterator, Iterable, Iterator, Sequence
@@ -31,7 +33,12 @@ from langgraph.checkpoint.base import (
 )
 from langgraph.checkpoint.serde.base import SerializerProtocol
 
-from langgraph_checkpoint_relate.errors import RelateCheckpointError, RelateReadOnlyError
+from langgraph_checkpoint_relate.errors import (
+    RelateCheckpointError,
+    RelateConcurrencyError,
+    RelateConnectionError,
+    RelateReadOnlyError,
+)
 from langgraph_checkpoint_relate.proxy import RelateThreadProxy
 from langgraph_checkpoint_relate.serde import RelateStateSerializer, default_serializer
 from langgraph_checkpoint_relate.tool_calls import (
@@ -42,6 +49,62 @@ from langgraph_checkpoint_relate.tool_calls import (
 )
 
 logger = logging.getLogger(__name__)
+
+_UNSET_DB_PATH: Any = object()
+_UNSET_WAL: Any = object()
+_UNSET_TIMEOUT: Any = object()
+_UNSET_LOG_LEVEL: Any = object()
+
+_TRUTHY_STRINGS = frozenset({"1", "true", "yes", "on"})
+_FALSY_STRINGS = frozenset({"0", "false", "no", "off"})
+_VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+
+
+def _wal_from_env() -> bool:
+    """Return RELATE_WAL_ENABLED parsed as a bool, or True when it is not set (AC-194)."""
+    env_wal = os.environ.get("RELATE_WAL_ENABLED")
+    if env_wal is None:
+        return True
+    norm_wal = env_wal.strip().lower()
+    if norm_wal in _TRUTHY_STRINGS:
+        return True
+    if norm_wal in _FALSY_STRINGS:
+        return False
+    raise ValueError(
+        f"Invalid value for RELATE_WAL_ENABLED: {env_wal!r}. "
+        "Must be one of: '1', 'true', 'yes', 'on', '0', 'false', 'no', 'off'."
+    )
+
+
+def _timeout_from_env() -> float:
+    """Return RELATE_PROXY_TIMEOUT_SEC as a float, or 30.0 when it is not set (AC-194)."""
+    env_timeout_str = os.environ.get("RELATE_PROXY_TIMEOUT_SEC")
+    if env_timeout_str is None:
+        return 30.0
+    try:
+        parsed_val = float(env_timeout_str)
+        if parsed_val <= 0 or not math.isfinite(parsed_val):
+            raise ValueError()
+    except (ValueError, TypeError):
+        raise ValueError(
+            f"Invalid value for RELATE_PROXY_TIMEOUT_SEC: {env_timeout_str!r} "
+            "(must be a positive float)"
+        ) from None
+    return parsed_val
+
+
+def _log_level_from_env() -> str | None:
+    """Return RELATE_LOG_LEVEL normalized, or None when it is not set (AC-194)."""
+    env_log_level = os.environ.get("RELATE_LOG_LEVEL")
+    if env_log_level is None:
+        return None
+    norm_env_log_level = env_log_level.strip().upper()
+    if norm_env_log_level not in _VALID_LOG_LEVELS:
+        raise ValueError(
+            f"Invalid value for RELATE_LOG_LEVEL: {env_log_level!r}. "
+            "Must be one of: DEBUG, INFO, WARNING, ERROR, CRITICAL."
+        )
+    return norm_env_log_level
 
 
 def _utc_now_iso() -> str:
@@ -72,20 +135,35 @@ class RelateSaver(BaseCheckpointSaver[str]):
 
     def __init__(
         self,
-        db_path: str | RelateThreadProxy = ":memory:",
+        db_path: str | RelateThreadProxy | Any = _UNSET_DB_PATH,
         *,
-        wal_enabled: bool = True,
+        wal_enabled: bool | Any = _UNSET_WAL,
         proxy: RelateThreadProxy | None = None,
         serde: RelateStateSerializer | SerializerProtocol | None = None,
         connection_factory: Any | None = None,
         read_only: bool = False,
+        default_timeout: float | None | Any = _UNSET_TIMEOUT,
+        log_level: str | None | Any = _UNSET_LOG_LEVEL,
     ) -> None:
         """Initialize RelateSaver checkpointer.
+
+        Resolves configuration using a strict 3-tier hierarchy:
+        1. Explicit constructor argument (an argument passed as None counts as not passed)
+        2. RELATE_* environment variable (RELATE_DB_PATH, RELATE_WAL_ENABLED,
+           RELATE_PROXY_TIMEOUT_SEC, RELATE_LOG_LEVEL)
+        3. Built-in defaults (db_path=":memory:", wal_enabled=True,
+           default_timeout=30.0, log_level="INFO")
+
+        A RELATE_* variable is parsed only when its argument is not passed, so an invalid
+        value for a variable the saver does not use never raises (AC-194, ADR-0033). The
+        level of the package logger is set only when log_level or RELATE_LOG_LEVEL is
+        given; otherwise the logger is left unchanged and ``self.log_level`` reports "INFO".
 
         Args:
             db_path: Path to the embedded Relate database file (default: ":memory:").
                 Can also be an existing RelateThreadProxy instance.
-            wal_enabled: Whether to enable Write-Ahead Logging for file-based databases.
+            wal_enabled: Whether to enable Write-Ahead Logging for file-based databases
+                (default: True).
             proxy: Optional pre-configured RelateThreadProxy actor instance.
             serde: Optional custom serializer protocol (defaults to RelateStateSerializer).
             connection_factory: Optional custom connection factory for driver injection.
@@ -93,20 +171,80 @@ class RelateSaver(BaseCheckpointSaver[str]):
                 byte-identical: no schema setup, no flush, and writes raise
                 RelateReadOnlyError. With a passed proxy, the saver takes its
                 read-only state from that proxy.
+            default_timeout: Optional proxy operation timeout in seconds (default: 30.0).
+                None falls back to RELATE_PROXY_TIMEOUT_SEC, then 30.0; it does not
+                disable the timeout.
+            log_level: Optional logging level name (default: "INFO").
 
         Raises:
             ValueError: If read_only is true with ":memory:" or with a writable proxy.
+            ValueError: If a RELATE_* environment variable the saver uses (its argument is
+                not passed) contains an invalid value.
         """
-        self.serde: RelateStateSerializer | Any = serde or default_serializer
-        super().__init__(serde=self.serde)
+        # Resolution: explicit argument (None counts as not passed) -> RELATE_* variable ->
+        # default. A variable is parsed only when its argument is not passed (AC-178,
+        # AC-194, ADR-0028, ADR-0033).
+        if db_path is _UNSET_DB_PATH or db_path is None:
+            resolved_db_path: Any = os.environ.get("RELATE_DB_PATH", ":memory:")
+        else:
+            resolved_db_path = db_path
+
+        if wal_enabled is _UNSET_WAL or wal_enabled is None:
+            resolved_wal = _wal_from_env()
+        else:
+            resolved_wal = bool(wal_enabled)
+
+        resolved_timeout: float
+        if default_timeout is _UNSET_TIMEOUT or default_timeout is None:
+            resolved_timeout = _timeout_from_env()
+        else:
+            try:
+                parsed_timeout = float(default_timeout)
+                if parsed_timeout <= 0 or not math.isfinite(parsed_timeout):
+                    raise ValueError()
+                resolved_timeout = parsed_timeout
+            except (ValueError, TypeError):
+                raise ValueError(
+                    f"Invalid default_timeout: {default_timeout!r} (must be a positive float)"
+                ) from None
+
+        # The package logger level is set only when log_level or RELATE_LOG_LEVEL is given.
+        configured_log_level: str | None
+        if log_level is _UNSET_LOG_LEVEL or log_level is None:
+            configured_log_level = _log_level_from_env()
+        else:
+            norm_log = str(log_level).strip().upper()
+            if norm_log not in _VALID_LOG_LEVELS:
+                raise ValueError(
+                    f"Invalid log_level: {log_level!r}. "
+                    "Must be one of: DEBUG, INFO, WARNING, ERROR, CRITICAL."
+                )
+            configured_log_level = norm_log
+
+        self.log_level = configured_log_level or "INFO"
+        if configured_log_level is not None:
+            lvl = getattr(logging, configured_log_level)
+            logger.setLevel(lvl)
+            logging.getLogger("langgraph_checkpoint_relate").setLevel(lvl)
+
+        if serde is None:
+            resolved_serde = default_serializer
+        elif isinstance(serde, RelateStateSerializer):
+            resolved_serde = serde
+        else:
+            resolved_serde = RelateStateSerializer(inner_serializer=serde)
+        self.serde: RelateStateSerializer | Any = resolved_serde
+        super().__init__(serde=resolved_serde)
         self._applied_tool_calls = AppliedToolCalls()
 
-        passed_proxy = db_path if isinstance(db_path, RelateThreadProxy) else proxy
+        passed_proxy = (
+            resolved_db_path if isinstance(resolved_db_path, RelateThreadProxy) else proxy
+        )
         if read_only:
             if passed_proxy is not None:
                 if getattr(passed_proxy, "read_only", False) is not True:
                     raise ValueError("read_only=True requires a read-only proxy")
-            elif str(db_path) == ":memory:":
+            elif str(resolved_db_path) == ":memory:":
                 raise ValueError(
                     "read_only=True requires a file path; ':memory:' has nothing to inspect"
                 )
@@ -116,13 +254,15 @@ class RelateSaver(BaseCheckpointSaver[str]):
             else read_only
         )
 
-        if isinstance(db_path, RelateThreadProxy):
-            self.proxy = db_path
-            self.db_path = db_path.db_path
+        if isinstance(resolved_db_path, RelateThreadProxy):
+            self.proxy = resolved_db_path
+            self.db_path = resolved_db_path.db_path
             self._owns_proxy = False
             self._connection_factory = connection_factory or getattr(
-                db_path, "_connection_factory", None
+                resolved_db_path, "_connection_factory", None
             )
+            self.wal_enabled = getattr(resolved_db_path, "wal_enabled", resolved_wal)
+            self.default_timeout = getattr(resolved_db_path, "default_timeout", resolved_timeout)
         elif proxy is not None:
             self.proxy = proxy
             self.db_path = proxy.db_path
@@ -130,14 +270,19 @@ class RelateSaver(BaseCheckpointSaver[str]):
             self._connection_factory = connection_factory or getattr(
                 proxy, "_connection_factory", None
             )
+            self.wal_enabled = getattr(proxy, "wal_enabled", resolved_wal)
+            self.default_timeout = getattr(proxy, "default_timeout", resolved_timeout)
         else:
-            self.db_path = str(db_path)
+            self.db_path = str(resolved_db_path)
             self._connection_factory = connection_factory
+            self.wal_enabled = resolved_wal
+            self.default_timeout = resolved_timeout
             self.proxy = RelateThreadProxy(
                 db_path=self.db_path,
-                wal_enabled=wal_enabled,
+                wal_enabled=resolved_wal,
                 connection_factory=connection_factory,
                 auto_init_schema=True,
+                default_timeout=resolved_timeout,
                 read_only=read_only,
             )
             self._owns_proxy = True
@@ -220,18 +365,12 @@ class RelateSaver(BaseCheckpointSaver[str]):
         parent_checkpoint_id: str | None = None
         raw_parent = dict(checkpoint).get("parent_checkpoint_id")
 
-        if (
-            isinstance(metadata, dict)
-            and "parents" in metadata
-            and isinstance(metadata["parents"], dict)
-            and metadata["parents"]
-        ):
-            ns_parent = metadata["parents"].get(checkpoint_ns)
-            parent_checkpoint_id = str(ns_parent) if ns_parent else None
+        if parent_candidate:
+            parent_checkpoint_id = str(parent_candidate)
         elif raw_parent:
             parent_checkpoint_id = str(raw_parent)
-        elif parent_candidate:
-            parent_checkpoint_id = str(parent_candidate)
+        else:
+            parent_checkpoint_id = None
 
         if parent_checkpoint_id == checkpoint_id:
             parent_checkpoint_id = None
@@ -275,6 +414,7 @@ class RelateSaver(BaseCheckpointSaver[str]):
             "FOREACH (_ IN CASE WHEN p IS NOT NULL AND next_count = 0 AND p.thread_id = c.thread_id AND p.checkpoint_ns = c.checkpoint_ns THEN [1] ELSE [] END | CREATE (p)-[:NEXT]->(c)) "
             "WITH c "
             "OPTIONAL MATCH (w:Write {checkpoint_id: $checkpoint_id}) "
+            "WHERE w.thread_id = $thread_id AND w.checkpoint_ns = $checkpoint_ns "
             "FOREACH (_ IN CASE WHEN w IS NOT NULL THEN [1] ELSE [] END | MERGE (c)-[:HAS_WRITE]->(w))"
         )
         params = {
@@ -296,6 +436,7 @@ class RelateSaver(BaseCheckpointSaver[str]):
             self._capture_tool_calls(
                 values=channel_values.values(),
                 thread_id=thread_id,
+                checkpoint_ns=checkpoint_ns,
                 checkpoint_id=checkpoint_id,
             )
 
@@ -358,9 +499,10 @@ class RelateSaver(BaseCheckpointSaver[str]):
             write_idx = WRITES_IDX_MAP.get(channel, idx)
             write_blob = self.serde.dumps(value)
             write_id = f"{thread_id}:{checkpoint_ns}:{checkpoint_id_str}:{task_id_str}:{write_idx}"
+            set_clause = "SET" if channel in WRITES_IDX_MAP else "ON CREATE SET"
             stmt = (
-                "MERGE (w:Write {write_id: $write_id}) "
-                "SET w.thread_id = $thread_id, "
+                f"MERGE (w:Write {{write_id: $write_id}}) "
+                f"{set_clause} w.thread_id = $thread_id, "
                 "    w.checkpoint_ns = $checkpoint_ns, "
                 "    w.checkpoint_id = $checkpoint_id, "
                 "    w.task_id = $task_id, "
@@ -371,6 +513,7 @@ class RelateSaver(BaseCheckpointSaver[str]):
                 "    w.created_at = $created_at "
                 "WITH w "
                 "OPTIONAL MATCH (c:Checkpoint {checkpoint_id: $checkpoint_id}) "
+                "WHERE c.thread_id = $thread_id AND c.checkpoint_ns = $checkpoint_ns "
                 "FOREACH (_ IN CASE WHEN c IS NOT NULL THEN [1] ELSE [] END | MERGE (c)-[:HAS_WRITE]->(w))"
             )
             params = {
@@ -392,6 +535,7 @@ class RelateSaver(BaseCheckpointSaver[str]):
         self._capture_tool_calls(
             values=[value for _, value in writes],
             thread_id=thread_id,
+            checkpoint_ns=checkpoint_ns,
             checkpoint_id=checkpoint_id_str,
         )
 
@@ -399,6 +543,7 @@ class RelateSaver(BaseCheckpointSaver[str]):
         self,
         values: Iterable[Any],
         thread_id: str,
+        checkpoint_ns: str,
         checkpoint_id: str,
     ) -> None:
         """Record new tool calls found in saved values as :ToolCall nodes (best effort).
@@ -417,6 +562,7 @@ class RelateSaver(BaseCheckpointSaver[str]):
             statements = build_tool_call_statements(
                 plan.events,
                 thread_id=thread_id,
+                checkpoint_ns=checkpoint_ns,
                 checkpoint_id=checkpoint_id,
                 serde=self.serde,
                 created_at=_utc_now_iso(),
@@ -454,12 +600,12 @@ class RelateSaver(BaseCheckpointSaver[str]):
 
         checkpoint_id = get_checkpoint_id(config)
         checkpoint_ns_raw = configurable.get("checkpoint_ns")
-        checkpoint_ns = str(checkpoint_ns_raw) if checkpoint_ns_raw is not None else None
+        checkpoint_ns = str(checkpoint_ns_raw) if checkpoint_ns_raw is not None else ""
 
         if checkpoint_id:
             query = (
                 "MATCH (c:Checkpoint {thread_id: $thread_id, checkpoint_id: $checkpoint_id}) "
-                "WHERE ($checkpoint_ns IS NULL OR c.checkpoint_ns = $checkpoint_ns) "
+                "WHERE c.checkpoint_ns = $checkpoint_ns "
                 "RETURN c.checkpoint_id AS checkpoint_id, "
                 "       c.thread_id AS thread_id, "
                 "       c.checkpoint_ns AS checkpoint_ns, "
@@ -479,7 +625,7 @@ class RelateSaver(BaseCheckpointSaver[str]):
         else:
             query = (
                 "MATCH (c:Checkpoint {thread_id: $thread_id}) "
-                "WHERE ($checkpoint_ns IS NULL OR c.checkpoint_ns = $checkpoint_ns) "
+                "WHERE c.checkpoint_ns = $checkpoint_ns "
                 "RETURN c.checkpoint_id AS checkpoint_id, "
                 "       c.thread_id AS thread_id, "
                 "       c.checkpoint_ns AS checkpoint_ns, "
@@ -489,7 +635,7 @@ class RelateSaver(BaseCheckpointSaver[str]):
                 "       c.metadata_blob AS metadata_blob, "
                 "       c.state_hash AS state_hash, "
                 "       c.created_at AS created_at "
-                "ORDER BY c.step DESC, c.created_at DESC "
+                "ORDER BY c.checkpoint_id DESC "
                 "LIMIT 1"
             )
             params = {
@@ -499,6 +645,8 @@ class RelateSaver(BaseCheckpointSaver[str]):
 
         try:
             records = self.proxy.execute_read(query, params)
+        except (RelateConnectionError, RelateConcurrencyError):
+            raise
         except RelateCheckpointError:
             return None
 
@@ -526,12 +674,12 @@ class RelateSaver(BaseCheckpointSaver[str]):
         # Retrieve any pending writes associated with this checkpoint
         writes_query = (
             "MATCH (c:Checkpoint {thread_id: $thread_id, checkpoint_id: $checkpoint_id})-[:HAS_WRITE]->(w:Write) "
-            "WHERE w.checkpoint_ns = $checkpoint_ns "
+            "WHERE w.thread_id = c.thread_id AND w.checkpoint_ns = c.checkpoint_ns "
             "RETURN w.task_id AS task_id, "
             "       w.channel AS channel, "
             "       w.write_blob AS write_blob, "
             "       w.idx AS idx "
-            "ORDER BY w.idx ASC"
+            "ORDER BY w.task_id, w.idx"
         )
         writes_params = {
             "thread_id": thread_id,
@@ -607,11 +755,19 @@ class RelateSaver(BaseCheckpointSaver[str]):
 
         checkpoint_id = get_checkpoint_id(config) if config else None
 
+        # Extract target before checkpoint id if specified (AC-175, ADR-0026)
+        before_id: str | None = None
+        if isinstance(before, dict):
+            before_id = get_checkpoint_id(before)
+        elif isinstance(before, str) and before.strip():
+            before_id = before.strip()
+
         query = (
             "MATCH (c:Checkpoint) "
             "WHERE ($thread_id IS NULL OR c.thread_id = $thread_id) "
             "  AND ($checkpoint_ns IS NULL OR c.checkpoint_ns = $checkpoint_ns) "
             "  AND ($checkpoint_id IS NULL OR c.checkpoint_id = $checkpoint_id) "
+            "  AND ($before IS NULL OR c.checkpoint_id < $before) "
             "RETURN c.checkpoint_id AS checkpoint_id, "
             "       c.thread_id AS thread_id, "
             "       c.checkpoint_ns AS checkpoint_ns, "
@@ -621,70 +777,29 @@ class RelateSaver(BaseCheckpointSaver[str]):
             "       c.metadata_blob AS metadata_blob, "
             "       c.state_hash AS state_hash, "
             "       c.created_at AS created_at "
-            "ORDER BY c.step DESC, c.created_at DESC"
+            "ORDER BY c.checkpoint_id DESC"
         )
         params: dict[str, Any] = {
             "thread_id": thread_id,
             "checkpoint_ns": checkpoint_ns,
             "checkpoint_id": checkpoint_id,
+            "before": before_id,
         }
 
         try:
             rows = self.proxy.execute_read(query, params)
+        except (RelateConnectionError, RelateConcurrencyError):
+            raise
         except RelateCheckpointError:
             return
-
-        # Extract target before checkpoint id if specified
-        before_id: str | None = None
-        if isinstance(before, dict):
-            before_id = get_checkpoint_id(before)
-        elif isinstance(before, str) and before.strip():
-            before_id = before.strip()
-
-        before_step: int | None = None
-        before_created_at: str | None = None
-        if before_id:
-            for r in rows:
-                if r["checkpoint_id"] == before_id:
-                    before_step = int(r["step"])
-                    before_created_at = str(r["created_at"])
-                    break
-            if before_step is None:
-                try:
-                    b_query = (
-                        "MATCH (c:Checkpoint {checkpoint_id: $cid}) "
-                        "RETURN c.step AS step, c.created_at AS created_at "
-                        "LIMIT 1"
-                    )
-                    b_rows = self.proxy.execute_read(b_query, {"cid": before_id})
-                    if b_rows:
-                        before_step = int(b_rows[0]["step"])
-                        before_created_at = str(b_rows[0]["created_at"])
-                except RelateCheckpointError:
-                    pass
 
         yielded_count = 0
         for r in rows:
             cid = str(r["checkpoint_id"])
-            step = int(r["step"])
-            created_at = str(r["created_at"])
 
-            # Filter by before checkpoint boundary
-            if before_id:
-                if cid == before_id:
-                    continue
-                if before_step is not None:
-                    if step > before_step:
-                        continue
-                    if (
-                        step == before_step
-                        and before_created_at is not None
-                        and created_at >= before_created_at
-                    ):
-                        continue
-                else:
-                    if cid >= before_id:
-                        continue
+            # Filter by before checkpoint boundary (AC-175, ADR-0026)
+            if before_id and cid >= before_id:
+                continue
 
             metadata_bytes = _extract_bytes(r["metadata_blob"])
             metadata = self.serde.loads(metadata_bytes)
