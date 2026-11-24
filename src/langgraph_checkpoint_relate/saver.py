@@ -60,6 +60,18 @@ _FALSY_STRINGS = frozenset({"0", "false", "no", "off"})
 _VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 
 
+def _db_path_from_env() -> str:
+    """Return RELATE_DB_PATH, or ':memory:' when it is not set (AC-178, AC-199)."""
+    env_db_path = os.environ.get("RELATE_DB_PATH")
+    if env_db_path is None:
+        return ":memory:"
+    if not env_db_path.strip():
+        raise ValueError(
+            f"Invalid value for RELATE_DB_PATH: {env_db_path!r} (must be a non-empty path)"
+        )
+    return env_db_path
+
+
 def _wal_from_env() -> bool:
     """Return RELATE_WAL_ENABLED parsed as a bool, or True when it is not set (AC-194)."""
     env_wal = os.environ.get("RELATE_WAL_ENABLED")
@@ -185,7 +197,7 @@ class RelateSaver(BaseCheckpointSaver[str]):
         # default. A variable is parsed only when its argument is not passed (AC-178,
         # AC-194, ADR-0028, ADR-0033).
         if db_path is _UNSET_DB_PATH or db_path is None:
-            resolved_db_path: Any = os.environ.get("RELATE_DB_PATH", ":memory:")
+            resolved_db_path: Any = _db_path_from_env()
         else:
             resolved_db_path = db_path
 

@@ -371,6 +371,16 @@ def test_env_var_db_path_takes_precedence_over_default_ac_178(
         assert saver_default.db_path == ":memory:"
 
 
+@pytest.mark.parametrize("value", ["", "   "])
+def test_empty_relate_db_path_is_rejected_ac_199(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """AC-199: an empty or whitespace-only RELATE_DB_PATH is rejected when db_path is not passed."""
+    monkeypatch.setenv("RELATE_DB_PATH", value)
+    with pytest.raises(ValueError, match="RELATE_DB_PATH"):
+        RelateSaver()
+
+
 def test_explicit_wal_enabled_takes_precedence_over_env_var_ac_178(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
