@@ -296,12 +296,13 @@ class RelateThreadProxy:
                         else self._conn.execute(cmd.cypher)
                     )
                     records = cur.fetchall() if hasattr(cur, "fetchall") else []
-                    if hasattr(self._conn, "commit") and not getattr(
-                        self._conn, "autocommit", True
-                    ):
+                    autocommit = getattr(self._conn, "autocommit", True)
+                    if hasattr(self._conn, "commit") and not autocommit:
                         self._conn.commit()
-                    # In autocommit mode the statement is already committed by execute().
-                    committed = True
+                        committed = True
+                    elif autocommit:
+                        # AC-198: in autocommit mode execute() has already committed the statement.
+                        committed = True
                     if self.wal_enabled and hasattr(self._conn, "flush"):
                         self._conn.flush()
             else:

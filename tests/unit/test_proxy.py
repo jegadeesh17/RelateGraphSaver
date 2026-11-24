@@ -347,6 +347,42 @@ def _spy_proxy(
     )
 
 
+class _NoCommitConnection:
+    """Connection that reports autocommit=False and has no commit(); flush fails once armed."""
+
+    def __init__(self, inner: Any, events: list[str]) -> None:
+        self._inner = inner
+        self._events = events
+        self.armed = False
+
+    @property
+    def autocommit(self) -> bool:
+        return self.armed is False and bool(self._inner.autocommit)
+
+    @autocommit.setter
+    def autocommit(self, value: bool) -> None:
+        self._inner.autocommit = value
+
+    def rollback(self) -> None:
+        self._events.append("rollback")
+        self._inner.rollback()
+
+    def flush(self) -> None:
+        self._events.append("flush")
+        if self.armed:
+            raise RuntimeError("disk full")
+        self._inner.flush()
+
+    def close(self) -> None:
+        self._events.append("close")
+        self._inner.close()
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "commit":
+            raise AttributeError(name)
+        return getattr(self._inner, name)
+
+
 _CREATE: list[tuple[str, dict[str, Any]]] = [("CREATE (:Thread {thread_id: $t})", {"t": "spy"})]
 _COUNT = "MATCH (t:Thread {thread_id: 'spy'}) RETURN count(t) AS n"
 
@@ -474,6 +510,29 @@ class TestProxyFlushFailureAfterCommit:
             assert "commit" not in events
             assert "rollback" in events
             assert proxy.execute_read(_COUNT)[0]["n"] == 0
+        finally:
+            proxy.abort()
+
+    def test_write_without_commit_method_still_rolls_back_on_flush_failure_ac_198(self) -> None:
+        """AC-198: a non-autocommit connection with no commit() is not committed, so it rolls back."""
+        events: list[str] = []
+        holder: list[_NoCommitConnection] = []
+
+        def factory(db_path: str) -> _NoCommitConnection:
+            conn = _NoCommitConnection(relate.connect(database=db_path), events)
+            holder.append(conn)
+            return conn
+
+        proxy = RelateThreadProxy(db_path=":memory:", wal_enabled=True, connection_factory=factory)
+        try:
+            conn = holder[0]
+            assert not hasattr(conn, "commit")
+            conn.armed = True
+            events.clear()
+            with pytest.raises(RelateCheckpointError, match="disk full"):
+                proxy.execute_write("CREATE (:Thread {thread_id: 'spy'})")
+            assert "flush" in events
+            assert "rollback" in events
         finally:
             proxy.abort()
 
