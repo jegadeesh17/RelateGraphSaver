@@ -45,6 +45,7 @@ Reference documents:
 | [ADR-0031](#adr-0031-writes-and-tool-calls-attach-only-to-a-checkpoint-of-their-own-thread) | Writes and Tool Calls Attach Only to a Checkpoint of Their Own Thread | Accepted | 2026-11-23 |
 | [ADR-0032](#adr-0032-the-failure-checkpoint-walk-may-cross-one-forked_to-edge-after-a-put_writes-link) | The Failure-Checkpoint Walk May Cross One `[:FORKED_TO]` Edge After a `put_writes()` Link | Accepted | 2026-11-23 |
 | [ADR-0033](#adr-0033-relate_-variables-are-parsed-only-when-used-none-means-unset-and-a-timeout-reports-whether-the-command-started) | RELATE_* variables are parsed only when used, None means unset, and a timeout reports whether the command started | Accepted | 2026-11-23 |
+| [ADR-0034](#adr-0034-fork-reads-fail-loudly-a-committed-transaction-is-never-rolled-back-and-an-empty-relate_db_path-is-rejected) | Fork Reads Fail Loudly, a Committed Transaction Is Never Rolled Back, and an Empty RELATE_DB_PATH Is Rejected | Accepted | 2026-11-24 |
 
 ---
 
@@ -169,7 +170,7 @@ When a developer targets a checkpoint for replay, `TimeTravelEngine` queries the
 
 ### Consequences
 
-- **Positive:** True zero-side-effect time-travel sandboxing. The primary `.rl` file remains bitwise untouched.
+- **Positive:** True zero-side-effect time-travel sandboxing. The primary `.rl` file remains bitwise untouched (true only when the source is opened read-only; see ADR-0015).
 - **Positive:** Zero cleanup overhead; the in-memory database is instantly reclaimed by the OS and Python runtime when the object is closed or garbage-collected.
 - **Negative:** Large execution histories cloned into memory will consume RAM proportional to the cloned subgraph. Cloned histories are scoped strictly to the selected thread and ancestor chain to keep memory consumption minimal.
 
@@ -247,7 +248,8 @@ Each async method runs its synchronous counterpart with `asyncio.to_thread`, so 
 
 Date: 2026-11-17  
 Status: Accepted  
-Amended by: [ADR-0026](#adr-0026-latest-and-before-follow-checkpoint_id-order)
+Amended by: [ADR-0026](#adr-0026-latest-and-before-follow-checkpoint_id-order)  
+Amended: 2026-11-24
 
 ### Context
 
@@ -270,6 +272,8 @@ The fast test command (`ruff check .`, `ruff format --check .`, `mypy src tests`
 
 - **Positive:** One command tells a contributor whether the repository is healthy, and it now passes.
 - **Negative:** The number of real type errors hidden behind the configuration error is unknown until mypy runs, so this fix may touch many files with annotations only.
+
+`tests/unit/__init__.py` and `tests/integration/__init__.py` now exist and are required: `test_proxy.py` and `test_visualizer.py` exist in both folders, and pytest's default import mode needs those folders to be packages to keep same-named test modules apart. `explicit_package_bases` stays. The concern in alternative 1 still stands for the top-level `tests/` folder, which still has no `__init__.py`.
 
 ---
 
@@ -1189,3 +1193,39 @@ Four defects came out of a review of how `RelateSaver` and `RelateThreadProxy` h
 - **Negative:** `default_timeout=None` now means the environment or default timeout (30.0 s), not no timeout. Code that passed `None` to wait forever now times out.
 - **Negative:** An invalid `RELATE_*` variable that the caller's arguments cover is no longer reported at all.
 - **Negative:** After a timeout on a running command, the caller cannot tell whether it committed without reading the store.
+
+---
+
+## ADR-0034: Fork Reads Fail Loudly, a Committed Transaction Is Never Rolled Back, and an Empty RELATE_DB_PATH Is Rejected
+
+Date: 2026-11-24  
+Status: Accepted
+
+This amends [ADR-0010](#adr-0010-in-memory-forks-copy-tool-call-data), [ADR-0014](#adr-0014-tool-call-capture-commits-without-its-own-flush) and [ADR-0033](#adr-0033-relate_-variables-are-parsed-only-when-used-none-means-unset-and-a-timeout-reports-whether-the-command-started).
+
+### Context
+
+- `fork_in_memory()` caught `RelateCheckpointError` on three source reads (the parent lineage lookup, the `[:NEXT]`/`[:FORKED_TO]` edge query and the thread metadata query) and carried on, so a fork could silently miss ancestors, edges or metadata.
+- When the WAL flush failed after a successful commit, the proxy's single-command and batch handlers called `rollback()` on a transaction that had already committed.
+- `RELATE_DB_PATH=""` was accepted, although `.env.example` says empty values are rejected and the other three `RELATE_*` variables already reject them.
+
+### Decision
+
+1. **Fork reads fail loudly.** A `RelateCheckpointError` from any source read in `fork_in_memory()` propagates, and no fork is returned (AC-197). An empty result is not an error: missing edges are still rebuilt from `parent_checkpoint_id`, and a missing thread `created_at` still uses the current time.
+2. **A committed transaction is never rolled back.** When the flush fails after a commit, the proxy does not call `rollback()`, and the committed data stays readable. The flush error still reaches the caller, because durability was not confirmed (AC-198).
+3. **An empty `RELATE_DB_PATH` is rejected.** When `db_path` is not passed and `RELATE_DB_PATH` is empty or only whitespace, `RelateSaver()` raises `ValueError` naming `RELATE_DB_PATH` (AC-199).
+
+### Alternatives considered
+
+1. **Keep the fallbacks.** Rejected: the fork would silently differ from the source.
+2. **Wrap the flush error in a new error type.** Rejected: it changes the exception hierarchy.
+3. **Reject an empty explicit `db_path` too.** Rejected for now: it is outside this change.
+
+### Consequences
+
+- **Positive:** A fork either matches its source lineage or fails, so replay and forensics on a fork never run on partial data.
+- **Positive:** A flush failure no longer discards data the engine reports as committed.
+- **Positive:** The documented rule for empty `RELATE_*` values now holds for all four variables.
+- **Negative:** A transient read error during a fork now fails the fork instead of returning a partial one.
+- **Negative:** After a flush error the caller cannot tell from the error alone whether the data will survive a crash; it is committed but not confirmed durable.
+- **Negative:** An environment that set `RELATE_DB_PATH=""` to get the `:memory:` default now fails at construction.

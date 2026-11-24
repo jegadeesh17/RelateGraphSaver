@@ -4,7 +4,7 @@ Embedded graph-native checkpointing, thread-affinity serialization, and time-tra
 
 Reference documents: [specification](SPEC.md), [decisions](DECISIONS.md), [overview](README.md).
 
-Date: 2026-11-18  
+Date: 2026-11-18 (amended 2026-11-24)  
 Status: FROZEN
 
 ## Overview
@@ -54,7 +54,7 @@ python benchmarks/bench_checkpointers.py --checkpoints 1000
 ```
 The benchmark is not collected by pytest (`testpaths = ["tests"]`, and the file is not named `test_*`). See [Benchmark](#benchmark).
 
-*Note on test performance:* Tests that run full multi-agent simulation loops, process termination crash simulations, fresh-environment installs, or large graph workloads are marked `@pytest.mark.slow`. The fast suite targets under 15 seconds but measured about 270 seconds on the development machine on 2026-11-23; new replay and demo tests reuse session-scoped stores to avoid adding to it.
+*Note on test performance:* Tests that run full multi-agent simulation loops, process termination crash simulations, fresh-environment installs, or large graph workloads are marked `@pytest.mark.slow`. The fast suite took about 270 seconds on the development machine on 2026-11-23; new replay and demo tests reuse session-scoped stores to avoid adding to it.
 
 ## Components
 
@@ -185,6 +185,8 @@ CREATE INDEX checkpoint_thread_idx IF NOT EXISTS
 FOR (c:Checkpoint) ON (c.thread_id, c.checkpoint_ns, c.step);
 CREATE INDEX checkpoint_hash_idx IF NOT EXISTS
 FOR (c:Checkpoint) ON (c.state_hash);
+CREATE INDEX checkpoint_ns_idx IF NOT EXISTS
+FOR (c:Checkpoint) ON (c.checkpoint_ns);
 ```
 
 ## Interfaces and contracts
@@ -286,6 +288,8 @@ RETURN c.checkpoint_id AS checkpoint_id, tc.call_id AS call_id, tc.tool_name AS 
 ```
 One row per edge. A `RelateCheckpointError` from this read propagates to the caller; the fork is not returned without its tool calls, because forensics on such a fork would silently differ from the source.
 
+Every other source read (candidates, parent lineage, edges, thread metadata, writes) also propagates `RelateCheckpointError` (AC-197, [ADR-0034](DECISIONS.md#adr-0034-fork-reads-fail-loudly-a-committed-transaction-is-never-rolled-back-and-an-empty-relate_db_path-is-rejected)). An empty result is not an error: missing edges are rebuilt from `parent_checkpoint_id`, and a missing thread `created_at` uses the current time.
+
 **Outcomes only up to the fork point.** Before building statements, the fork deserializes the fork-point checkpoint's `checkpoint_blob` (already read with the lineage) with `source_saver.serde.loads(_extract_bytes(...))` and, if its `channel_values` is a dict, runs `extract_tool_events(channel_values.values())` from `tool_calls.py`; no other parsing is done. The `call_id`s of the resulting outcomes form the *fork-point outcome set* (empty when `channel_values` is missing or not a dict). A copied node keeps the source's stored `result_blob` or `error` only if its `call_id` is in that set; otherwise it is copied without either property, so a replay in the fork records its own first outcome. Results that exist only in the fork point's pending writes, or only in later checkpoints, do not count. If the blob cannot be deserialized, the fork raises `RelateCheckpointError`.
 
 **Tool call writes**, appended to the single population batch after the `:Write` statements and before the optional branch `[:FORKED_TO]` statement:
@@ -372,6 +376,7 @@ Every command takes `--db/-d PATH` (`tree` also accepts `--file/-f`). Errors pri
 - **`relate-dag forensics loops <thread_id> [--threshold <int>]`:** queries the Cypher graph for repeating state transitions and displays cycle tables.
 - **`relate-dag forensics trace-error <thread_id>`:** traverses backward causal paths to print root-cause analysis for failed threads. The report panel has a `Root Tool Name:` line (`None` when unknown) next to `Root Tool Call ID:`, and, when the report has an origin, `Bad argument origin: <origin_argument> came from node <origin_node> (step <origin_step>, <origin_hops> hops before failure)` followed by a dim note that hops count checkpoint steps from the write where the argument first appeared to the error checkpoint (AC-122). `Causal Path Length:` in this panel and in `forensics` is followed by `(checkpoint steps from the offending write to the error checkpoint)`.
 - **`relate-dag forensics failures`:** prints the [`failure_summary()`](#9-forensic-queries-loop-detection-and-argument-provenance-forensicspy) table (Tool, Failures, Calls, Threads, Origin nodes), or `No failing tool calls found.` when there are none (AC-123..AC-125). `failures` is registered in `ForensicsGroup`, so it is never read as a thread id (RC-04).
+- **`relate-dag forensics diagnose <thread_id>`:** hidden (not listed in `--help`); the default command that `relate-dag forensics <thread_id>` routes to, combining loop detection and root-cause analysis. Stored text and thread ids print literally (AC-160).
 
 `relate-dag --help` must work in a fresh environment with only the declared dependencies installed (AC-33).
 
@@ -691,21 +696,23 @@ RelateGraphSaver/
 │       ├── proxy.py            # RelateThreadProxy actor implementation
 │       ├── replay.py           # Graph-spec loader, sandbox replay, run snapshot and diff
 │       ├── saver.py            # RelateSaver (BaseCheckpointSaver, sync + async)
-│       ├── schema.py           # Cypher constraints and schema migrations
+│       ├── schema.py           # Cypher constraints and indexes (DDL)
 │       ├── serde.py            # JsonPlusSerializer wrapper & error mapper
 │       ├── time_travel.py      # TimeTravelEngine in-memory sandbox
 │       ├── tool_calls.py       # Tool call extractor and ToolCall statements
 │       └── visualizer.py       # Rich/Unicode tree terminal renderer
-├── tests/                      # no __init__.py here (see ADR-0007)
+├── tests/                      # no __init__.py at this level; unit/ and integration/ have one (ADR-0007)
 │   ├── conftest.py             # Shared fixtures; deselects `network` tests by default
 │   ├── unit/                   # test_errors, test_models, test_packaging (AC-34, AC-57), test_proxy, test_readme,
 │   │                           # test_saver, test_serde, test_tool_calls (AC-46, AC-47), test_visualizer,
-│   │                           # test_replay_diff (AC-104..AC-106)
+│   │                           # test_replay_diff (AC-104..AC-106), test_build_demo_store_checks, test_setup_consistency
 │   ├── integration/            # test_async_saver, test_checkpointing_end_to_end, test_clean_install (slow, AC-33),
 │   │                           # test_cli, test_concurrency, test_crash_recovery, test_demo_store, test_forensics(_end_to_end),
 │   │                           # test_langgraph_workflow, test_read_only (ADR-0015), test_time_travel(_end_to_end),
 │   │                           # test_tool_call_capture, test_tool_calls_end_to_end, test_tool_forensics_demo (AC-45),
-│   │                           # test_replay (AC-94..AC-103, AC-107, AC-108), test_dependency_agent (AC-127..AC-132; one `network` test)
+│   │                           # test_replay (AC-94..AC-103, AC-107, AC-108), test_dependency_agent (AC-127..AC-132; one `network` test),
+│   │                           # test_engine_wiring, test_env_config_and_timeout_wiring, test_openrouter_agent, test_proxy,
+│   │                           # test_readme_explore, test_saver_sync, test_visualizer, test_write_path_integration
 │   └── fakes/                  # __init__.py, fake_relate_driver.py
 ├── benchmarks/
 │   └── bench_checkpointers.py  # RelateSaver vs SqliteSaver (not a test)
@@ -713,7 +720,7 @@ RelateGraphSaver/
     ├── build_demo_store.py     # Regenerates the committed demo store (needs pypi.org)
     ├── data/
     │   ├── demo.rl             # Committed demo store (four threads), inspected read-only
-    │   └── demo-llm.rl         # Optional recorded LLM run (only if approved)
+    │   └── demo-llm.rl         # Committed recorded LLM run (examples/openrouter_agent.py)
     ├── dependency_agent.py     # Key-free PyPI dependency audit (real-API failure)
     ├── openrouter_agent.py     # Optional LLM run (`llm` extra, OPENROUTER_API_KEY)
     ├── research_agent.py       # Multi-agent demo workflow

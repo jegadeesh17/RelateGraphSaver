@@ -508,6 +508,10 @@ AC-192: Given a run resumed from a past checkpoint P that already has a [:NEXT] 
 AC-193: Given any --db store path, existing or missing, When `relate-dag forensics loops <thread> --threshold N` is run with N < 2, Then the CLI exits with code 2 and a usage error naming --threshold before opening the store, no store file is created at a missing path, and an existing store file is byte-identical afterwards (the library-level detect_loops() ValueError is AC-188).
 AC-194: Given RelateSaver construction, When db_path, wal_enabled, default_timeout or log_level is passed as None, Then it counts as not passed; and When an argument is passed (not None), Then its RELATE_* variable is not parsed, so an invalid value raises ValueError naming the variable only when that argument is not passed; and When neither log_level nor RELATE_LOG_LEVEL is given, Then the level of the "langgraph_checkpoint_relate" logger is left unchanged, and it is set only when one of them is given ([ADR-0033](DECISIONS.md#adr-0033-relate_-variables-are-parsed-only-when-used-none-means-unset-and-a-timeout-reports-whether-the-command-started), amends AC-178).
 AC-195: Given a RelateThreadProxy command (single execute, batch or flush) whose caller timeout expires, When the worker has not started the command, Then it is cancelled and never executed, and RelateConcurrencyError says it was not executed; and When the worker has already started it, Then it runs to completion, and RelateConcurrencyError says the operation timed out while running and may have committed ([ADR-0033](DECISIONS.md#adr-0033-relate_-variables-are-parsed-only-when-used-none-means-unset-and-a-timeout-reports-whether-the-command-started), amends AC-179).
+AC-196: Given a thread whose root-to-leaf checkpoint sequence has 2,000 checkpoints with no repeats, When detect_loops() cycle detection runs on that sequence, Then it finishes in under 2 seconds and returns exactly the cycles the previous algorithm returned for every input.
+AC-197: Given a source store whose parent-lineage, edge or thread-metadata read raises RelateCheckpointError, When fork_in_memory() runs, Then the error propagates to the caller and no fork is returned.
+AC-198: Given a write or batch whose commit succeeds but whose WAL flush raises, When the proxy handles it, Then the error is raised to the caller, rollback() is not called, and the committed data stays readable.
+AC-199: Given RELATE_DB_PATH set to an empty or whitespace-only value and no db_path argument, When RelateSaver() is constructed, Then it raises ValueError naming RELATE_DB_PATH.
 
 ### 3.9 Regression Criteria
 
@@ -579,7 +583,7 @@ Write-path and read-side correctness non-goals:
 
 2. **Graph Schema Model for LangGraph:**
    - *Question:* Should checkpoints be stored as individual nodes with `PARENT_OF` relationships, or should channels and writes have dedicated first-class nodes?
-   - *Assumption:* A hybrid graph model: `:Checkpoint` nodes represent steps connected by `[:PREV_CHECKPOINT]`, with `:Write` nodes connected via `[:HAS_WRITE]` and `:Channel` nodes linked via `[:HAS_CHANNEL]`, allowing Cypher queries to traverse state mutations natively.
+   - *Resolved:* `:Checkpoint` nodes are chained by `[:NEXT]`, writes are `:Write` nodes linked by `[:HAS_WRITE]`, and branches use `[:FORKED_TO]`; there are no `:Channel` nodes (see the graph schema in [ARCHITECTURE](ARCHITECTURE.md)).
 
 3. **CLI Terminal Formatting Library:**
    - *Question:* Which library should be used to render the terminal tree?
