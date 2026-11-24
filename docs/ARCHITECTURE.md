@@ -324,11 +324,12 @@ class RelateThreadProxy:
     def execute_read(self, cypher: str, params: dict[str, Any]) -> Any: ...
     def execute_batch(self, statements: list[tuple[str, dict[str, Any]]], timeout: float | None = None,
                       *, flush: bool = True) -> list[list[dict[str, Any]]]:
-        """Run all statements in one transaction; all commit or all roll back."""
+        """Run all statements in one transaction; a failing statement or commit rolls all back.
+        A flush error after the commit leaves the batch committed (AC-198)."""
     def close(self, timeout: float | None = 5.0) -> None: ...   # stop() is an alias
 ```
 
-**`flush` keyword ([ADR-0014](DECISIONS.md#adr-0014-tool-call-capture-commits-without-its-own-flush)).** `BatchCommand` has `flush: bool = True`, and `_handle_batch_command` calls `conn.flush()` after the commit only when `self.wal_enabled and cmd.flush`. With `flush=False` the batch still commits (or rolls back) as one transaction before the future resolves; only the per-write flush is skipped. The default keeps every other caller flushing: `execute_write`, `put()`, `put_writes()`, `transaction()`, the dict `transaction` message and the fork population batch do not pass the keyword. Only `RelateSaver._capture_tool_calls` passes `flush=False`. `close()` flushes explicitly: on shutdown the worker calls `conn.flush()` (when `wal_enabled` and the connection has `flush`) before `conn.close()`; a flush error is logged at WARNING and the connection is still closed. `abort()` does not flush. With `wal_enabled=False` the keyword changes nothing.
+**`flush` keyword ([ADR-0014](DECISIONS.md#adr-0014-tool-call-capture-commits-without-its-own-flush)).** `BatchCommand` has `flush: bool = True`, and `_handle_batch_command` calls `conn.flush()` after the commit only when `self.wal_enabled and cmd.flush`. With `flush=False` the batch still commits (or rolls back) as one transaction before the future resolves; only the per-write flush is skipped. The default keeps every other caller flushing: `execute_write`, `put()`, `put_writes()`, `transaction()`, the dict `transaction` message and the fork population batch do not pass the keyword. Only `RelateSaver._capture_tool_calls` passes `flush=False`. `close()` flushes explicitly: on shutdown the worker calls `conn.flush()` (when `wal_enabled` and the connection has `flush`) before `conn.close()`; a flush error is logged at WARNING and the connection is still closed. `abort()` does not flush. With `wal_enabled=False` the keyword changes nothing. If that flush raises, the batch stays committed, no rollback is issued, and the error reaches the caller (AC-198, [ADR-0034](DECISIONS.md#adr-0034-fork-reads-fail-loudly-a-committed-transaction-is-never-rolled-back-and-an-empty-relate_db_path-is-rejected)).
 
 **`read_only` keyword ([ADR-0015](DECISIONS.md#adr-0015-read-only-opening-for-inspection-commands)).** With `read_only=True`, still on the single worker thread:
 - `_open_connection` skips `os.makedirs` and calls `relate.connect(database=db_path, read_only=True)`; a custom `connection_factory` is still called as `factory(db_path)`. `":memory:"` with `read_only=True` raises `ValueError` in the constructor.
@@ -738,7 +739,7 @@ A variable is parsed only when its argument is not passed, so an invalid or unpa
 
 | Environment Variable | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `RELATE_DB_PATH` | string | `":memory:"` | Target database file path or `":memory:"` for embedded graph storage ([ADR-0028](DECISIONS.md#adr-0028-relate_-environment-variable-configuration)) |
+| `RELATE_DB_PATH` | string | `":memory:"` | Target database file path or `":memory:"` for embedded graph storage ([ADR-0028](DECISIONS.md#adr-0028-relate_-environment-variable-configuration)); an empty or whitespace-only value raises `ValueError` (AC-199, [ADR-0034](DECISIONS.md#adr-0034-fork-reads-fail-loudly-a-committed-transaction-is-never-rolled-back-and-an-empty-relate_db_path-is-rejected)) |
 | `RELATE_WAL_ENABLED` | boolean | `true` | Enables the per-write WAL flush for crash safety; tool call capture never flushes on its own ([ADR-0014](DECISIONS.md#adr-0014-tool-call-capture-commits-without-its-own-flush)). Measured cost under the concurrency and crash safety model |
 | `RELATE_PROXY_TIMEOUT_SEC` | float | `30.0` | Maximum wait time for actor queue transactions before raising timeout |
 | `RELATE_LOG_LEVEL` | string | `"INFO"` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`); applied to the package logger only when configured |

@@ -1224,8 +1224,9 @@ This amends [ADR-0010](#adr-0010-in-memory-forks-copy-tool-call-data), [ADR-0014
 ### Consequences
 
 - **Positive:** A fork either matches its source lineage or fails, so replay and forensics on a fork never run on partial data.
-- **Positive:** A flush failure no longer discards data the engine reports as committed.
+- **Positive:** A flush failure no longer issues a rollback against a transaction that is already committed, so the proxy's behavior no longer depends on how the driver treats that rollback.
 - **Positive:** The documented rule for empty `RELATE_*` values now holds for all four variables.
 - **Negative:** A transient read error during a fork now fails the fork instead of returning a partial one.
 - **Negative:** After a flush error the caller cannot tell from the error alone whether the data will survive a crash; it is committed but not confirmed durable.
 - **Negative:** An environment that set `RELATE_DB_PATH=""` to get the `:memory:` default now fails at construction.
+- **Negative:** When the flush in `put()` fails, the checkpoint is stored but `put()` raises before tool-call capture; retrying `put()` with the same `checkpoint_id` fails the `checkpoint_id` uniqueness constraint. The tool calls are captured by the next save that sees the same messages ([ADR-0021](#adr-0021-tool-call-root-cause-anchors-on-the-failure-checkpoint)).
