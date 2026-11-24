@@ -1035,6 +1035,8 @@ We establish five forensic traversal and attribution rules:
 - **Positive:** Deterministic, localized root-cause attribution prioritizing proximate tool failures (`distance_to_error <= 1`).
 - **Positive:** Diagnostic tools preserve database file immutability by defaulting to `read_only=True`.
 
+**Amendment (2026-11-24).** `trace_root_cause` used 0 for `causal_path_length` both as a real distance and as "not yet set", so when the selected offending write or tool call sat on the error checkpoint itself (distance 0), the fallback replaced it with the largest distance in the lineage; on the committed demo store, `relate-dag forensics trace-error demo-real-api` printed 4 although the root write is on the error checkpoint. The value now stays unset until one of the five priorities selects an antecedent, and is then that antecedent's `distance_to_error`, including 0 (AC-200). The largest-distance fallback applies only when no antecedent was selected, and an empty lineage still gives 0. The priority order is unchanged, and the argument-provenance hop count ([ADR-0018](#adr-0018-argument-provenance-by-string-containment-earliest-write-wins)) is unaffected.
+
 ---
 
 ## ADR-0030: The Failure-Checkpoint Walk Follows `[:NEXT]` Edges Only

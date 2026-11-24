@@ -109,7 +109,7 @@ Thread: demo-real-api
 | Bad argument origin: name came from node planner (step 1, 2 hops before     |
 | failure)                                                                    |
 | ...                                                                         |
-| Causal Path Length:  4 (checkpoint steps from the offending write to the    |
+| Causal Path Length:  0 (checkpoint steps from the offending write to the    |
 | error checkpoint)                                                           |
 ```
 

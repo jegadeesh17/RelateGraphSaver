@@ -935,6 +935,44 @@ class TestRelateForensics:
         assert origin.hops == chain_length - 1
         assert arg_elapsed < 1.0
 
+    def test_causal_path_length_zero_when_offender_on_error_checkpoint_ac_200(self) -> None:
+        """AC-200: an offending tool call on the error checkpoint reports a path length of 0.
+
+        The lineage has earlier checkpoints, so a fallback to the lineage maximum would
+        report a positive length.
+        """
+        thread_id = "thread-path-zero-001"
+        with RelateSaver(db_path=":memory:", wal_enabled=False) as saver:
+            config: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+            for step in range(4):
+                cp: Any = dict(empty_checkpoint())
+                cp["id"] = f"cp-zero-{step:04d}"
+                config = saver.put(config, cp, {"step": step, "source": "loop", "parents": {}}, {})
+            error_cp_id = config["configurable"]["checkpoint_id"]
+            saver.proxy.execute_write(
+                "CREATE (tc:ToolCall {call_id: $call_id, tool_name: $name, args_blob: $args, "
+                "error: $err, created_at: $created_at}) "
+                "WITH tc "
+                "MATCH (c:Checkpoint {checkpoint_id: $cid}) "
+                "MERGE (c)-[:INVOKED]->(tc)",
+                {
+                    "call_id": "call-path-zero-1",
+                    "name": "slow_api",
+                    "args": b"{}",
+                    "err": "HTTP 503: upstream unavailable",
+                    "created_at": "2026-11-12T00:00:00Z",
+                    "cid": error_cp_id,
+                },
+            )
+            saver.put_writes(config, [("__error__", "Chain aborted")], task_id="task-zero")
+
+            report = saver.trace_root_cause(thread_id)
+
+        assert report.error_checkpoint_id == error_cp_id
+        assert report.root_tool_call_id == "call-path-zero-1"
+        assert report.causal_path_length == 0
+        assert "Causal path distance: 0 step(s)." in report.diagnostic_summary
+
     def test_trace_scales_linearly_on_long_thread_ac_27(self, temp_disk_db: str) -> None:
         """AC-27: tracing a 2,000-checkpoint chain stays linear; lineage lookups use the id index."""
         thread_id = "thread-scale-001"

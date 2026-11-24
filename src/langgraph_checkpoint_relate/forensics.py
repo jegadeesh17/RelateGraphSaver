@@ -1202,7 +1202,9 @@ class RelateForensics:
         root_tool_call_id: str | None = None
         root_tool_name: str | None = None
         root_channel_write: str | None = None
-        causal_path_length: int = 0
+        # None until a priority selects an antecedent, so a selected distance of 0 (the
+        # offender on the error checkpoint) is kept (AC-200).
+        causal_path_length: int | None = None
 
         # Prioritized search for offending antecedent:
         # Priority 1: ToolCall with explicit error (AC-184, ADR-0029)
@@ -1269,9 +1271,11 @@ class RelateForensics:
                     causal_path_length = int(r.get("distance_to_error", 0))
                     break
 
-        # Default path length to max distance traversed if not set
-        if causal_path_length == 0 and causal_rows:
-            causal_path_length = max(int(r.get("distance_to_error", 0)) for r in causal_rows)
+        # Default path length to max distance traversed when no priority selected an antecedent
+        if causal_path_length is None:
+            causal_path_length = (
+                max(int(r.get("distance_to_error", 0)) for r in causal_rows) if causal_rows else 0
+            )
 
         # Construct diagnostic summary
         parts: list[str] = [
