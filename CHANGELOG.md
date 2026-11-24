@@ -54,6 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `relate-dag tree` renders a thread's checkpoints as a flat list of siblings, with forks nested under the checkpoint they branch from, so long runs no longer indent off screen (AC-185).
 - `relate-dag forensics --help` lists the reserved subcommand names and states that thread IDs starting with `-` are not accepted as positional thread IDs.
 - The combined `relate-dag forensics <thread>` panel shows the bad-argument origin line, as `trace-error` does.
+- Loop detection skips pattern lengths that cannot repeat, so a 1,000-checkpoint path is scanned in about 0.06 s instead of about 9 s, with identical results (AC-196).
 
 ### Fixed
 - `RelateSaver` treats a `None` constructor argument as unset, parses each `RELATE_*` variable only when its argument is not given (a malformed variable for a setting passed explicitly no longer raises), and sets the `langgraph_checkpoint_relate` logger level only when `log_level` or `RELATE_LOG_LEVEL` is given, so the application's own logging configuration is kept (AC-194, ADR-0033).
@@ -118,3 +119,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Database errors raised by tree queries reach the CLI error handler instead of being swallowed.
 - `trace_root_cause` no longer toggles the process-wide garbage collector, and long threads trace in linear time: about 1.1 s at 4,000 checkpoints, down from 6.6 s (AC-27).
 - Wide CLI tables print through a local Rich `Console` instead of mutating the shared console's private width (AC-167).
+- `fork_in_memory` raises `RelateCheckpointError` when the source's parent-lineage, edge or thread-metadata read fails, instead of returning a fork with missing ancestors, edges or metadata (AC-197, ADR-0034).
+- A WAL flush that fails after a successful commit no longer triggers a rollback of the committed transaction; the flush error still reaches the caller (AC-198, ADR-0034).
+- `RelateSaver()` rejects an empty or whitespace-only `RELATE_DB_PATH` with a `ValueError`, as it already did for the other `RELATE_*` variables (AC-199, ADR-0034).
+- Root-cause tracing logs at debug level when it skips a metadata or error blob it cannot deserialize, instead of skipping it silently.
