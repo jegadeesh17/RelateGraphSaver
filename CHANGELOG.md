@@ -57,6 +57,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Loop detection skips pattern lengths that cannot repeat, so a 1,000-checkpoint path is scanned in about 0.06 s instead of about 9 s, with identical results (AC-196).
 
 ### Fixed
+- `trace_root_cause()` and `relate-dag forensics trace-error` keep a causal path length of 0 when the offending write or tool call is on the error checkpoint, instead of reporting the longest distance in the lineage (AC-200, amendment to ADR-0029).
 - `RelateSaver` treats a `None` constructor argument as unset, parses each `RELATE_*` variable only when its argument is not given (a malformed variable for a setting passed explicitly no longer raises), and sets the `langgraph_checkpoint_relate` logger level only when `log_level` or `RELATE_LOG_LEVEL` is given, so the application's own logging configuration is kept (AC-194, ADR-0033).
 - A proxy command whose caller times out raises `RelateConcurrencyError` saying whether it was skipped (never executed, safe to retry) or had already started and may have committed, instead of always reporting it as skipped (AC-195, ADR-0033).
 - README and `docs/ARCHITECTURE.md` describe the forensics failure walk as it runs: one read of a thread's `[:NEXT]`/`[:FORKED_TO]` edges, a breadth-first walk in Python, then one `UNWIND $lineage` causal query, and name `fork_in_memory(branch_thread_id=...)` as the only source of `(:Checkpoint)-[:FORKED_TO]->(:Thread)` (ADR-0030).

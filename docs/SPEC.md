@@ -512,6 +512,7 @@ AC-196: Given a thread whose root-to-leaf checkpoint sequence has 2,000 checkpoi
 AC-197: Given a source store whose parent-lineage, edge or thread-metadata read raises RelateCheckpointError, When fork_in_memory() runs, Then the error propagates to the caller and no fork is returned.
 AC-198: Given a write or batch whose commit succeeds but whose WAL flush raises, When the proxy handles it, Then the error is raised to the caller, rollback() is not called, and the committed data stays readable.
 AC-199: Given RELATE_DB_PATH set to an empty or whitespace-only value and no db_path argument, When RelateSaver() is constructed, Then it raises ValueError naming RELATE_DB_PATH.
+AC-200: Given an error checkpoint whose lineage trace_root_cause() walks, When the selected offending write or tool call is on the error checkpoint itself (distance_to_error 0), Then causal_path_length is 0 and `relate-dag forensics trace-error` prints `Causal Path Length: 0`; and When the selected antecedent is at distance N > 0, Then causal_path_length is N; and only When no offending antecedent is selected, Then causal_path_length falls back to the largest distance traversed in the lineage (on the committed demo store, `relate-dag forensics trace-error demo-real-api --db examples/data/demo.rl` prints `Causal Path Length: 0`).
 
 ### 3.9 Regression Criteria
 
