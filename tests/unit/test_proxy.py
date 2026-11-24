@@ -318,6 +318,10 @@ class _SpyConnection:
         self._events.append("commit")
         self._inner.commit()
 
+    def rollback(self) -> None:
+        self._events.append("rollback")
+        self._inner.rollback()
+
     def flush(self) -> None:
         self._events.append("flush")
         if self._flush_error is not None:
@@ -426,6 +430,52 @@ class TestProxyFlushControl:
         assert any(
             r.levelno == logging.WARNING and "disk full" in r.getMessage() for r in caplog.records
         )
+
+
+class TestProxyFlushFailureAfterCommit:
+    """A WAL flush that fails after a successful commit must not trigger a rollback."""
+
+    def test_batch_flush_failure_after_commit_does_not_roll_back_ac_198(self) -> None:
+        """AC-198: a batch whose flush raises after commit surfaces the error, with no rollback."""
+        events: list[str] = []
+        proxy = _spy_proxy(events, flush_error=RuntimeError("disk full"))
+        try:
+            events.clear()
+            with pytest.raises(RelateCheckpointError, match="disk full"):
+                proxy.execute_batch(_CREATE, flush=True)
+            assert "rollback" not in events
+            assert events.index("commit") < events.index("flush")
+            assert proxy.execute_read(_COUNT)[0]["n"] == 1
+        finally:
+            proxy.abort()
+
+    def test_write_flush_failure_after_commit_does_not_roll_back_ac_198(self) -> None:
+        """AC-198: a single autocommit write whose flush raises surfaces the error, no rollback."""
+        events: list[str] = []
+        proxy = _spy_proxy(events, flush_error=RuntimeError("disk full"))
+        try:
+            events.clear()
+            with pytest.raises(RelateCheckpointError, match="disk full"):
+                proxy.execute_write("CREATE (:Thread {thread_id: 'spy'})")
+            assert "rollback" not in events
+            assert "flush" in events
+            assert proxy.execute_read(_COUNT)[0]["n"] == 1
+        finally:
+            proxy.abort()
+
+    def test_batch_failure_before_commit_still_rolls_back_ac_198(self) -> None:
+        """AC-198: an error before commit keeps the rollback."""
+        events: list[str] = []
+        proxy = _spy_proxy(events)
+        try:
+            events.clear()
+            with pytest.raises(RelateCheckpointError):
+                proxy.execute_batch([*_CREATE, ("THIS IS NOT CYPHER", {})])
+            assert "commit" not in events
+            assert "rollback" in events
+            assert proxy.execute_read(_COUNT)[0]["n"] == 0
+        finally:
+            proxy.abort()
 
 
 class _GateConnection(_SpyConnection):
