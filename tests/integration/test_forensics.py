@@ -12,10 +12,11 @@ from __future__ import annotations
 
 import gc
 import os
+import random
 import sys
 import tempfile
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator, Sequence
 from pathlib import Path
 from typing import Annotated, Any, TypedDict
 from unittest.mock import patch
@@ -37,7 +38,10 @@ if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
 from langgraph_checkpoint_relate.errors import CheckpointNotFoundError  # noqa: E402
-from langgraph_checkpoint_relate.forensics import RelateForensics  # noqa: E402
+from langgraph_checkpoint_relate.forensics import (  # noqa: E402
+    RelateForensics,
+    _detect_sequence_cycles,
+)
 from langgraph_checkpoint_relate.models import LoopReport, RootCauseReport  # noqa: E402
 from langgraph_checkpoint_relate.saver import RelateSaver  # noqa: E402
 
@@ -2804,3 +2808,90 @@ class TestFailureWalkAcrossOneFork:
             assert _failure_checkpoint(forensics, self.THREAD, "cp-c-root") == "cp-c-root"
             saver.put_writes(deep, [("messages", [result])], task_id="task-deep")
             assert _failure_checkpoint(forensics, self.THREAD, "cp-c-root") == "cp-c-fork-n1"
+
+
+def _reference_is_primitive(pattern: Sequence[Any]) -> bool:
+    """Pre-AC-196 primitive-pattern check, kept verbatim as an oracle."""
+    n = len(pattern)
+    if n <= 1:
+        return True
+    for d in range(1, n // 2 + 1):
+        if n % d == 0:
+            sub = pattern[:d]
+            if list(sub) * (n // d) == list(pattern):
+                return False
+    return True
+
+
+def _reference_detect_sequence_cycles(
+    items: list[dict[str, Any]],
+    key_fn: Callable[[dict[str, Any]], Any],
+    threshold: int,
+) -> list[tuple[int, int, int, list[str]]]:
+    """Pre-AC-196 cycle detection algorithm, kept verbatim as an oracle."""
+    tokens = [key_fn(it) for it in items]
+    n = len(tokens)
+    found_cycles: list[tuple[int, int, int, list[str]]] = []
+
+    i = 0
+    while i < n:
+        best_match: tuple[int, int, list[str]] | None = None
+        max_l = (n - i) // threshold
+        for length in range(1, max_l + 1):
+            pattern = tokens[i : i + length]
+            if not _reference_is_primitive(pattern):
+                continue
+
+            k = 1
+            while (
+                i + (k + 1) * length <= n
+                and tokens[i + k * length : i + (k + 1) * length] == pattern
+            ):
+                k += 1
+
+            if k >= threshold:
+                cycle_nodes = [str(items[idx]["node"]) for idx in range(i, i + length)]
+                if best_match is None or (k * length > best_match[0] * len(best_match[2])):
+                    best_match = (k, length, cycle_nodes)
+
+        if best_match:
+            k, length, cycle_nodes = best_match
+            end_idx = i + k * length - 1
+            found_cycles.append((i, end_idx, k, cycle_nodes))
+            i = end_idx + 1
+        else:
+            i += 1
+
+    return found_cycles
+
+
+class TestSequenceCycleDetectionAc196:
+    """AC-196: cycle detection stays fast on long acyclic sequences and matches the old output."""
+
+    def test_matches_reference_on_random_sequences_ac_196(self) -> None:
+        rng = random.Random(196)
+        for case in range(400):
+            length = rng.randint(0, 60)
+            alphabet = ["a", "b", "c", "d"][: rng.randint(1, 4)]
+            tokens: list[str | None] = [
+                None if rng.random() < 0.1 else rng.choice(alphabet) for _ in range(length)
+            ]
+            threshold = rng.randint(2, 4)
+            items: list[dict[str, Any]] = [{"node": tok} for tok in tokens]
+
+            def key(it: dict[str, Any]) -> Any:
+                return it["node"]
+
+            expected = _reference_detect_sequence_cycles(items, key, threshold)
+            actual = _detect_sequence_cycles(items, key, threshold)
+            assert actual == expected, f"case {case}: tokens={tokens} threshold={threshold}"
+
+    def test_two_thousand_distinct_checkpoints_under_two_seconds_ac_196(self) -> None:
+        items: list[dict[str, Any]] = [{"node": f"n{i}"} for i in range(2000)]
+
+        start = time.perf_counter()
+        result = _detect_sequence_cycles(items, lambda it: it["node"], 2)
+        elapsed = time.perf_counter() - start
+
+        assert result == []
+        assert elapsed < 2.0, f"took {elapsed:.2f}s"

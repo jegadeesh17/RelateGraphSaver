@@ -69,9 +69,11 @@ def _detect_sequence_cycles(
         best_match: tuple[int, int, list[str]] | None = None
         max_l = (n - i) // threshold
         for length in range(1, max_l + 1):
-            pattern = tokens[i : i + length]
-            if not _is_primitive(pattern):
+            # AC-196: a cycle needs tokens[i + length] to equal tokens[i]; skip the rest cheaply.
+            a, b = tokens[i], tokens[i + length]
+            if a is not b and a != b:
                 continue
+            pattern = tokens[i : i + length]
 
             k = 1
             while (
@@ -80,7 +82,7 @@ def _detect_sequence_cycles(
             ):
                 k += 1
 
-            if k >= threshold:
+            if k >= threshold and _is_primitive(pattern):
                 cycle_nodes = [str(items[idx]["node"]) for idx in range(i, i + length)]
                 if best_match is None or (k * length > best_match[0] * len(best_match[2])):
                     best_match = (k, length, cycle_nodes)
